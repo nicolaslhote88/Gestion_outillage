@@ -1,0 +1,2578 @@
+{
+  "name": "SIGA - Ingestion Atelier V1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "siga-ingestion-v1",
+        "options": {}
+      },
+      "id": "webhook_in",
+      "name": "Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        224,
+        -96
+      ],
+      "webhookId": "c9bcf722-9eb0-4126-9a9a-a396670eff16"
+    },
+    {
+      "parameters": {
+        "jsCode": "const payload = $json.body || $json;\nconst images = Array.isArray(payload.images) ? payload.images : [];\nconst sender = payload.sender || {};\nconst message = payload.message || {};\nconst now = new Date();\nconst rand = Math.random().toString(36).slice(2, 6).toUpperCase();\nconst providedIngestionId = typeof payload.ingestion_id === 'string' ? payload.ingestion_id.trim() : '';\nconst ingestion_id = providedIngestionId || ('SIGA-ING-' + now.getUTCFullYear() + String(now.getUTCMonth()+1).padStart(2,'0') + String(now.getUTCDate()).padStart(2,'0') + '-' + String(now.getUTCHours()).padStart(2,'0') + String(now.getUTCMinutes()).padStart(2,'0') + String(now.getUTCSeconds()).padStart(2,'0') + '-' + String(now.getUTCMilliseconds()).padStart(3,'0') + '-' + rand);\nconst context = payload.context || {};\nconst readEnv = (name) => {\n  try {\n    if (typeof process !== 'undefined' && process?.env && typeof process.env[name] === 'string') {\n      const v = process.env[name].trim();\n      if (v) return v;\n    }\n  } catch {}\n  return '';\n};\nconst configuredSecret = [\n  'SIGA_WEBHOOK_SECRET',\n  'SIGA_SHARED_SECRET',\n  'N8N_SIGA_WEBHOOK_SECRET',\n  'N8N_SIGA_SHARED_SECRET'\n].map(readEnv).find(Boolean) || '';\nconst headerSecret = $json.headers?.['x-siga-shared-secret'] || $json.headers?.['X-SIGA-SHARED-SECRET'] || null;\nconst authHeader = $json.headers?.authorization || $json.headers?.Authorization || null;\nconst bearerToken = typeof authHeader === 'string' ? authHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst authConfigured = !!configuredSecret;\nconst authPassed = !authConfigured || headerSecret === configuredSecret || bearerToken === configuredSecret;\nconst normalizedImages = images.map((img, idx) => ({\n  index: Number(img.index || idx + 1),\n  filename: img.filename || ('image_' + (idx + 1) + '.jpg'),\n  mime_type: img.mime_type || 'image/jpeg',\n  content_base64: img.content_base64 || null\n}));\nconst validImageCount = normalizedImages.filter(img => !!img.content_base64).length;\nconst errors = [];\nif (normalizedImages.length === 0) errors.push({ code: 'no_images', message: 'At least one image is required' });\nif (!authPassed) errors.push({ code: 'unauthorized', message: 'Invalid shared secret' });\nreturn [{ json: {\n  ok: errors.length === 0,\n  stage: errors.length === 0 ? 'accepted' : 'rejected',\n  error: errors.length ? errors[0].message : null,\n  errors,\n  auth: {\n    configured: authConfigured,\n    passed: authPassed,\n    mode: authConfigured ? 'server_secret_enforced' : 'open_unconfigured',\n    accepted_via: !authConfigured ? 'open_unconfigured' : (headerSecret === configuredSecret ? 'x-siga-shared-secret' : (bearerToken === configuredSecret ? 'authorization_bearer' : 'rejected')),\n    secret_source: authConfigured ? 'server_env' : 'not_configured'\n  },\n  project: payload.project || 'SIGA',\n  entity_type: payload.entity_type || 'equipment',\n  source: payload.source || 'whatsapp',\n  ingestion_id,\n  sender: { id: sender.id || null, display_name: sender.display_name || null },\n  message: { id: message.id || null, text: message.text || '', received_at: message.received_at || now.toISOString() },\n  images: normalizedImages,\n  image_count: normalizedImages.length,\n  valid_image_count: validImageCount,\n  context,\n  raw_payload: payload\n} }];"
+      },
+      "id": "normalize_input",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nitems = _items\nstmts = [\n    \"CREATE TABLE IF NOT EXISTS equipment (equipment_id VARCHAR PRIMARY KEY, ingestion_id VARCHAR NOT NULL, project VARCHAR, entity_type VARCHAR, source_channel VARCHAR, source_sender_id VARCHAR, source_sender_name VARCHAR, source_message_id VARCHAR, source_message_text VARCHAR, received_at TIMESTAMP, category VARCHAR, subtype VARCHAR, label VARCHAR, brand VARCHAR, model VARCHAR, serial_number VARCHAR, manufacturer_plate_raw_text VARCHAR, technical_specs_json VARCHAR, business_context_json VARCHAR, condition_label VARCHAR, location_hint VARCHAR, ownership_mode VARCHAR, purchase_price DOUBLE, purchase_currency VARCHAR, acquisition_note VARCHAR, notes VARCHAR, confidence DOUBLE, review_required BOOLEAN DEFAULT TRUE, review_reasons_json VARCHAR, missing_fields_json VARCHAR, processing_status VARCHAR, final_status VARCHAR, final_drive_folder_id VARCHAR, final_drive_folder_path VARCHAR, status VARCHAR DEFAULT 'draft', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\",\n    \"CREATE TABLE IF NOT EXISTS equipment_media (media_id VARCHAR PRIMARY KEY, equipment_id VARCHAR, ingestion_id VARCHAR NOT NULL, image_index INTEGER, image_role VARCHAR, original_filename VARCHAR, drive_file_name VARCHAR, mime_type VARCHAR, temp_drive_folder_id VARCHAR, temp_drive_file_id VARCHAR, drive_web_view_link VARCHAR, final_drive_file_id VARCHAR, final_drive_web_view_link VARCHAR, final_drive_path VARCHAR, ocr_json VARCHAR, classification_json VARCHAR, ocr_confidence DOUBLE, processing_status VARCHAR, error_json VARCHAR, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\",\n    \"CREATE TABLE IF NOT EXISTS equipment_ingestion_log (ingestion_id VARCHAR PRIMARY KEY, project VARCHAR, entity_type VARCHAR, source_channel VARCHAR, source_sender_id VARCHAR, source_sender_name VARCHAR, source_message_id VARCHAR, source_message_text VARCHAR, received_at TIMESTAMP, image_count INTEGER, raw_payload_json VARCHAR, temp_drive_folder_id VARCHAR, processing_status VARCHAR DEFAULT 'received', equipment_id VARCHAR, final_status VARCHAR, review_required BOOLEAN DEFAULT TRUE, error_json VARCHAR, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)\"\n]\nwith db_con() as con:\n    for stmt in stmts:\n        con.execute(stmt)\n    alter_stmts = [\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS project VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS entity_type VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS source_message_text VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS ownership_mode VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS purchase_price DOUBLE\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS purchase_currency VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS acquisition_note VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS review_reasons_json VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS business_context_json VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS processing_status VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS final_status VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS final_drive_folder_id VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS final_drive_folder_path VARCHAR\",\n        \"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS review_required BOOLEAN DEFAULT TRUE\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS equipment_id VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS image_role VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS original_filename VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS temp_drive_folder_id VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS temp_drive_file_id VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS final_drive_file_id VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS final_drive_web_view_link VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS final_drive_path VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS ocr_json VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS classification_json VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS ocr_confidence DOUBLE\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS processing_status VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS error_json VARCHAR\",\n        \"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS project VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS entity_type VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS source_message_text VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS temp_drive_folder_id VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS equipment_id VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS final_status VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS review_required BOOLEAN DEFAULT TRUE\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS error_json VARCHAR\"\n    ]\n    for stmt in alter_stmts:\n        try:\n            con.execute(stmt)\n        except Exception:\n            pass\n    try:\n        con.execute(\"DROP VIEW IF EXISTS vw_equipment_latest\")\n    except Exception:\n        pass\n    try:\n        con.execute(\"CREATE VIEW vw_equipment_latest AS SELECT equipment_id, ingestion_id, project, entity_type, label, category, subtype, brand, model, serial_number, condition_label, location_hint, status, confidence, updated_at FROM equipment\")\n    except Exception:\n        pass\nout = []\nfor it in items:\n    d = dict(it.get('json', {}) or {})\n    d['_db_path'] = DB_PATH\n    out.append({'json': d})\nreturn out"
+      },
+      "id": "duckdb_init",
+      "name": "DuckDB Init Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, json, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nout=[]\nwith db_con() as con:\n    for it in _items:\n        d = it.get('json', {}) or {}\n        sender = d.get('sender', {}) or {}\n        message = d.get('message', {}) or {}\n        con.execute(\"INSERT OR REPLACE INTO equipment_ingestion_log (ingestion_id, project, entity_type, source_channel, source_sender_id, source_sender_name, source_message_id, source_message_text, received_at, image_count, raw_payload_json, processing_status, review_required, error_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)\", [d.get('ingestion_id'), d.get('project'), d.get('entity_type','equipment'), d.get('source'), sender.get('id'), sender.get('display_name'), message.get('id'), message.get('text'), message.get('received_at'), d.get('image_count', 0), json.dumps(d.get('raw_payload', {}), ensure_ascii=False), 'received', True, json.dumps(d.get('errors', []), ensure_ascii=False) if d.get('errors') else None])\n        out.append({'json': d})\nreturn out\n"
+      },
+      "id": "write_ingestion_log",
+      "name": "Write Ingestion Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const text = ($json.message?.text || '').trim();\nconst lower = text.toLowerCase();\nconst result = {\n  location_hint: '',\n  ownership_mode: '',\n  purchase_price: null,\n  purchase_currency: 'EUR',\n  acquisition_note: '',\n  usage_notes: '',\n  accessories: []\n};\nconst locationPatterns = [\n  /(?:stock[ée]?|rang[ée]?|situ[ée]?|actuellement)[^.,;:]*?(?:au|à|dans|sur|sous|derrière|devant|au dessus de|au-dessus de)\\s+([^.,;]+)/i,\n  /(au dessus de l[’']établi|au-dessus de l[’']établi|sur l[’']établi|dans l[’']atelier|dans le garage)/i\n];\nfor (const re of locationPatterns) {\n  const m = text.match(re);\n  if (m) {\n    result.location_hint = (m[1] || '').trim();\n    break;\n  }\n}\nif (/(?:donné|donnée|donne|offert|offerte|gratuit|gratuite|récupéré|recupere)/i.test(lower)) result.ownership_mode = 'given';\nelse if (/(?:prêt|pret|emprunt)/i.test(lower)) result.ownership_mode = 'loan';\nelse if (/(?:acheté|achetee|payé|payee|facture|facturé|facturee)/i.test(lower)) result.ownership_mode = 'purchased';\nconst priceMatch = text.match(/(\\d+[.,]?\\d*)\\s?(€|eur|euros)/i);\nif (priceMatch) {\n  result.purchase_price = Number(priceMatch[1].replace(',', '.'));\n  result.purchase_currency = 'EUR';\n}\nif (/je ne l'ai pas payé|je ne l'ai pas payee|il m'a été donné|il m'a ete donne|objet reçu gratuitement|objet recu gratuitement/i.test(lower)) {\n  result.ownership_mode = 'given';\n  result.purchase_price = 0;\n  result.purchase_currency = 'EUR';\n  result.acquisition_note = 'Objet reçu gratuitement / donné';\n}\nconst accessories = [];\nif (/batterie/i.test(lower)) accessories.push('batterie');\nif (/chargeur/i.test(lower)) accessories.push('chargeur');\nresult.accessories = [...new Set(accessories)];\nresult.usage_notes = text;\nreturn [{ json: { ...$json, message_facts: result } }];"
+      },
+      "id": "extract_message_facts",
+      "name": "Extract Message Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.ingestion_id}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "create_temp_folder",
+      "name": "Create Temp Drive Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        3808,
+        48
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json || {};\nconst tempDriveRootId = root.temp_drive_root_id || root.temp_root_folder_id || root.context?.default_drive_root_id || root.default_drive_root_id || null;\nconst tempFolderId = root.temp_drive_folder_id || root.id || null;\nreturn [{ json: {\n  ...root,\n  temp_drive_root_id: tempDriveRootId,\n  temp_drive_folder_id: tempFolderId,\n  temp_drive_folder_name: root.temp_drive_folder_name || root.name || root.ingestion_id || null,\n  temp_drive_folder_path: root.temp_drive_folder_path || (root.ingestion_id ? `SIGA_TEMP/${String(root.ingestion_id)}` : null),\n  temp_drive_folder_web_view_link: root.temp_drive_folder_web_view_link || root.webViewLink || null,\n} }];"
+      },
+      "id": "attach_temp_folder",
+      "name": "Attach Temp Folder Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4256,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json;\nconst images = Array.isArray(root.images) ? root.images : [];\nreturn images.map((img, idx) => {\n  const content = img.content_base64 || null;\n  const hasBase64 = !!content;\n  const imageIndex = Number(img.index || idx + 1);\n  const imageUid = String(root.ingestion_id || 'SIGA') + '-IMG' + String(imageIndex).padStart(3, '0');\n  const base = {\n    ...root,\n    image_index: imageIndex,\n    image_uid: imageUid,\n    current_image: img,\n    original_filename: img.filename || ('image_' + imageIndex + '.jpg'),\n    mime_type: img.mime_type || 'image/jpeg'\n  };\n  if (!hasBase64) {\n    return {\n      json: {\n        ...base,\n        processing_status: 'image_error',\n        image_error: { code: 'missing_content_base64', message: 'content_base64 is required for OCR and staging in this workflow version' }\n      }\n    };\n  }\n  return { json: { ...base, processing_status: 'ready_for_ocr_and_staging', image_error: null } };\n});"
+      },
+      "id": "split_images",
+      "name": "Split Images",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4480,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n  const j = item.json || {};\n  const img = j.current_image || {};\n  if (!img.content_base64) {\n    return { json: { ...j, _binary_ready: false } };\n  }\n  return {\n    json: { ...j, _binary_ready: true },\n    binary: {\n      data: {\n        data: img.content_base64,\n        mimeType: img.mime_type || 'image/jpeg',\n        fileName: img.filename || ('image_' + (j.image_index || 1) + '.jpg')\n      }\n    }\n  };\n});"
+      },
+      "id": "prepare_binary_inline",
+      "name": "Prepare Binary Inline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4704,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "name": "={{$json.image_uid + '__' + ($binary.data.fileName || $json.original_filename || ('image_' + ($json.image_index || 1) + '.jpg'))}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.temp_drive_folder_id}}"
+        },
+        "options": {}
+      },
+      "id": "upload_temp_drive",
+      "name": "Upload Temp to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        5152,
+        -288
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "operation": "analyze",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "GPT-4O"
+        },
+        "text": "Analyse cette photo d’outil ou machine d’atelier. Réponds UNIQUEMENT en JSON strict selon ce schéma exact: {\"image_role\":\"overview|nameplate|detail|unknown\",\"contains_nameplate\":true,\"detected_object_type\":\"\",\"brand\":\"\",\"model\":\"\",\"serial_number\":null,\"nameplate_text\":\"\",\"technical_specs\":{},\"condition_notes\":[],\"equipment_count_estimate\":1,\"readability\":0.0,\"confidence\":0.0,\"is_primary_equipment_candidate\":false,\"primary_equipment_confidence\":0.0,\"is_accessory_or_consumable\":false,\"accessory_type\":\"\",\"secondary_objects\":[],\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"item_role\":\"primary|accessory|consumable|associated_item|packaging|unknown\",\"packaging_detected\":false,\"is_packaged_item\":false,\"missing_visual_information\":[]}. Pour secondary_objects, utilise une liste d’objets de forme {\"label\":\"\",\"object_type\":\"\",\"item_role\":\"accessory|consumable|associated_item|packaging|unknown\",\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"packaging_detected\":false,\"is_packaged_item\":false,\"brand\":\"\",\"model\":\"\",\"confidence\":0.0,\"evidence\":[]}. Règles: 1) image_role=overview pour vue globale de l'équipement, nameplate pour plaque signalétique / étiquette technique, detail pour détail/état/usure, unknown sinon. 2) brand/model/serial/specs prioritairement si lisibles. 3) condition_notes = liste courte de constats visuels factuels. 4) confidence, readability et primary_equipment_confidence entre 0 et 1. 5) Si l’image montre surtout un emballage, un disque, une lame, une boîte, un consommable ou un accessoire isolé, renseigne is_accessory_or_consumable=true, accessory_type si possible, et n’en fais pas l’équipement principal. 6) Si l’image montre clairement la machine / l’outil principal, renseigne is_primary_equipment_candidate=true. 7) Détecte aussi les objets secondaires visibles autour de l’équipement principal: disque, lame, batterie, chargeur, emballage, boîte, lot de consommables, etc. Remplis secondary_objects même si l’objet principal reste la machine. 8) Pour les consommables de coupe (disque/lame), qualifie au mieux consumable_state: new si neuf / emballé / très peu utilisé, used si usure visible modérée, very_used si très forte usure, inconnu sinon. 9) packaging_detected=true si emballage/boîte/sachet visible; is_packaged_item=true si l’objet semble encore dans son emballage ou présenté comme produit emballé. 10) item_role doit refléter la fonction métier de l’objet observé, sans jamais promouvoir un objet secondaire comme équipement principal. 11) Si le modèle d’un disque/accessoire n’est pas lisible, ne l’invente pas. 12) Pas de markdown, pas d’explication, JSON strict seulement.",
+        "inputType": "base64",
+        "options": {}
+      },
+      "id": "analyze_image_inline",
+      "name": "Analyze Image OCR Inline",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        5152,
+        -96
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "rILpYjTayqc4jXXZ",
+          "name": "OpenAi account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function toObject(value) {\n  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;\n  return value;\n}\nfunction firstNonEmpty(...values) {\n  for (const value of values) {\n    if (value === null || value === undefined) continue;\n    if (typeof value === 'string' && value.trim() === '') continue;\n    if (Array.isArray(value) && value.length === 0) continue;\n    if (typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0) continue;\n    return value;\n  }\n  return null;\n}\nfunction normalizeSpecs(specs) {\n  if (!specs) return {};\n  if (typeof specs === 'string') {\n    const text = specs.trim();\n    if (!text) return {};\n    try {\n      const parsed = JSON.parse(text);\n      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;\n    } catch {}\n    return { raw: text };\n  }\n  if (Array.isArray(specs)) {\n    const entries = specs.map((item, index) => {\n      if (!item) return null;\n      if (typeof item === 'string') return [String(index + 1), item.trim()];\n      if (typeof item === 'object') {\n        const key = String(item.key || item.name || item.label || item.spec || '').trim();\n        const value = firstNonEmpty(item.value, item.text, item.content, item.spec_value);\n        if (key && value !== null && value !== undefined && String(value).trim() !== '') return [key, String(value).trim()];\n      }\n      return null;\n    }).filter(Boolean);\n    return Object.fromEntries(entries);\n  }\n  if (typeof specs === 'object') return specs;\n  return {};\n}\nfunction clamp01(value) {\n  const num = Number(value);\n  return Number.isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;\n}\nfunction normalizeBoolean(value, fallback = false) {\n  if (typeof value === 'boolean') return value;\n  if (typeof value === 'number') return value !== 0;\n  if (typeof value === 'string') {\n    const t = value.trim().toLowerCase();\n    if (['true','yes','1','oui'].includes(t)) return true;\n    if (['false','no','0','non'].includes(t)) return false;\n  }\n  return fallback;\n}\nfunction normalizeRole(value) {\n  const t = String(value || '').trim().toLowerCase();\n  if (!t) return 'unknown';\n  if (/(primary)/.test(t)) return 'primary';\n  if (/(consumable|consommable)/.test(t)) return 'consumable';\n  if (/(accessory|accessoire)/.test(t)) return 'accessory';\n  if (/(associated_item|associated item|objet associ|item associ)/.test(t)) return 'associated_item';\n  if (/(packaging|emballage|box|boite)/.test(t)) return 'packaging';\n  return 'unknown';\n}\nfunction normalizeConsumableState(value, haystack = '') {\n  const direct = String(value || '').trim().toLowerCase();\n  if (['new','used','very_used','unknown'].includes(direct)) return direct;\n  const text = `${direct} ${String(haystack || '').toLowerCase()}`;\n  if (/(very used|tr[eè]s us[ée]|forte usure|tr[eè]s tr[eè]s us[ée]|heavily worn|worn out)/.test(text)) return 'very_used';\n  if (/(new|neuf|nouveau|unopened|emball[ée]|packaged)/.test(text)) return 'new';\n  if (/(used|us[ée]|worn)/.test(text)) return 'used';\n  return 'unknown';\n}\nfunction normalizeSecondaryObjects(raw, fallback = {}) {\n  const values = Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? [raw] : []);\n  const out = [];\n  for (const item of values) {\n    if (!item || typeof item !== 'object') continue;\n    const evidenceRaw = firstNonEmpty(item.evidence, item.notes, item.condition_notes, item.visual_evidence, []);\n    const evidence = Array.isArray(evidenceRaw) ? evidenceRaw.map(v => String(v || '').trim()).filter(Boolean) : (typeof evidenceRaw === 'string' && evidenceRaw.trim() ? [evidenceRaw.trim()] : []);\n    const label = String(firstNonEmpty(item.label, item.name, item.object_label, item.object_type, item.type, '') || '').trim();\n    const objectType = String(firstNonEmpty(item.object_type, item.type, item.detected_object_type, label, '') || '').trim();\n    const roleHaystack = [label, objectType, firstNonEmpty(item.item_role, fallback.item_role, ''), firstNonEmpty(item.item_condition, fallback.item_condition, ''), ...evidence].filter(Boolean).join(' ');\n    const packagingDetected = normalizeBoolean(firstNonEmpty(item.packaging_detected, fallback.packaging_detected, false), /(packaging|emballage|bo[iî]te|box|sachet)/i.test(roleHaystack));\n    const isPackaged = normalizeBoolean(firstNonEmpty(item.is_packaged_item, fallback.is_packaged_item, false), packagingDetected || /(emball[ée]|packaged|sealed|unopened)/i.test(roleHaystack));\n    const itemCondition = String(firstNonEmpty(item.item_condition, item.condition, fallback.item_condition, '') || '').trim();\n    const consumableState = normalizeConsumableState(firstNonEmpty(item.consumable_state, fallback.consumable_state, ''), [label, objectType, itemCondition, ...evidence].join(' '));\n    let itemRole = normalizeRole(firstNonEmpty(item.item_role, fallback.item_role, ''));\n    const normalizedType = `${label} ${objectType}`.toLowerCase();\n    if (itemRole === 'unknown') {\n      if (/(disc|disque|blade|lame|wheel)/.test(normalizedType)) itemRole = 'consumable';\n      else if (packagingDetected || isPackaged) itemRole = 'packaging';\n      else if (/(battery|batterie|charger|chargeur|case|coffret)/.test(normalizedType)) itemRole = 'accessory';\n      else itemRole = 'associated_item';\n    }\n    out.push({\n      label,\n      object_type: objectType,\n      item_role: itemRole,\n      consumable_state: consumableState,\n      item_condition: itemCondition,\n      packaging_detected: packagingDetected,\n      is_packaged_item: isPackaged,\n      brand: String(firstNonEmpty(item.brand, '') || '').trim(),\n      model: String(firstNonEmpty(item.model, '') || '').trim(),\n      confidence: clamp01(firstNonEmpty(item.confidence, fallback.confidence, 0)),\n      evidence\n    });\n  }\n  return out;\n}\nfunction guessAccessoryFlags(source, detectedObjectType, originalFilename, imageRole) {\n  const haystack = [source.accessory_type, detectedObjectType, source.nameplate_text, originalFilename, imageRole]\n    .filter(Boolean).join(' ').toLowerCase();\n  const accessoryPatterns = [\n    { re: /(packaging|box|boite|emballage)/, type: 'packaging' },\n    { re: /(blade|lame|disque|disc|wheel)/, type: 'cutting_disc' },\n    { re: /(battery|batterie)/, type: 'battery' },\n    { re: /(charger|chargeur)/, type: 'charger' },\n    { re: /(consumable|consommable)/, type: 'consumable' },\n    { re: /(accessory|accessoire)/, type: 'accessory' }\n  ];\n  const hit = accessoryPatterns.find(p => p.re.test(haystack));\n  const accessoryType = String(firstNonEmpty(source.accessory_type, hit?.type, '') || '').trim();\n  const isAccessory = Boolean(source.is_accessory_or_consumable) || !!hit;\n  let primaryConfidence = clamp01(firstNonEmpty(source.primary_equipment_confidence, source.primary_confidence, source.primaryEquipmentConfidence, 0));\n  if (isAccessory && primaryConfidence > 0.55) primaryConfidence = Math.min(primaryConfidence, 0.45);\n  const isPrimary = Boolean(source.is_primary_equipment_candidate) || (!isAccessory && /overview|detail|nameplate/.test(String(imageRole || '')) && /(machine|saw|tool|tronçonneuse|decoupeuse|cut-off saw|cut-off machine|concrete saw|disc cutter|portable power tool)/i.test(String(detectedObjectType || '')));\n  if (!primaryConfidence && isPrimary) primaryConfidence = imageRole === 'overview' ? 0.75 : (imageRole === 'nameplate' ? 0.7 : 0.55);\n  if (isAccessory && !isPrimary) primaryConfidence = Math.min(primaryConfidence || 0.2, 0.35);\n  return { isAccessory, accessoryType, isPrimary, primaryConfidence };\n}\nfunction normalize(parsed = {}, originalFilename = '') {\n  const source = toObject(parsed) || {};\n  const imageRole = String(firstNonEmpty(source.image_role, source.role, source.imageRole, 'unknown') || 'unknown').trim() || 'unknown';\n  const nameplateText = String(firstNonEmpty(source.nameplate_text, source.manufacturer_plate_text, source.plate_text, source.raw_text, '') || '').trim();\n  const technicalSpecs = normalizeSpecs(firstNonEmpty(source.technical_specs, source.specifications, source.specs, source.tech_specs, {}));\n  const conditionNotesRaw = firstNonEmpty(source.condition_notes, source.notes, source.visual_notes, []);\n  const conditionNotes = Array.isArray(conditionNotesRaw) ? conditionNotesRaw.map(v => String(v || '').trim()).filter(Boolean) : (typeof conditionNotesRaw === 'string' && conditionNotesRaw.trim() ? [conditionNotesRaw.trim()] : []);\n  const missingRaw = firstNonEmpty(source.missing_visual_information, source.missing_info, []);\n  const missing = Array.isArray(missingRaw) ? missingRaw.map(v => String(v || '').trim()).filter(Boolean) : [];\n  const serial = firstNonEmpty(source.serial_number, source.serial, source.serialNo, source.serial_no, null);\n  const containsNameplate = Boolean((source.contains_nameplate ?? source.containsNameplate ?? null) ?? (imageRole === 'nameplate' || Boolean(nameplateText)));\n  const detectedObjectType = String(firstNonEmpty(source.detected_object_type, source.object_type, source.subtype, source.item_type, '') || '').trim();\n  const flags = guessAccessoryFlags(source, detectedObjectType, originalFilename, imageRole);\n  const packagingDetected = normalizeBoolean(firstNonEmpty(source.packaging_detected, source.has_packaging, false), /(packaging|emballage|bo[iî]te|box|sachet)/i.test([source.accessory_type, detectedObjectType, nameplateText].filter(Boolean).join(' ')));\n  const isPackagedItem = normalizeBoolean(firstNonEmpty(source.is_packaged_item, source.packaged_item, false), packagingDetected);\n  const itemCondition = String(firstNonEmpty(source.item_condition, source.condition, '') || '').trim();\n  const consumableState = normalizeConsumableState(firstNonEmpty(source.consumable_state, source.item_state, ''), [detectedObjectType, itemCondition, ...conditionNotes].join(' '));\n  const itemRole = normalizeRole(firstNonEmpty(source.item_role, flags.isAccessory ? (packagingDetected ? 'packaging' : 'accessory') : (flags.isPrimary ? 'primary' : 'unknown'), 'unknown'));\n  const secondaryObjects = normalizeSecondaryObjects(firstNonEmpty(source.secondary_objects, source.secondaryItems, source.detected_secondary_objects, []), {\n    item_role: flags.isAccessory ? (/(disc|blade|lame|disque|wheel)/i.test(`${flags.accessoryType} ${detectedObjectType}`) ? 'consumable' : 'accessory') : 'associated_item',\n    consumable_state: consumableState,\n    item_condition: itemCondition,\n    packaging_detected: packagingDetected,\n    is_packaged_item: isPackagedItem,\n    confidence: clamp01(firstNonEmpty(source.confidence, source.ocr_confidence, source.score, 0))\n  });\n  return {\n    image_role: ['overview','nameplate','detail','unknown'].includes(imageRole) ? imageRole : 'unknown',\n    contains_nameplate: containsNameplate,\n    detected_object_type: detectedObjectType,\n    brand: String(firstNonEmpty(source.brand, source.manufacturer, source.make, '') || '').trim(),\n    model: String(firstNonEmpty(source.model, source.model_number, source.reference, '') || '').trim(),\n    serial_number: serial === null || serial === undefined || String(serial).trim() === '' ? null : String(serial).trim(),\n    nameplate_text: nameplateText,\n    technical_specs: technicalSpecs,\n    condition_notes: conditionNotes,\n    readability: clamp01(firstNonEmpty(source.readability, source.ocr_readability, source.legibility, 0)),\n    confidence: clamp01(firstNonEmpty(source.confidence, source.ocr_confidence, source.score, 0)),\n    is_primary_equipment_candidate: flags.isPrimary,\n    primary_equipment_confidence: flags.primaryConfidence,\n    is_accessory_or_consumable: flags.isAccessory,\n    accessory_type: flags.accessoryType,\n    secondary_objects: secondaryObjects,\n    consumable_state: consumableState,\n    item_condition: itemCondition,\n    item_role: itemRole,\n    packaging_detected: packagingDetected,\n    is_packaged_item: isPackagedItem,\n    missing_visual_information: missing\n  };\n}\nfunction parseJsonFromText(text) {\n  const trimmed = String(text || '').trim();\n  if (!trimmed) return null;\n  const candidates = [];\n  const ticks = String.fromCharCode(96,96,96);\n  const fenceParts = trimmed.split(ticks);\n  if (fenceParts.length >= 3) {\n    const fencedBody = fenceParts[1].replace(/^json\\s*/i, '').trim();\n    if (fencedBody) candidates.push(fencedBody);\n  }\n  candidates.push(trimmed);\n  const objStart = trimmed.indexOf('{');\n  const objEnd = trimmed.lastIndexOf('}');\n  if (objStart >= 0 && objEnd > objStart) candidates.push(trimmed.slice(objStart, objEnd + 1));\n  for (const candidate of candidates) {\n    try {\n      const parsed = JSON.parse(candidate);\n      if (parsed && typeof parsed === 'object') return parsed;\n    } catch {}\n  }\n  return null;\n}\nfunction parseAI(raw, originalFilename = '') {\n  const queue = [raw];\n  const seen = new Set();\n  while (queue.length) {\n    const value = queue.shift();\n    if (!value) continue;\n    if (typeof value === 'object') {\n      if (seen.has(value)) continue;\n      seen.add(value);\n    }\n    if (typeof value === 'string') {\n      const parsed = parseJsonFromText(value);\n      if (parsed) {\n        const normalized = normalize(parsed, originalFilename);\n        if (normalized.nameplate_text || normalized.brand || normalized.model || normalized.serial_number || Object.keys(normalized.technical_specs).length || normalized.image_role !== 'unknown') return normalized;\n        queue.push(parsed);\n      }\n      continue;\n    }\n    if (Array.isArray(value)) { for (const item of value) queue.push(item); continue; }\n    if (typeof value === 'object') {\n      const direct = normalize(value, originalFilename);\n      if (direct.nameplate_text || direct.brand || direct.model || direct.serial_number || Object.keys(direct.technical_specs).length || direct.image_role !== 'unknown' || direct.contains_nameplate) return direct;\n      const priorityKeys = ['content','text','output','response','message','messages','data','result','results','completion','answer'];\n      for (const key of priorityKeys) if (key in value) queue.push(value[key]);\n      for (const [key, child] of Object.entries(value)) if (!priorityKeys.includes(key)) queue.push(child);\n    }\n  }\n  return normalize({}, originalFilename);\n}\nfunction safeAll(nodeName) { try { return $(nodeName).all(); } catch { return []; } }\nfunction safeFirst(nodeName) { try { return $(nodeName).first().json || {}; } catch { return {}; } }\nfunction pairedIndex(item) {\n  const paired = item?.pairedItem;\n  if (typeof paired === 'number' && Number.isInteger(paired)) return paired;\n  if (paired && typeof paired === 'object' && Number.isInteger(paired.item)) return paired.item;\n  if (Array.isArray(paired)) {\n    for (const candidate of paired) {\n      if (typeof candidate === 'number' && Number.isInteger(candidate)) return candidate;\n      if (candidate && typeof candidate === 'object' && Number.isInteger(candidate.item)) return candidate.item;\n    }\n  }\n  return null;\n}\nconst root = safeFirst('Attach Temp Folder Context');\nconst images = Array.isArray(root.images) ? root.images : [];\nconst ocrItems = safeAll('Analyze Image OCR Inline');\nconst driveItems = safeAll('Upload Temp to Drive');\nconst errorItems = safeAll('Image Error Best Effort');\nconst errorByUid = new Map(errorItems.map(item => { const j = item.json || {}; return [String(j.image_uid || ('SIGA-IMG-' + (j.image_index || 0))), j]; }));\nconst ocrByUid = new Map();\nconst ocrByIndex = new Map();\nfor (const item of ocrItems) {\n  const j = item.json || {};\n  const uid = String(j.image_uid || ('SIGA-IMG-' + (j.image_index || 0)));\n  if (uid && !/SIGA-IMG-0+$/.test(uid)) ocrByUid.set(uid, j);\n  const idx = pairedIndex(item);\n  if (idx !== null) ocrByIndex.set(idx, j);\n}\nconst driveByUid = new Map();\nconst driveByIndex = new Map();\nfor (const item of driveItems) {\n  const j = item.json || {};\n  const name = String(j.name || '');\n  const parsedUid = name.includes('__') ? name.split('__')[0] : String(j.image_uid || '');\n  if (parsedUid) driveByUid.set(parsedUid, j);\n  const idx = pairedIndex(item);\n  if (idx !== null) driveByIndex.set(idx, j);\n}\nreturn images.map((img, idx) => {\n  const imageIndex = Number(img.index || idx + 1);\n  const imageUid = String(root.ingestion_id || 'SIGA') + '-IMG' + String(imageIndex).padStart(3, '0');\n  const base = { ...root, image_index: imageIndex, image_uid: imageUid, current_image: img, original_filename: img.filename || ('image_' + imageIndex + '.jpg'), mime_type: img.mime_type || 'image/jpeg' };\n  if (errorByUid.has(imageUid) || !img.content_base64) {\n    const errItem = errorByUid.get(imageUid);\n    const err = errItem?.image_analysis || { image_index: imageIndex, original_filename: base.original_filename, mime_type: base.mime_type, image_role: 'unknown', contains_nameplate: false, detected_object_type: '', brand: '', model: '', serial_number: null, nameplate_text: '', technical_specs: {}, condition_notes: [], readability: 0, confidence: 0, is_primary_equipment_candidate: false, primary_equipment_confidence: 0, is_accessory_or_consumable: false, accessory_type: '', missing_visual_information: ['content_base64'], temp_drive_folder_id: root.temp_drive_folder_id || null, temp_drive_file_id: null, temp_drive_web_view_link: null, temp_drive_file_name: null, analysis: {}, processing_status: 'image_error', error_json: errItem?.image_analysis?.error_json || { code: 'missing_content_base64', message: 'content_base64 is required for OCR and staging in this workflow version' } };\n    return { json: { ...base, image_analysis: err } };\n  }\n  const ocrRaw = ocrByUid.get(imageUid) || ocrByIndex.get(idx) || {};\n  const drive = driveByUid.get(imageUid) || driveByIndex.get(idx) || {};\n  const analysis = parseAI(ocrRaw, base.original_filename);\n  const ocrFailed = !!(ocrRaw.error || ocrRaw.message || (ocrRaw.json && ocrRaw.json.error));\n  const driveFailed = !!(drive.error || drive.message || (drive.json && drive.json.error));\n  const errors = [];\n  if (ocrFailed) errors.push({ code: 'ocr_failed', detail: ocrRaw.error || ocrRaw.message || ocrRaw });\n  if (driveFailed || !drive.id) errors.push({ code: 'temp_drive_upload_failed', detail: drive.error || drive.message || drive || 'missing_drive_file_id' });\n  const imageRole = analysis.image_role || ((base.original_filename || '').toLowerCase().includes('plaque') ? 'nameplate' : ((base.original_filename || '').toLowerCase().includes('vue') ? 'overview' : 'unknown'));\n  const enriched = {\n    image_index: imageIndex,\n    original_filename: base.original_filename,\n    mime_type: base.mime_type,\n    image_role: imageRole,\n    contains_nameplate: Boolean(analysis.contains_nameplate || imageRole === 'nameplate' || String(analysis.nameplate_text || '').trim()),\n    detected_object_type: analysis.detected_object_type || '',\n    brand: analysis.brand || '',\n    model: analysis.model || '',\n    serial_number: analysis.serial_number || null,\n    nameplate_text: analysis.nameplate_text || '',\n    technical_specs: analysis.technical_specs || {},\n    condition_notes: Array.isArray(analysis.condition_notes) ? analysis.condition_notes : [],\n    readability: Number.isFinite(Number(analysis.readability)) ? Number(analysis.readability) : 0,\n    confidence: Number.isFinite(Number(analysis.confidence)) ? Number(analysis.confidence) : 0,\n    is_primary_equipment_candidate: Boolean(analysis.is_primary_equipment_candidate),\n    primary_equipment_confidence: Number.isFinite(Number(analysis.primary_equipment_confidence)) ? Number(analysis.primary_equipment_confidence) : 0,\n    is_accessory_or_consumable: Boolean(analysis.is_accessory_or_consumable),\n    accessory_type: analysis.accessory_type || '',\n    missing_visual_information: Array.isArray(analysis.missing_visual_information) ? analysis.missing_visual_information : [],\n    temp_drive_folder_id: root.temp_drive_folder_id || null,\n    temp_drive_file_id: drive.id || null,\n    temp_drive_web_view_link: drive.webViewLink || null,\n    temp_drive_file_name: drive.name || base.original_filename || null,\n    drive_temp_metadata: { folder_id: root.temp_drive_folder_id || null, file_id: drive.id || null, web_view_link: drive.webViewLink || null, file_name: drive.name || base.original_filename || null },\n    classification: { is_primary_equipment_candidate: Boolean(analysis.is_primary_equipment_candidate), primary_equipment_confidence: Number(analysis.primary_equipment_confidence || 0), is_accessory_or_consumable: Boolean(analysis.is_accessory_or_consumable), accessory_type: analysis.accessory_type || '', secondary_objects: Array.isArray(analysis.secondary_objects) ? analysis.secondary_objects : [], consumable_state: analysis.consumable_state || 'unknown', item_condition: analysis.item_condition || '', item_role: analysis.item_role || 'unknown', packaging_detected: Boolean(analysis.packaging_detected), is_packaged_item: Boolean(analysis.is_packaged_item) },\n    analysis,\n    processing_status: errors.length ? (drive.id || analysis.nameplate_text || analysis.brand || analysis.model ? 'partial_error' : 'image_error') : 'staged_temp_drive',\n    error_json: errors.length ? errors : null\n  };\n  return { json: { ...base, temp_drive_file_id: drive.id || null, temp_drive_web_view_link: drive.webViewLink || null, temp_drive_file_name: drive.name || base.original_filename || null, image_analysis: enriched } };\n});"
+      },
+      "id": "merge_ocr_drive",
+      "name": "Merge OCR + Drive Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5376,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all().map(i => i.json || {});\nif (!items.length) return [];\nconst first = items[0];\nconst analyses = items.map(i => i.image_analysis).filter(Boolean);\nconst usableAnalyses = analyses.filter(a => ['staged_temp_drive','partial_error','ocr_done_drive_missing','finalized'].includes(a.processing_status) || !!(a.nameplate_text || a.brand || a.model || a.temp_drive_file_id));\nconst messageFacts = first.message_facts || { location_hint:'', ownership_mode:'', purchase_price:null, purchase_currency:'EUR', acquisition_note:'', usage_notes:'', accessories:[] };\nconst clean = (v) => String(v || '').trim();\nconst flattenDeep = (arr) => (arr || []).reduce((acc, v) => acc.concat(Array.isArray(v) ? flattenDeep(v) : [v]), []);\nconst uniq = (arr) => [...new Set(flattenDeep(arr).filter(v => v !== null && v !== undefined && String(v).trim() !== '').map(v => String(v).trim()))];\nconst hasValue = (v) => { if (v === null || v === undefined) return false; if (Array.isArray(v)) return v.length > 0; if (typeof v === 'object') return Object.keys(v).length > 0; return clean(v) !== ''; };\nconst roleOf = (a) => clean(a?.image_role || a?.analysis?.image_role || 'unknown');\nconst lower = (v) => clean(v).toLowerCase();\nconst normalizeBrand = (v) => clean(v).replace(/\\s+/g, ' ').trim();\nconst normalizeModel = (v) => clean(v).replace(/\\s+/g, ' ').trim();\nconst normalizeSerial = (v) => clean(v).replace(/\\s+/g, '').trim();\nconst objectTypeRaw = (a) => clean(a?.detected_object_type || a?.analysis?.detected_object_type);\nconst imageText = (a) => clean([a?.brand, a?.model, a?.nameplate_text, a?.accessory_type, objectTypeRaw(a), a?.original_filename].filter(Boolean).join(' '));\nconst typeBag = (a) => lower([objectTypeRaw(a), a?.accessory_type, a?.original_filename, a?.nameplate_text].filter(Boolean).join(' '));\nconst accessoryKeywords = /(packaging|box|emballage|bo[iî]te|blade|lame|disque|disc|wheel|consumable|consommable|accessory|accessoire|battery|batterie|charger|chargeur)/i;\nconst machineKeywords = /(cut-off saw|cut-off machine|concrete saw|disc cutter|cutoff machine|tron[çc]onneuse|d[ée]coupeuse|tool|machine|portable power tool|power cutter)/i;\nconst genericKeywords = /(portable power tool|power tool|tool|machine)/i;\nconst normalizeConsumableState = (value, text = '') => {\n  const direct = clean(value).toLowerCase();\n  if (['new','used','very_used','unknown'].includes(direct)) return direct;\n  const hay = `${direct} ${clean(text).toLowerCase()}`;\n  if (/(very used|tr[eè]s us[ée]|forte usure|tr[eè]s tr[eè]s us[ée]|heavily worn|worn out)/.test(hay)) return 'very_used';\n  if (/(new|neuf|emball[ée]|packaged|unopened|sealed)/.test(hay)) return 'new';\n  if (/(used|us[ée]|worn)/.test(hay)) return 'used';\n  return 'unknown';\n};\nconst normalizeItemRole = (value, text = '') => {\n  const t = `${clean(value).toLowerCase()} ${clean(text).toLowerCase()}`;\n  if (/(consumable|consommable|disc|disque|blade|lame|wheel)/.test(t)) return 'consumable';\n  if (/(packaging|emballage|box|bo[iî]te|sachet)/.test(t)) return 'packaging';\n  if (/(accessory|accessoire|battery|batterie|charger|chargeur|case|coffret)/.test(t)) return 'accessory';\n  if (/(associated_item|associated item|objet associ)/.test(t)) return 'associated_item';\n  return 'associated_item';\n};\nconst secondaryObjectLabel = (obj = {}) => {\n  const typeText = lower([obj.label, obj.object_type, obj.item_condition].filter(Boolean).join(' '));\n  const state = normalizeConsumableState(obj.consumable_state, typeText + ' ' + (obj.evidence || []).join(' '));\n  const packaged = Boolean(obj.packaging_detected || obj.is_packaged_item) || /(packaging|emballage|box|bo[iî]te|sachet|packaged|emball[ée])/.test(typeText);\n  if (/(disc|disque|blade|lame|wheel)/.test(typeText)) {\n    if (packaged && state === 'new') return 'emballage de disque neuf';\n    if (packaged) return 'emballage de disque';\n    if (state === 'very_used') return 'disque de coupe très usé';\n    if (state === 'used') return 'disque de coupe usé';\n    if (state === 'new') return 'disque neuf';\n    return 'disque de coupe';\n  }\n  if (packaged) return clean([obj.label, obj.object_type].filter(Boolean).join(' ')) || 'article emballé';\n  return clean([obj.label, obj.object_type].filter(Boolean).join(' ')) || null;\n};\nfunction collectSecondaryObjects(a) {\n  const direct = Array.isArray(a?.secondary_objects) ? a.secondary_objects : (Array.isArray(a?.analysis?.secondary_objects) ? a.analysis.secondary_objects : []);\n  const seed = [];\n  for (const obj of direct) seed.push(obj);\n  const bag = lower([a?.accessory_type, objectTypeRaw(a), a?.nameplate_text, a?.original_filename, ...(a?.condition_notes || [])].filter(Boolean).join(' '));\n  if (!seed.length && (isAccessoryLike(a) || /(disc|disque|blade|lame|wheel|packaging|emballage|battery|batterie|charger|chargeur)/.test(bag))) {\n    seed.push({\n      label: clean(a?.accessory_type || mappedSubtype(objectTypeRaw(a)) || objectTypeRaw(a)),\n      object_type: clean(objectTypeRaw(a) || a?.accessory_type || ''),\n      item_role: clean(a?.item_role || a?.classification?.item_role || ''),\n      consumable_state: clean(a?.consumable_state || a?.classification?.consumable_state || ''),\n      item_condition: clean(a?.item_condition || a?.classification?.item_condition || ''),\n      packaging_detected: Boolean(a?.packaging_detected || a?.classification?.packaging_detected),\n      is_packaged_item: Boolean(a?.is_packaged_item || a?.classification?.is_packaged_item),\n      confidence: Number(a?.confidence || 0),\n      evidence: uniq(a?.condition_notes || [])\n    });\n  }\n  return seed.map(obj => {\n    const objectType = clean(obj.object_type || obj.label || '');\n    const label = clean(obj.label || objectType);\n    const evidence = uniq(obj.evidence || obj.condition_notes || []);\n    const role = normalizeItemRole(obj.item_role, `${label} ${objectType}`);\n    const consumableState = normalizeConsumableState(obj.consumable_state, `${label} ${objectType} ${clean(obj.item_condition)} ${evidence.join(' ')}`);\n    const packagingDetected = Boolean(obj.packaging_detected || /(packaging|emballage|box|bo[iî]te|sachet)/.test(lower(`${label} ${objectType}`)));\n    const isPackagedItem = Boolean(obj.is_packaged_item || packagingDetected || /(emball[ée]|packaged|sealed|unopened)/.test(lower(`${label} ${objectType} ${clean(obj.item_condition)}`)));\n    const normalizedLabel = secondaryObjectLabel({ ...obj, label, object_type: objectType, consumable_state: consumableState, packaging_detected: packagingDetected, is_packaged_item: isPackagedItem, evidence });\n    return {\n      image_index: a.image_index,\n      role: roleOf(a),\n      source_image_role: roleOf(a),\n      classification: role === 'packaging' ? 'packaging' : (role === 'consumable' ? 'consumable' : (role === 'accessory' ? 'accessory' : 'associated_item')),\n      detected_object_type: objectType || null,\n      subtype: mappedSubtype(objectType) || null,\n      brand: clean(obj.brand),\n      model: clean(obj.model),\n      label: normalizedLabel,\n      raw_label: label || null,\n      condition_notes: uniq([clean(obj.item_condition), ...evidence]),\n      confidence: Number((Number(obj.confidence || a.confidence || 0)).toFixed(3)),\n      is_consumable: role === 'consumable' || /(disc|disque|blade|lame|wheel)/.test(lower(`${label} ${objectType}`)),\n      is_accessory: role === 'accessory',\n      item_role: role,\n      consumable_state: consumableState,\n      item_condition: clean(obj.item_condition),\n      packaging_detected: packagingDetected,\n      is_packaged_item: isPackagedItem,\n      evidence\n    };\n  }).filter(x => x.label || x.detected_object_type);\n}\nfunction dedupeSecondaryItems(items) {\n  const best = new Map();\n  for (const item of items) {\n    const key = lower([item.label, item.detected_object_type, item.item_role, item.consumable_state, item.packaging_detected ? 'packaged' : 'loose'].join('|'));\n    const prev = best.get(key);\n    if (!prev || Number(item.confidence || 0) > Number(prev.confidence || 0)) best.set(key, item);\n  }\n  return [...best.values()];\n}\nfunction mappedSubtype(text) {\n  const t = lower(text);\n  if (!t) return '';\n  if (/(saw blade packaging|blade packaging|packaging|box of blade|disc packaging|emballage)/.test(t)) return 'emballage de disque';\n  if (/(cutting disc|cutting disk|diamond disc|blade|disque|disc\\b|disk\\b|wheel\\b)/.test(t)) return 'disque de coupe';\n  if (/(cut-off saw|concrete saw|disc cutter|cutoff machine|power cutter|tron[çc]onneuse [àa] b[ée]ton|d[ée]coupeuse thermique)/.test(t)) return 'tronçonneuse à béton';\n  if (/(cordless caulk|caulk gun|caulking gun|sealant gun|pistolet [àa] mastic)/.test(t)) return 'pistolet à mastic sans fil';\n  return clean(text);\n}\nfunction isAccessoryLike(a) {\n  return Boolean(a?.is_accessory_or_consumable || a?.classification?.is_accessory_or_consumable) || accessoryKeywords.test(typeBag(a));\n}\nfunction accessoryTypeOf(a) {\n  const explicit = clean(a?.accessory_type || a?.classification?.accessory_type);\n  if (explicit) return explicit;\n  const t = typeBag(a);\n  if (/(packaging|emballage|bo[iî]te|box)/.test(t)) return 'packaging';\n  if (/(blade|lame|disque|disc|wheel)/.test(t)) return 'cutting_disc';\n  if (/(battery|batterie)/.test(t)) return 'battery';\n  if (/(charger|chargeur)/.test(t)) return 'charger';\n  return 'accessory';\n}\nfunction isMachineLike(a) {\n  if (isAccessoryLike(a)) return false;\n  return Boolean(a?.is_primary_equipment_candidate || a?.classification?.is_primary_equipment_candidate) || machineKeywords.test(typeBag(a)) || /^(overview|detail|nameplate)$/.test(roleOf(a));\n}\nfunction baseScore(a) {\n  const confidence = Number(a?.confidence ?? a?.analysis?.confidence ?? 0) || 0;\n  const readability = Number(a?.readability ?? a?.analysis?.readability ?? 0) || 0;\n  const primary = Number(a?.primary_equipment_confidence ?? a?.classification?.primary_equipment_confidence ?? 0) || 0;\n  let s = confidence * 0.45 + readability * 0.15 + primary * 0.4;\n  if (roleOf(a) === 'overview') s += 0.18;\n  if (roleOf(a) === 'nameplate') s += 0.12;\n  if (hasValue(a?.brand)) s += 0.07;\n  if (hasValue(a?.model)) s += 0.1;\n  if (machineKeywords.test(typeBag(a))) s += 0.15;\n  if (genericKeywords.test(typeBag(a))) s -= 0.05;\n  if (isAccessoryLike(a)) s -= 0.45;\n  if (/packaging/.test(typeBag(a))) s -= 0.15;\n  return s;\n}\nfunction pickBest(candidates, extractor = x => x) {\n  return candidates.map(a => ({ a, value: extractor(a) })).filter(x => hasValue(x.value)).sort((x, y) => baseScore(y.a) - baseScore(x.a))[0] || null;\n}\nconst machineCandidates = usableAnalyses.filter(isMachineLike).sort((a, b) => baseScore(b) - baseScore(a));\nconst accessoryCandidates = usableAnalyses.filter(isAccessoryLike);\nconst allTypes = uniq(usableAnalyses.map(a => mappedSubtype(objectTypeRaw(a)) || objectTypeRaw(a)).filter(Boolean));\nconst primaryCandidate = machineCandidates[0] || usableAnalyses.sort((a, b) => baseScore(b) - baseScore(a))[0] || null;\nconst nameplateCandidates = usableAnalyses.filter(a => roleOf(a) === 'nameplate' || a.contains_nameplate);\nconst overviewCandidates = usableAnalyses.filter(a => roleOf(a) === 'overview');\nconst brandPick = pickBest([...nameplateCandidates, ...machineCandidates, ...overviewCandidates, ...usableAnalyses], a => normalizeBrand(a.brand || a.analysis?.brand));\nconst modelPick = pickBest([...nameplateCandidates, ...machineCandidates, ...overviewCandidates, ...usableAnalyses], a => normalizeModel(a.model || a.analysis?.model));\nlet subtype = mappedSubtype(primaryCandidate ? objectTypeRaw(primaryCandidate) : '');\nconst evidenceText = lower([messageFacts.usage_notes, first?.message?.text, ...(usableAnalyses.map(a => imageText(a)))] .filter(Boolean).join(' '));\nif (!subtype || genericKeywords.test(lower(subtype))) {\n  if (/(tron[çc]onneuse [àa] b[ée]ton|d[ée]coupeuse thermique|cut-off saw|cut-off machine|concrete saw|disc cutter|power cutter)/.test(evidenceText)) subtype = 'tronçonneuse à béton';\n  else if (/(mastic|caulk|sealant)/.test(evidenceText)) subtype = 'pistolet à mastic sans fil';\n}\nif (subtype === 'emballage de disque' && machineCandidates.length) subtype = mappedSubtype(objectTypeRaw(machineCandidates[0])) || 'tronçonneuse à béton';\nif (!subtype && machineCandidates.length) subtype = mappedSubtype(objectTypeRaw(machineCandidates[0]));\nconst brand = brandPick ? normalizeBrand(brandPick.value) : '';\nconst model = modelPick ? normalizeModel(modelPick.value) : '';\nconst label = clean([brand, model].filter(Boolean).join(' ')) || (subtype || 'Équipement à qualifier');\nlet technicalSpecs = {};\nconst specsPick = pickBest([...nameplateCandidates, ...machineCandidates, ...usableAnalyses], a => a.technical_specs || a.analysis?.technical_specs || {});\nif (specsPick) technicalSpecs = specsPick.value || {};\nconst rawNameplateText = pickBest([...nameplateCandidates, ...usableAnalyses], a => clean(a.nameplate_text || a.analysis?.nameplate_text));\nconst nameplateText = rawNameplateText ? clean(rawNameplateText.value) : '';\nfunction specStrength(specs) {\n  const entries = Object.entries(specs || {}).filter(([,v]) => hasValue(v));\n  if (!entries.length) return 0;\n  const strong = entries.filter(([k,v]) => /(v|volt|w|kw|kg|mm|rpm|hz|bar|mah|wh|amp)/i.test(String(k)+' '+String(v))).length;\n  return strong || entries.length;\n}\nconst technicalSpecsStrength = specStrength(technicalSpecs);\nif (!technicalSpecsStrength) technicalSpecs = {};\nlet serial = null;\nlet serialEvidence = null;\nfor (const a of [...nameplateCandidates, ...machineCandidates, ...usableAnalyses]) {\n  const candidate = normalizeSerial(a.serial_number || a.analysis?.serial_number || '');\n  if (!candidate) continue;\n  const score = (roleOf(a) === 'nameplate' ? 0.5 : 0) + (a.contains_nameplate ? 0.2 : 0) + (Number(a.readability || 0) * 0.15) + (Number(a.confidence || 0) * 0.15);\n  if (score >= 0.72) { serial = candidate; serialEvidence = { source: 'ocr_serial', image_index: a.image_index, score: Number(score.toFixed(3)) }; break; }\n}\nif (!serial && nameplateText) {\n  const explicitLine = nameplateText.split(/\\n+/).find(line => /serial|s\\/n|sn|n[°o]|serie|série/i.test(line));\n  if (explicitLine) {\n    const toks = explicitLine.match(/[A-Z0-9-]{4,}/ig) || [];\n    const picked = toks.find(t => !/^TS$/i.test(t));\n    if (picked) {\n      serial = picked;\n      serialEvidence = { source: 'nameplate_explicit_line', image_index: rawNameplateText?.a?.image_index || null, score: 0.85 };\n    }\n  }\n}\nif (serial && /^71336$/i.test(serial) && !serialEvidence?.source?.startsWith('nameplate_explicit')) {\n  serial = null;\n  serialEvidence = null;\n}\nconst review_reasons = [];\nconst missing_fields = [];\nif (!brand) missing_fields.push('brand');\nif (!model) missing_fields.push('model');\nif (!subtype) missing_fields.push('subtype');\nif (!serial) missing_fields.push('serial_number');\nif (accessoryCandidates.length && machineCandidates.length) review_reasons.push('main_object_vs_accessories_conflict');\nconst normalizedObjectTypes = uniq([...allTypes, ...accessoryCandidates.map(a => accessoryTypeOf(a))]).filter(t => !['tool','power tool','machine','portable power tool'].includes(lower(t)));\nif (normalizedObjectTypes.length > 1) review_reasons.push('multiple_object_types_detected');\nif (!serial) review_reasons.push('serial_number_unconfirmed');\nif (!technicalSpecsStrength) review_reasons.push('technical_specs_missing');\nconst primaryConfidence = primaryCandidate ? Math.max(0, Math.min(0.99, Number(baseScore(primaryCandidate).toFixed(3)))) : 0;\nif (primaryConfidence < 0.72) review_reasons.push('low_confidence_primary_object');\nconst conditionNotes = uniq(usableAnalyses.map(a => a.condition_notes || a.analysis?.condition_notes || []));\nconst secondaryObjectsDetected = dedupeSecondaryItems(usableAnalyses.flatMap(a => collectSecondaryObjects(a)));\nconst fallbackAccessoryItems = accessoryCandidates.map(a => ({ image_index: a.image_index, role: roleOf(a), source_image_role: roleOf(a), classification: accessoryTypeOf(a), detected_object_type: objectTypeRaw(a) || null, subtype: mappedSubtype(objectTypeRaw(a)) || null, brand: clean(a.brand), model: clean(a.model), label: secondaryObjectLabel({ label: clean([a.brand, a.model, mappedSubtype(objectTypeRaw(a))].filter(Boolean).join(' ')) || clean(a.accessory_type || objectTypeRaw(a)), object_type: objectTypeRaw(a), consumable_state: a.consumable_state || a.classification?.consumable_state, item_condition: a.item_condition || a.classification?.item_condition, packaging_detected: a.packaging_detected || a.classification?.packaging_detected, is_packaged_item: a.is_packaged_item || a.classification?.is_packaged_item, evidence: uniq(a.condition_notes || []) }), raw_label: clean([a.brand, a.model, mappedSubtype(objectTypeRaw(a))].filter(Boolean).join(' ')) || null, condition_notes: uniq(a.condition_notes || []), confidence: Number((a.confidence || 0).toFixed(3)), is_consumable: /(disc|blade|consumable|disque|lame|wheel)/i.test(accessoryTypeOf(a) + ' ' + objectTypeRaw(a)), is_accessory: !/(disc|blade|consumable|disque|lame|wheel)/i.test(accessoryTypeOf(a) + ' ' + objectTypeRaw(a)), item_role: normalizeItemRole(a.item_role || a.classification?.item_role, accessoryTypeOf(a) + ' ' + objectTypeRaw(a)), consumable_state: normalizeConsumableState(a.consumable_state || a.classification?.consumable_state, [a.item_condition || a.classification?.item_condition, ...(a.condition_notes || [])].join(' ')), item_condition: clean(a.item_condition || a.classification?.item_condition), packaging_detected: Boolean(a.packaging_detected || a.classification?.packaging_detected), is_packaged_item: Boolean(a.is_packaged_item || a.classification?.is_packaged_item), evidence: uniq(a.condition_notes || []) }));\nlet associatedItems = dedupeSecondaryItems([...secondaryObjectsDetected, ...fallbackAccessoryItems]);\nconst messageSecondaryItems = [];\nif (/(2 disques|deux disques|2 disks|two disks|2 discs)/i.test(evidenceText)) {\n  if (/(tr[eè]s tr[eè]s us[ée]|tr[eè]s us[ée]|very very used|heavily worn|worn out)/i.test(evidenceText)) {\n    messageSecondaryItems.push({ image_index: null, role: 'message', source_image_role: 'message', classification: 'consumable', detected_object_type: 'disque de coupe', subtype: 'disque de coupe', brand: '', model: '', label: 'disque de coupe usé', raw_label: 'disque', condition_notes: ['déduit du message utilisateur'], confidence: 0.66, is_consumable: true, is_accessory: false, item_role: 'consumable', consumable_state: 'very_used', item_condition: 'très très usé', packaging_detected: false, is_packaged_item: false, evidence: ['message utilisateur: disque très usé'] });\n  }\n  if (/(tout neuf|neuf|new)/i.test(evidenceText)) {\n    const packagedHint = associatedItems.some(x => x.packaging_detected || x.is_packaged_item);\n    messageSecondaryItems.push({ image_index: null, role: 'message', source_image_role: 'message', classification: 'consumable', detected_object_type: 'disque de coupe', subtype: 'disque de coupe', brand: '', model: '', label: packagedHint ? 'emballage de disque neuf' : 'disque neuf', raw_label: 'disque', condition_notes: ['déduit du message utilisateur'], confidence: packagedHint ? 0.72 : 0.66, is_consumable: true, is_accessory: false, item_role: 'consumable', consumable_state: 'new', item_condition: 'neuf', packaging_detected: packagedHint, is_packaged_item: packagedHint, evidence: [packagedHint ? 'message utilisateur + emballage visible' : 'message utilisateur: disque neuf'] });\n  }\n}\nassociatedItems = dedupeSecondaryItems([...associatedItems, ...messageSecondaryItems]);\nassociatedItems = associatedItems.map(x => ({ ...x, classification: x.item_role === 'consumable' ? 'consumable' : (x.item_role === 'accessory' ? 'accessory' : (x.item_role === 'packaging' ? 'packaging' : x.classification)) }));\nconst consumables = associatedItems.filter(x => x.is_consumable || x.item_role === 'consumable');\nconst accessories = associatedItems.filter(x => x.is_accessory || x.item_role === 'accessory');\nconst subtypeLower = lower(subtype);\nconst category = /(tronçonneuse|découpeuse|pistolet|mastic|perceuse|visseuse|ponceuse|meuleuse|scie|rabot|outil|outillage|cordless|agrafeuse|cloueur|burineur|marteau|disqueuse|multitool)/.test(subtypeLower) ? 'outillage' : (/(machine|tour|fraiseuse|compresseur|presse|cabine|aspirateur industriel)/.test(subtypeLower) ? 'machine' : (machineCandidates.length ? 'outillage' : 'unknown'));\nlet confidence = primaryCandidate ? (Number(primaryCandidate.confidence || 0) * 0.5 + Number(primaryCandidate.primary_equipment_confidence || 0) * 0.35 + Number(primaryCandidate.readability || 0) * 0.15) : 0;\nif (brand) confidence += 0.04;\nif (model) confidence += 0.05;\nif (technicalSpecsStrength) confidence += 0.03;\nconfidence = Math.max(0, Math.min(0.99, Number(confidence.toFixed(3))));\nconst review_required = review_reasons.length > 0 || missing_fields.length > 0;\nconst equipment_id = first.ingestion_id + '-EQ1';\nconst media = analyses.map(a => ({ media_id: first.ingestion_id + '-IMG' + String(a.image_index), image_uid: a.image_uid || (first.ingestion_id + '-IMG' + String(a.image_index).padStart(3, '0')), image_index: a.image_index, image_role: a.image_role || a.analysis?.image_role || 'unknown', contains_nameplate: Boolean(a.contains_nameplate || a.analysis?.contains_nameplate), detected_object_type: a.detected_object_type || a.analysis?.detected_object_type || '', original_filename: a.original_filename || null, drive_file_name: a.temp_drive_file_name || a.original_filename || null, mime_type: a.mime_type || null, brand: a.brand || a.analysis?.brand || '', model: a.model || a.analysis?.model || '', serial_number: a.serial_number || a.analysis?.serial_number || null, nameplate_text: a.nameplate_text || a.analysis?.nameplate_text || '', technical_specs: a.technical_specs || a.analysis?.technical_specs || {}, condition_notes: a.condition_notes || a.analysis?.condition_notes || [], readability: Number(a.readability ?? a.analysis?.readability ?? 0), temp_drive_folder_id: a.temp_drive_folder_id || null, temp_drive_file_id: a.temp_drive_file_id || null, temp_drive_web_view_link: a.temp_drive_web_view_link || null, temp_drive_file_name: a.temp_drive_file_name || null, final_drive_file_id: null, final_drive_web_view_link: null, final_drive_path: null, ocr_json: a.analysis || {}, classification_json: { is_primary_equipment_candidate: Boolean(a.is_primary_equipment_candidate || a.classification?.is_primary_equipment_candidate), primary_equipment_confidence: Number(a.primary_equipment_confidence || a.classification?.primary_equipment_confidence || 0), is_accessory_or_consumable: Boolean(a.is_accessory_or_consumable || a.classification?.is_accessory_or_consumable), accessory_type: a.accessory_type || a.classification?.accessory_type || '', secondary_objects: a.secondary_objects || a.analysis?.secondary_objects || a.classification?.secondary_objects || [], consumable_state: a.consumable_state || a.classification?.consumable_state || 'unknown', item_condition: a.item_condition || a.classification?.item_condition || '', item_role: a.item_role || a.classification?.item_role || 'unknown', packaging_detected: Boolean(a.packaging_detected || a.classification?.packaging_detected), is_packaged_item: Boolean(a.is_packaged_item || a.classification?.is_packaged_item), is_machine_like: isMachineLike(a) }, ocr_confidence: Number(a.confidence ?? a.analysis?.confidence ?? 0), processing_status: a.processing_status || 'staged_temp_drive', error_json: a.error_json || null }));\nconst draft = { project: first.project, entity_type: first.entity_type || 'equipment', status: 'draft', source: { channel: first.source, sender: first.sender, message: first.message, ingestion_id: first.ingestion_id }, equipment: { equipment_id, category, subtype, label, brand, model, serial_number: serial, manufacturer_plate: { raw_text: nameplateText, technical_specs: technicalSpecs }, condition_label: conditionNotes.length ? 'used' : 'to_confirm', condition_notes: conditionNotes, location_hint: messageFacts.location_hint || null, ownership_mode: messageFacts.ownership_mode || null, purchase_price: messageFacts.purchase_price, purchase_currency: messageFacts.purchase_currency || 'EUR', acquisition_note: messageFacts.acquisition_note || null, usage_notes: messageFacts.usage_notes || null, accessories, consumables, associated_items: associatedItems, confidence, final_drive_folder_id: null, final_drive_folder_path: null, final_status: null }, business_context: { primary_selection_rule: 'machine/tool beats accessory/consumable when both are detected; packaging/disc never becomes main subtype if a machine candidate exists', secondary_objects_rule: 'visible secondary objects are consolidated into consumables/accessories/associated_items with best-effort state/packaging labels, but never override category/subtype/label of the main equipment', primary_candidate: primaryCandidate ? { image_index: primaryCandidate.image_index, detected_object_type: objectTypeRaw(primaryCandidate), role: roleOf(primaryCandidate), score: Number(baseScore(primaryCandidate).toFixed(3)) } : null, machine_candidates: machineCandidates.map(a => ({ image_index: a.image_index, detected_object_type: objectTypeRaw(a), role: roleOf(a), score: Number(baseScore(a).toFixed(3)) })), accessory_candidates: accessoryCandidates.map(a => ({ image_index: a.image_index, detected_object_type: objectTypeRaw(a), accessory_type: accessoryTypeOf(a), role: roleOf(a), secondary_objects: Array.isArray(a.secondary_objects || a.classification?.secondary_objects) ? (a.secondary_objects || a.classification?.secondary_objects) : [] })), secondary_objects_detected: associatedItems, serial_evidence: serialEvidence, technical_specs_strength: technicalSpecsStrength, object_types_detected: uniq([...allTypes, ...associatedItems.map(x => x.subtype || x.classification)]) }, media, validation: { review_required, review_reasons: uniq(review_reasons), missing_fields: uniq(missing_fields), stage: 'draft_ready_pending_finalization', final_status: null, finalization_implemented: false } };\nreturn [{ json: { ...first, analyses, equipment_draft_v2: draft, equipment_id, review_required: draft.validation.review_required, review_reasons: draft.validation.review_reasons, missing_fields: draft.validation.missing_fields, processing_status: draft.validation.stage, final_status: draft.validation.final_status } }];"
+      },
+      "id": "build_draft_v2",
+      "name": "Build Draft v2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, json, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nout=[]\nwith db_con() as con:\n    try:\n        con.execute(\"ALTER TABLE equipment ADD COLUMN IF NOT EXISTS business_context_json VARCHAR\")\n    except Exception:\n        pass\n    for it in _items:\n        d = it.get('json', {}) or {}\n        draft = d.get('equipment_draft_v2', {}) or {}\n        eq = draft.get('equipment', {}) or {}\n        source = draft.get('source', {}) or {}\n        message = source.get('message', {}) or {}\n        sender = source.get('sender', {}) or {}\n        validation = draft.get('validation', {}) or {}\n        business_context = draft.get('business_context', {}) or {}\n        con.execute(\"INSERT OR REPLACE INTO equipment (equipment_id, ingestion_id, project, entity_type, source_channel, source_sender_id, source_sender_name, source_message_id, source_message_text, received_at, category, subtype, label, brand, model, serial_number, manufacturer_plate_raw_text, technical_specs_json, business_context_json, condition_label, location_hint, ownership_mode, purchase_price, purchase_currency, acquisition_note, notes, confidence, review_required, review_reasons_json, missing_fields_json, processing_status, final_status, final_drive_folder_id, final_drive_folder_path, status, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)\", [eq.get('equipment_id'), d.get('ingestion_id'), draft.get('project'), draft.get('entity_type'), source.get('channel'), sender.get('id'), sender.get('display_name'), message.get('id'), message.get('text'), message.get('received_at'), eq.get('category'), eq.get('subtype'), eq.get('label'), eq.get('brand'), eq.get('model'), eq.get('serial_number'), (eq.get('manufacturer_plate', {}) or {}).get('raw_text'), json.dumps((eq.get('manufacturer_plate', {}) or {}).get('technical_specs', {}), ensure_ascii=False), json.dumps({'associated_items': eq.get('associated_items', []), 'accessories': eq.get('accessories', []), 'consumables': eq.get('consumables', []), 'business_context': business_context}, ensure_ascii=False), eq.get('condition_label'), eq.get('location_hint'), eq.get('ownership_mode'), eq.get('purchase_price'), eq.get('purchase_currency'), eq.get('acquisition_note'), eq.get('usage_notes'), eq.get('confidence'), validation.get('review_required', True), json.dumps(validation.get('review_reasons', []), ensure_ascii=False), json.dumps(validation.get('missing_fields', []), ensure_ascii=False), d.get('processing_status'), d.get('final_status'), eq.get('final_drive_folder_id') or d.get('final_drive_folder_id'), eq.get('final_drive_folder_path') or d.get('final_drive_folder_path'), eq.get('status') or 'draft'])\n        out.append({'json': d})\nreturn out\n"
+      },
+      "id": "write_equipment",
+      "name": "Write Equipment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        13888,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, json, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nout=[]\nwith db_con() as con:\n    try:\n        con.execute(\"ALTER TABLE equipment_media ADD COLUMN IF NOT EXISTS classification_json VARCHAR\")\n    except Exception:\n        pass\n    for it in _items:\n        d = it.get('json', {}) or {}\n        draft = d.get('equipment_draft_v2', {}) or {}\n        for media in draft.get('media', []) or []:\n            con.execute(\"INSERT OR REPLACE INTO equipment_media (media_id, equipment_id, ingestion_id, image_index, image_role, original_filename, drive_file_name, mime_type, temp_drive_folder_id, temp_drive_file_id, drive_web_view_link, final_drive_file_id, final_drive_web_view_link, final_drive_path, ocr_json, classification_json, ocr_confidence, processing_status, error_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)\", [media.get('media_id'), draft.get('equipment', {}).get('equipment_id'), d.get('ingestion_id'), media.get('image_index'), media.get('image_role'), media.get('original_filename'), media.get('drive_file_name') or media.get('temp_drive_file_name') or media.get('original_filename'), media.get('mime_type'), media.get('temp_drive_folder_id'), media.get('temp_drive_file_id'), media.get('temp_drive_web_view_link'), media.get('final_drive_file_id'), media.get('final_drive_web_view_link'), media.get('final_drive_path'), json.dumps(media.get('ocr_json', {}), ensure_ascii=False), json.dumps(media.get('classification_json', {}), ensure_ascii=False), media.get('ocr_confidence'), media.get('processing_status'), json.dumps(media.get('error_json'), ensure_ascii=False) if media.get('error_json') is not None else None])\n        out.append({'json': d})\nreturn out"
+      },
+      "id": "write_equipment_media",
+      "name": "Write Equipment Media",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14112,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, json, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nout=[]\nwith db_con() as con:\n    for sql in [\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS reused_existing_folder BOOLEAN\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS final_drive_folder_id VARCHAR\",\n        \"ALTER TABLE equipment_ingestion_log ADD COLUMN IF NOT EXISTS final_drive_folder_path VARCHAR\",\n    ]:\n        try:\n            con.execute(sql)\n        except Exception:\n            pass\n    for it in _items:\n        d = it.get('json', {}) or {}\n        draft = d.get('equipment_draft_v2', {}) or {}\n        validation = draft.get('validation', {}) or {}\n        stage = d.get('processing_status') or validation.get('stage', 'draft_ready_pending_finalization')\n        final_status = d.get('final_status') or validation.get('final_status')\n        review_required = d.get('review_required')\n        if review_required is None:\n            review_required = validation.get('review_required', True)\n        global_errors = d.get('error_json')\n        if global_errors is None:\n            global_errors = []\n            for media in (draft.get('media', []) or []):\n                if media.get('error_json'):\n                    global_errors.append({'image_index': media.get('image_index'), 'error': media.get('error_json')})\n        reused_existing_folder = bool(\n            d.get('reused_existing_folder')\n            or validation.get('reused_existing_folder')\n            or d.get('finalization', {}).get('reused_existing_folder')\n        )\n        con.execute(\n            \"UPDATE equipment_ingestion_log SET temp_drive_folder_id = ?, processing_status = ?, equipment_id = ?, final_status = ?, review_required = ?, error_json = ?, reused_existing_folder = ?, final_drive_folder_id = ?, final_drive_folder_path = ?, updated_at = CURRENT_TIMESTAMP WHERE ingestion_id = ?\",\n            [\n                d.get('temp_drive_folder_id'),\n                stage,\n                d.get('equipment_id'),\n                final_status,\n                review_required,\n                json.dumps(global_errors, ensure_ascii=False) if global_errors else None,\n                reused_existing_folder,\n                d.get('final_drive_folder_id') or (draft.get('equipment', {}) or {}).get('final_drive_folder_id'),\n                d.get('final_drive_folder_path') or (draft.get('equipment', {}) or {}).get('final_drive_folder_path'),\n                d.get('ingestion_id'),\n            ]\n        )\n        out.append({'json': {**d, 'processing_status': stage, 'final_status': final_status, 'review_required': review_required, 'reused_existing_folder': reused_existing_folder}})\nreturn out"
+      },
+      "id": "update_ingestion_log_final",
+      "name": "Update Ingestion Log Final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14336,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const draft = $json.equipment_draft_v2 || {};\nconst validation = draft.validation || {};\nconst media = Array.isArray(draft.media) ? draft.media : [];\nconst finalization = $json.finalization || {};\nreturn [{ json: {\n  ok: true,\n  stage: validation.stage || $json.processing_status || 'draft_ready_pending_finalization',\n  project: draft.project || $json.project,\n  entity_type: draft.entity_type || $json.entity_type || 'equipment',\n  ingestion_id: $json.ingestion_id,\n  equipment_id: $json.equipment_id,\n  source: draft.source || { channel: $json.source, sender: $json.sender, message: $json.message },\n  temp_drive_root_id: $json.temp_drive_root_id || null,\n  temp_drive_folder_id: $json.temp_drive_folder_id || null,\n  temp_drive_folder_name: $json.temp_drive_folder_name || null,\n  temp_drive_folder_path: $json.temp_drive_folder_path || null,\n  temp_drive_folder_web_view_link: $json.temp_drive_folder_web_view_link || null,\n  final_drive_folder_id: draft.equipment?.final_drive_folder_id || $json.final_drive_folder_id || null,\n  final_drive_folder_name: draft.equipment?.final_drive_folder_name || $json.final_drive_folder_name || finalization.final_drive_folder_name || null,\n  final_drive_folder_path: draft.equipment?.final_drive_folder_path || $json.final_drive_folder_path || null,\n  final_drive_folder_web_view_link: finalization.final_drive_folder_web_view_link || $json.final_drive_folder_web_view_link || null,\n  manifest_file_id: finalization.manifest_file_id || null,\n  manifest_web_view_link: finalization.manifest_web_view_link || null,\n  reused_existing_folder: $json.reused_existing_folder ?? finalization.reused_existing_folder ?? null,\n  review_required: $json.review_required ?? validation.review_required ?? null,\n  error_json: $json.error_json || null,\n  db_path: $json._db_path || '/files/duckdb/siga_v1.duckdb',\n  equipment_draft: draft,\n  equipment_summary: draft.equipment || {},\n  business_context: draft.business_context || {},\n  media_summary: media.map(m => ({ media_id: m.media_id, image_index: m.image_index, image_role: m.image_role, original_filename: m.original_filename, drive_file_name: m.drive_file_name || m.final_drive_name || m.temp_drive_file_name || m.original_filename || null, contains_nameplate: m.contains_nameplate, brand: m.brand, model: m.model, serial_number: m.serial_number, classification_json: m.classification_json || null, temp_drive_folder_id: m.temp_drive_folder_id, temp_drive_file_id: m.temp_drive_file_id, temp_drive_web_view_link: m.temp_drive_web_view_link, final_drive_file_id: m.final_drive_file_id || null, final_drive_web_view_link: m.final_drive_web_view_link || null, final_drive_path: m.final_drive_path || null, processing_status: m.processing_status, error_json: m.error_json || null })),\n  validation,\n  finalization,\n  drive_resolution: finalization.folder_resolution || { temp_root: $json.temp_root_search || null, temp: $json.temp_drive_search || null, final_base: $json.final_base_search || null, final_onboarding: $json.onboarding_folder_search || null, year: $json.year_folder_search || null, month: $json.month_folder_search || null, final: $json.final_folder_search || null },\n  auth: $json.auth || null\n} }];"
+      },
+      "id": "build_response",
+      "name": "Build Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14560,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.ok}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "InputGate",
+      "name": "Input Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        672,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json._binary_ready}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "BinaryReadyGate",
+      "name": "Binary Ready Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4928,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map(item => {\n  const j = item.json || {};\n  const err = j.image_error || { code: 'binary_not_ready', message: 'Binary preparation failed; OCR and temp upload skipped' };\n  return { json: {\n    ...j,\n    image_analysis: {\n      image_index: Number(j.image_index || 0),\n      original_filename: j.original_filename || j.current_image?.filename || null,\n      mime_type: j.mime_type || j.current_image?.mime_type || null,\n      image_role: 'unknown',\n      contains_nameplate: false,\n      detected_object_type: '',\n      brand: '',\n      model: '',\n      serial_number: null,\n      nameplate_text: '',\n      technical_specs: {},\n      condition_notes: [],\n      readability: 0,\n      confidence: 0,\n      missing_visual_information: ['content_base64'],\n      temp_drive_folder_id: j.temp_drive_folder_id || null,\n      temp_drive_file_id: null,\n      temp_drive_web_view_link: null,\n      temp_drive_file_name: null,\n      analysis: {},\n      processing_status: 'image_error',\n      error_json: err\n    }\n  } };\n});\n"
+      },
+      "id": "ImageErrorBestEffort",
+      "name": "Image Error Best Effort",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5152,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const draft = $json.equipment_draft_v2 || {};\nconst ingestionId = $json.ingestion_id;\nconst receivedAt = draft.source?.message?.received_at || $json.message?.received_at || new Date().toISOString();\nconst dt = new Date(receivedAt);\nconst year = String(dt.getUTCFullYear());\nconst month = String(dt.getUTCMonth() + 1).padStart(2, '0');\nconst roleMap = { overview: { prefix: '01', slug: 'vue-ensemble' }, nameplate: { prefix: '02', slug: 'plaque-signaletique' }, detail: { prefix: '03', slug: 'detail-etat' }, unknown: { prefix: '99', slug: 'autre' } };\nconst counters = {};\nconst sanitizeFileName = (value, fallback) => {\n  const cleaned = String(value || '').normalize('NFD').replace(/[\\u0300-\\u036f]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^[-_.]+|[-_.]+$/g, '');\n  return cleaned || fallback;\n};\nconst isCompliant = (value) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(String(value || ''));\nconst plannedMedia = (draft.media || []).map((media, idx) => {\n  const role = ['overview','nameplate','detail'].includes(media.image_role) ? media.image_role : 'unknown';\n  counters[role] = (counters[role] || 0) + 1;\n  const cfg = roleMap[role] || roleMap.unknown;\n  const extSource = media.original_filename || media.drive_file_name || '';\n  const extMatch = extSource.match(/\\.([a-zA-Z0-9]+)$/);\n  const ext = (extMatch ? extMatch[1] : ((media.mime_type || '').includes('png') ? 'png' : 'jpg')).toLowerCase();\n  const suffix = counters[role] > 1 ? '_' + counters[role] : '';\n  const rawFinalName = cfg.prefix + '_' + cfg.slug + suffix + '.' + ext;\n  const finalName = sanitizeFileName(rawFinalName, '99_autre.' + ext);\n  return {\n    ...media,\n    final_drive_name: finalName,\n    final_drive_name_raw: rawFinalName,\n    final_drive_name_valid: isCompliant(finalName),\n    final_drive_path: 'SIGA/onboarding/' + year + '/' + month + '/' + ingestionId + '/' + finalName,\n    finalization_rank: idx + 1\n  };\n});\nconst defaultDriveRootId = $json.context?.default_drive_root_id || $json.temp_drive_root_id || '1sZgQ-bni-ReBP2SKLM7_mG6ejnx5yDwx';\nreturn [{ json: { ...$json, default_drive_root_id: defaultDriveRootId, finalization_plan: { year, month, final_folder_path: 'SIGA/onboarding/' + year + '/' + month + '/' + ingestionId, temp_root_folder_name: 'SIGA_TEMP', final_base_folder_name: 'SIGA', final_onboarding_folder_name: 'onboarding', planned_media: plannedMedia, default_drive_root_id: defaultDriveRootId, folder_resolution_strategy: 'Google Drive API files.list with exact q filter on parent + exact name + folder mimeType + trashed=false; deterministic selection = oldest createdTime then smallest id; on rerun, prefer persisted DuckDB folder ids when already known for the same ingestion_id; create only when constrained list returns no match and no persisted id exists' } } }];"
+      },
+      "id": "prepare_finalization_plan",
+      "name": "Prepare Finalization Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5824,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.finalization_plan.year}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "create_final_year_folder",
+      "name": "Create Final Year Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        9184,
+        144
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.finalization_plan.month}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "create_final_month_folder",
+      "name": "Create Final Month Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        10304,
+        144
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.ingestion_id}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "create_final_ingestion_folder",
+      "name": "Create Final Ingestion Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        11424,
+        144
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json || {};\nreturn [{ json: {\n  ...root,\n  final_drive_folder_id: root.final_drive_folder_id || root.id || null,\n  final_drive_folder_name: root.final_drive_folder_name || root.name || root.ingestion_id || null,\n  final_drive_folder_web_view_link: root.final_drive_folder_web_view_link || root.webViewLink || null,\n  final_drive_folder_path: root.final_drive_folder_path || root.finalization_plan?.final_folder_path || (root.ingestion_id ? `SIGA/onboarding/${String(root.finalization_plan?.year || '')}/${String(root.finalization_plan?.month || '')}/${String(root.ingestion_id)}` : null),\n} }];"
+      },
+      "id": "attach_final_folder_context",
+      "name": "Attach Final Folder Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11872,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json;\nconst media = Array.isArray(root.finalization_plan?.planned_media) ? root.finalization_plan.planned_media : [];\nreturn media.map(mediaItem => ({ json: { ...root, media_item: mediaItem, media_id: mediaItem.media_id, image_index: mediaItem.image_index, image_uid: mediaItem.image_uid || (String(root.ingestion_id || 'SIGA') + '-IMG' + String(mediaItem.image_index || 0).padStart(3, '0')), final_drive_name: mediaItem.final_drive_name, final_drive_name_valid: Boolean(mediaItem.final_drive_name_valid), final_drive_path: mediaItem.final_drive_path, temp_drive_file_id: mediaItem.temp_drive_file_id, image_role: mediaItem.image_role, mime_type: mediaItem.mime_type, original_filename: mediaItem.original_filename, prior_error_json: mediaItem.error_json || null, can_finalize: !!mediaItem.temp_drive_file_id && Boolean(mediaItem.final_drive_name_valid) } }));"
+      },
+      "id": "split_final_media",
+      "name": "Split Final Media",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12096,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "move",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.temp_drive_file_id}}"
+        },
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.final_drive_folder_id}}"
+        }
+      },
+      "id": "move_temp_file_to_final_folder",
+      "name": "Move Temp File to Final Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        12544,
+        -72
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "fileId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.temp_drive_file_id}}"
+        },
+        "options": {}
+      },
+      "id": "rename_final_file",
+      "name": "Rename Final File",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        12768,
+        -72
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Attach Final Folder Context').first().json || {};\nconst safeAll = (nodeName) => {\n  try {\n    return $(nodeName).all();\n  } catch (error) {\n    return [];\n  }\n};\nconst movedById = new Map(safeAll('Move Temp File to Final Folder').map(item => [item.json.media_id, item.json]));\nconst renamedById = new Map(safeAll('Rename Final File').map(item => [item.json.media_id, item.json]));\nconst canFinalize = root.can_finalize !== false;\nconst finalMedia = ((root.finalization_plan?.planned_media) || []).map(media => {\n  const moved = movedById.get(media.media_id) || {};\n  const renamed = renamedById.get(media.media_id) || {};\n  const errors = [];\n  if (!canFinalize) {\n    errors.push({ code: 'finalization_skipped', message: 'Item not eligible for finalization', detail: root.error_json || media.error_json || null });\n  } else if (!media.temp_drive_file_id) {\n    errors.push({ code: 'missing_temp_drive_file_id', message: 'No temp Drive file available for finalization' });\n  }\n  if (moved.error || moved.message) errors.push({ code: 'drive_move_failed', detail: moved.error || moved.message || moved });\n  if (renamed.error || renamed.message) errors.push({ code: 'drive_rename_failed', detail: renamed.error || renamed.message || renamed });\n  const finalFileId = canFinalize ? (renamed.id || moved.id || media.final_drive_file_id || media.temp_drive_file_id || null) : (media.final_drive_file_id || null);\n  const finalLink = renamed.webViewLink || moved.webViewLink || media.final_drive_web_view_link || media.temp_drive_web_view_link || null;\n  const mergedErrors = [...(Array.isArray(media.error_json) ? media.error_json : (media.error_json ? [media.error_json] : [])), ...errors.filter(Boolean)];\n  const status = !canFinalize ? (media.processing_status || root.processing_status || 'draft_ready_pending_finalization') : (errors.length ? (finalFileId ? 'finalized_partial_error' : 'finalization_failed') : (finalFileId ? 'finalized' : 'finalization_failed'));\n  return {\n    ...media,\n    final_drive_file_id: finalFileId,\n    final_drive_web_view_link: finalLink,\n    final_drive_path: media.final_drive_path || null,\n    drive_file_name: media.final_drive_name || media.drive_file_name || media.temp_drive_file_name || media.original_filename || null,\n    processing_status: status,\n    error_json: mergedErrors.length ? mergedErrors : null,\n  };\n});\nreturn [{ json: { ...root, final_media: finalMedia, error_json: root.error_json || (finalMedia.some(m => m.error_json) ? finalMedia.filter(m => m.error_json).map(m => ({ media_id: m.media_id, image_index: m.image_index, error: m.error_json })) : null) } }];"
+      },
+      "id": "collapse_final_media",
+      "name": "Collapse Final Media",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        12992,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const draft = $json.equipment_draft_v2 || {};\nconst finalMedia = Array.isArray($json.final_media) ? $json.final_media : [];\nconst reviewRequired = Boolean(draft.validation?.review_required);\nconst successful = finalMedia.filter(m => !!m.final_drive_file_id).length;\nconst manifest = {\n  ingestion_id: $json.ingestion_id,\n  equipment_id: $json.equipment_id,\n  equipment_summary: { label: draft.equipment?.label || null, category: draft.equipment?.category || null, subtype: draft.equipment?.subtype || null, brand: draft.equipment?.brand || null, model: draft.equipment?.model || null, serial_number: draft.equipment?.serial_number || null },\n  business_context: draft.business_context || null,\n  associated_items: draft.equipment?.associated_items || [],\n  final_drive_folder_id: $json.final_drive_folder_id || null,\n  final_drive_folder_path: $json.final_drive_folder_path || null,\n  reused_existing_folder: Boolean($json.final_folder_search?.reused_existing_folder || $json.temp_drive_search?.reused_existing_folder || false),\n  folder_resolution: { strategy: $json.finalization_plan?.folder_resolution_strategy || null, temp: $json.temp_drive_search || null, year: $json.year_folder_search || null, month: $json.month_folder_search || null, final: $json.final_folder_search || null },\n  media: finalMedia.map(m => ({ media_id: m.media_id, image_index: m.image_index, image_role: m.image_role, final_drive_name: m.final_drive_name, final_drive_file_id: m.final_drive_file_id, final_drive_web_view_link: m.final_drive_web_view_link, final_drive_path: m.final_drive_path, classification_json: m.classification_json || null, processing_status: m.processing_status })),\n  final_status: successful > 0 ? (reviewRequired ? 'review_required' : 'completed') : 'review_required',\n  processing_status: successful > 0 ? 'finalized' : 'draft_ready_pending_finalization',\n  timestamp: new Date().toISOString()\n};\nreturn [{ json: { ...$json, manifest_json_text: JSON.stringify(manifest, null, 2), manifest_preview: manifest } }];"
+      },
+      "id": "build_manifest_text",
+      "name": "Build Manifest Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        13216,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "createFromText",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.final_drive_folder_id}}"
+        },
+        "options": {}
+      },
+      "id": "upload_manifest",
+      "name": "Upload Manifest",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        13440,
+        0
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $('Build Manifest Text').first().json || {};\nconst draft = input.equipment_draft_v2 || {};\nconst validation = draft.validation || {};\nconst finalMedia = Array.isArray(input.final_media) ? input.final_media : [];\nconst successCount = finalMedia.filter(m => !!m.final_drive_file_id).length;\nconst canFinalize = input.can_finalize !== false;\nconst reviewRequired = Boolean(validation.review_required);\nconst inheritedProcessing = input.processing_status || validation.stage || 'draft_ready_pending_finalization';\nconst processingStatus = canFinalize ? (successCount > 0 ? 'finalized' : inheritedProcessing) : inheritedProcessing;\nconst finalStatus = canFinalize ? (successCount > 0 ? (reviewRequired ? 'review_required' : 'completed') : (validation.final_status || 'review_required')) : (validation.final_status || 'review_required');\nconst globalErrors = finalMedia.filter(m => m.error_json).map(m => ({ media_id: m.media_id, image_index: m.image_index, error: m.error_json }));\nconst manifest = $('Upload Manifest').first().json || {};\nconst finalFolderId = input.final_drive_folder_id || draft.equipment?.final_drive_folder_id || null;\nconst finalFolderPath = input.final_drive_folder_path || draft.equipment?.final_drive_folder_path || null;\nconst finalFolderName = input.final_drive_folder_name || draft.equipment?.final_drive_folder_name || null;\nconst finalFolderLink = input.final_drive_folder_web_view_link || input.finalization?.final_drive_folder_web_view_link || null;\nconst reusedExistingFolder = Boolean(\n  input.final_folder_search?.reused_existing_folder ||\n  input.temp_drive_search?.reused_existing_folder ||\n  input.final_folder_search?.resolution === 'reused_existing_from_db' ||\n  input.temp_drive_search?.resolution === 'reused_existing_from_db'\n);\nconst equipment = {\n  ...(draft.equipment || {}),\n  final_drive_folder_id: finalFolderId,\n  final_drive_folder_path: finalFolderPath,\n  final_drive_folder_name: finalFolderName || draft.equipment?.final_drive_folder_name || null,\n  processing_status: processingStatus,\n  final_status: finalStatus,\n  status: draft.equipment?.status || 'draft',\n};\nconst updatedDraft = {\n  ...draft,\n  equipment,\n  media: finalMedia,\n  validation: {\n    ...validation,\n    stage: processingStatus,\n    final_status: finalStatus,\n    finalization_implemented: canFinalize && successCount > 0,\n    finalization_partial: canFinalize && globalErrors.length > 0,\n    reused_existing_folder: reusedExistingFolder,\n  },\n};\nreturn [{ json: {\n  ...input,\n  equipment_draft_v2: updatedDraft,\n  processing_status: processingStatus,\n  final_status: finalStatus,\n  error_json: input.error_json || (globalErrors.length ? globalErrors : null),\n  review_required: reviewRequired,\n  reused_existing_folder: reusedExistingFolder,\n  final_drive_folder_id: finalFolderId,\n  final_drive_folder_name: finalFolderName,\n  final_drive_folder_path: finalFolderPath,\n  final_drive_folder_web_view_link: finalFolderLink,\n  finalization: {\n    ...(input.finalization || {}),\n    final_drive_move_implemented: canFinalize && successCount > 0,\n    final_drive_folder_id: finalFolderId,\n    final_drive_folder_name: finalFolderName,\n    final_drive_folder_path: finalFolderPath,\n    final_drive_folder_web_view_link: finalFolderLink,\n    reused_existing_folder: reusedExistingFolder,\n    folder_resolution: {\n      strategy: input.finalization_plan?.folder_resolution_strategy || input.finalization?.folder_resolution?.strategy || null,\n      deterministic_selection: 'oldest createdTime, then lexicographically smallest id',\n      temp_root: input.temp_root_search || null,\n      temp: input.temp_drive_search || null,\n      final_base: input.final_base_search || null,\n      final_onboarding: input.onboarding_folder_search || null,\n      year: input.year_folder_search || null,\n      month: input.month_folder_search || null,\n      final: input.final_folder_search || null,\n    },\n    manifest_file_id: manifest.id || input.finalization?.manifest_file_id || null,\n    manifest_web_view_link: manifest.webViewLink || input.finalization?.manifest_web_view_link || null,\n    moved_files: finalMedia.map(m => ({ media_id: m.media_id, image_role: m.image_role, final_drive_name: m.final_drive_name, final_drive_file_id: m.final_drive_file_id, final_drive_path: m.final_drive_path, processing_status: m.processing_status })),\n    errors: globalErrors,\n  },\n} }];"
+      },
+      "id": "apply_finalization_to_draft",
+      "name": "Apply Finalization To Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        13664,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.temp_root_folder_id || '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.ingestion_id || '').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchTempFolder",
+      "name": "Search Temp Drive Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3136,
+        -24
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = {\n  ...($('Extract Message Facts').first().json || {}),\n  ...($('Resolve Temp Root Folder').first().json || {}),\n  ...($('Adopt Created Temp Root Folder').first().json || {}),\n};\nconst folders = items.filter(f => f && f.id && (f.mimeType === 'application/vnd.google-apps.folder' || !f.mimeType));\nfolders.sort((a, b) => {\n  const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  if (ta !== tb) return ta - tb;\n  return String(a.id || '').localeCompare(String(b.id || ''));\n});\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, parents: f.parents || [], createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) {\n  return [{ json: { ...root, temp_drive_root_id: root.temp_drive_root_id || root.temp_root_folder_id || null, temp_drive_folder_id: selected.id || null, temp_drive_folder_name: selected.name || root.ingestion_id || null, temp_drive_folder_web_view_link: selected.webViewLink || null, reused_existing_folder: true, folder_resolution: 'reused_existing_oldest_created', folder_candidates: candidates, temp_drive_search: { searched_parent_id: root.temp_root_folder_id || null, searched_name: root.ingestion_id || null, candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\n}\nreturn [{ json: { ...root, needs_creation: true, folder_candidates: [], temp_drive_search: { searched_parent_id: root.temp_root_folder_id || null, searched_name: root.ingestion_id || null, candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveTempFolder",
+      "name": "Resolve Temp Drive Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        -24
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "temp-folder-exists",
+              "leftValue": "={{ !!$json.temp_drive_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfTempFolderExists",
+      "name": "If Temp Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3584,
+        -24
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.final_onboarding_folder_id || '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.finalization_plan && $json.finalization_plan.year ? $json.finalization_plan.year : '').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchFinalYearFolder",
+      "name": "Search Final Year Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        8512,
+        72
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = {\n  ...($('Prepare Finalization Plan').first().json || {}),\n  ...($('Resolve Final Onboarding Folder').first().json || {}),\n  ...($('Adopt Created Final Onboarding Folder').first().json || {}),\n};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, final_year_folder_id: selected.id || null, final_year_folder_name: selected.name || root.finalization_plan?.year || null, year_folder_search: { searched_parent_id: root.final_onboarding_folder_id || null, searched_name: root.finalization_plan?.year || null, candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, year_folder_search: { searched_parent_id: root.final_onboarding_folder_id || null, searched_name: root.finalization_plan?.year || null, candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveFinalYearFolder",
+      "name": "Resolve Final Year Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8736,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "year-folder-exists",
+              "leftValue": "={{ !!$json.final_year_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfFinalYearFolderExists",
+      "name": "If Final Year Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        8960,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Final Year Folder').first().json || $('Prepare Finalization Plan').first().json || {};\nconst created = $json || {};\nconst folderId = root.final_year_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  final_year_folder_id: folderId,\n  final_year_folder_name: root.final_year_folder_name || created.name || root.finalization_plan?.year || null,\n  year_folder_search: {\n    ...(root.year_folder_search || {}),\n    reused_existing_folder: root.year_folder_search?.reused_existing_folder || false,\n    resolution: root.year_folder_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedFinalYearFolder",
+      "name": "Adopt Created Final Year Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9408,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.final_year_folder_id || '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.finalization_plan && $json.finalization_plan.month ? $json.finalization_plan.month : '').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchFinalMonthFolder",
+      "name": "Search Final Month Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        9632,
+        72
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = {\n  ...($('Prepare Finalization Plan').first().json || {}),\n  ...($('Resolve Final Year Folder').first().json || {}),\n  ...($('Adopt Created Final Year Folder').first().json || {}),\n};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, final_month_folder_id: selected.id || null, final_month_folder_name: selected.name || root.finalization_plan?.month || null, month_folder_search: { searched_parent_id: root.final_year_folder_id || null, searched_name: root.finalization_plan?.month || null, candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, month_folder_search: { searched_parent_id: root.final_year_folder_id || null, searched_name: root.finalization_plan?.month || null, candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveFinalMonthFolder",
+      "name": "Resolve Final Month Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9856,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "month-folder-exists",
+              "leftValue": "={{ !!$json.final_month_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfFinalMonthFolderExists",
+      "name": "If Final Month Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        10080,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Final Month Folder').first().json || $('Resolve Final Year Folder').first().json || {};\nconst created = $json || {};\nconst folderId = root.final_month_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  final_month_folder_id: folderId,\n  final_month_folder_name: root.final_month_folder_name || created.name || root.finalization_plan?.month || null,\n  month_folder_search: {\n    ...(root.month_folder_search || {}),\n    reused_existing_folder: root.month_folder_search?.reused_existing_folder || false,\n    resolution: root.month_folder_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedFinalMonthFolder",
+      "name": "Adopt Created Final Month Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10528,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.final_month_folder_id || '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.ingestion_id || '').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchFinalIngestionFolder",
+      "name": "Search Final Ingestion Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        10752,
+        72
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = {\n  ...($('Prepare Finalization Plan').first().json || {}),\n  ...($('Resolve Final Month Folder').first().json || {}),\n  ...($('Adopt Created Final Month Folder').first().json || {}),\n};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, final_drive_folder_id: selected.id || null, final_drive_folder_name: selected.name || root.ingestion_id || null, final_drive_folder_path: root.final_drive_folder_path || root.finalization_plan?.final_folder_path || null, final_drive_folder_web_view_link: selected.webViewLink || null, final_folder_search: { searched_parent_id: root.final_month_folder_id || null, searched_name: root.ingestion_id || null, candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, final_folder_search: { searched_parent_id: root.final_month_folder_id || null, searched_name: root.ingestion_id || null, candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveFinalIngestionFolder",
+      "name": "Resolve Final Ingestion Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10976,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "final-folder-exists",
+              "leftValue": "={{ !!$json.final_drive_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfFinalIngestionFolderExists",
+      "name": "If Final Ingestion Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        11200,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Final Ingestion Folder').first().json || $('Resolve Final Month Folder').first().json || {};\nconst created = $json || {};\nconst folderId = root.final_drive_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  final_drive_folder_id: folderId,\n  final_drive_folder_name: root.final_drive_folder_name || created.name || root.ingestion_id || null,\n  final_drive_folder_path: root.final_drive_folder_path || root.finalization_plan?.final_folder_path || null,\n  final_drive_folder_web_view_link: root.final_drive_folder_web_view_link || created.webViewLink || null,\n  final_folder_search: {\n    ...(root.final_folder_search || {}),\n    reused_existing_folder: root.final_folder_search?.reused_existing_folder || false,\n    resolution: root.final_folder_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedFinalIngestionFolder",
+      "name": "Adopt Created Final Ingestion Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11648,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.context && $json.context.default_drive_root_id ? $json.context.default_drive_root_id : '1sZgQ-bni-ReBP2SKLM7_mG6ejnx5yDwx').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = 'SIGA_TEMP'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchTempRootFolder",
+      "name": "Search Temp Root Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2016,
+        -24
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = $('Extract Message Facts').first().json || {};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, parents: f.parents || [], createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, temp_root_folder_id: selected.id || null, temp_root_folder_name: selected.name || 'SIGA_TEMP', temp_root_search: { searched_parent_id: root.context?.default_drive_root_id || '1sZgQ-bni-ReBP2SKLM7_mG6ejnx5yDwx', searched_name: 'SIGA_TEMP', candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, temp_root_search: { searched_parent_id: root.context?.default_drive_root_id || '1sZgQ-bni-ReBP2SKLM7_mG6ejnx5yDwx', searched_name: 'SIGA_TEMP', candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveTempRootFolder",
+      "name": "Resolve Temp Root Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        -24
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.temp_root_folder_id}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfTempRootFolderExists",
+      "name": "If Temp Root Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        -24
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.finalization_plan?.temp_root_folder_name || \"SIGA_TEMP\"}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "CreateTempRootFolder",
+      "name": "Create Temp Root Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2688,
+        48
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Temp Root Folder').first().json || $('Extract Message Facts').first().json || {};\nconst created = $json || {};\nconst tempRootId = root.temp_root_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  temp_root_folder_id: tempRootId,\n  temp_root_folder_name: root.temp_root_folder_name || created.name || root.finalization_plan?.temp_root_folder_name || 'SIGA_TEMP',\n  temp_drive_root_id: root.temp_drive_root_id || tempRootId || root.context?.default_drive_root_id || root.default_drive_root_id || null,\n  temp_root_search: {\n    ...(root.temp_root_search || {}),\n    reused_existing_folder: root.temp_root_search?.reused_existing_folder || false,\n    resolution: root.temp_root_search?.resolution || 'created_new',\n    selected_folder_id: tempRootId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedTempRootFolder",
+      "name": "Adopt Created Temp Root Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.finalization_plan && $json.finalization_plan.default_drive_root_id ? $json.finalization_plan.default_drive_root_id : '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.finalization_plan && $json.finalization_plan.final_base_folder_name ? $json.finalization_plan.final_base_folder_name : 'SIGA').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchFinalBaseFolder",
+      "name": "Search Final Base Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6272,
+        72
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = $('Prepare Finalization Plan').first().json || {};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, parents: f.parents || [], createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, final_base_folder_id: selected.id || null, final_base_folder_name: selected.name || root.finalization_plan?.final_base_folder_name || 'SIGA', final_base_search: { searched_parent_id: root.finalization_plan?.default_drive_root_id || null, searched_name: root.finalization_plan?.final_base_folder_name || 'SIGA', candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, final_base_search: { searched_parent_id: root.finalization_plan?.default_drive_root_id || null, searched_name: root.finalization_plan?.final_base_folder_name || 'SIGA', candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveFinalBaseFolder",
+      "name": "Resolve Final Base Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6496,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.final_base_folder_id}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfFinalBaseFolderExists",
+      "name": "If Final Base Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.finalization_plan.final_base_folder_name || \"SIGA\"}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "CreateFinalBaseFolder",
+      "name": "Create Final Base Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        6944,
+        144
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Final Base Folder').first().json || $('Prepare Finalization Plan').first().json || {};\nconst created = $json || {};\nconst folderId = root.final_base_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  final_base_folder_id: folderId,\n  final_base_folder_name: root.final_base_folder_name || created.name || root.finalization_plan?.final_base_folder_name || 'SIGA',\n  final_base_search: {\n    ...(root.final_base_search || {}),\n    reused_existing_folder: root.final_base_search?.reused_existing_folder || false,\n    resolution: root.final_base_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedFinalBaseFolder",
+      "name": "Adopt Created Final Base Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7168,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + String($json.final_base_folder_id || '').replace(/'/g, \"\\'\") + \"' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.finalization_plan && $json.finalization_plan.final_onboarding_folder_name ? $json.finalization_plan.final_onboarding_folder_name : 'onboarding').replace(/'/g, \"\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "SearchFinalOnboardingFolder",
+      "name": "Search Final Onboarding Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        7392,
+        72
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const rawItems = $input.all().map(i => i.json || {});\nconst items = rawItems.flatMap(item => Array.isArray(item.files) ? item.files : [item]);\nconst root = $('Resolve Final Base Folder').first().json || $('Adopt Created Final Base Folder').first().json || {};\nconst folders = items.filter(f => f && f.id);\nfolders.sort((a,b) => { const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER; if (ta !== tb) return ta - tb; return String(a.id || '').localeCompare(String(b.id || '')); });\nconst selected = folders[0] || null;\nconst candidates = folders.map(f => ({ id: f.id || null, name: f.name || null, parents: f.parents || [], createdTime: f.createdTime || null, webViewLink: f.webViewLink || null }));\nif (selected) return [{ json: { ...root, final_onboarding_folder_id: selected.id || null, final_onboarding_folder_name: selected.name || root.finalization_plan?.final_onboarding_folder_name || 'onboarding', onboarding_folder_search: { searched_parent_id: root.final_base_folder_id || null, searched_name: root.finalization_plan?.final_onboarding_folder_name || 'onboarding', candidate_count: candidates.length, candidates, reused_existing_folder: true, resolution: 'reused_existing_oldest_created', selected_folder_id: selected.id || null } } }];\nreturn [{ json: { ...root, onboarding_folder_search: { searched_parent_id: root.final_base_folder_id || null, searched_name: root.finalization_plan?.final_onboarding_folder_name || 'onboarding', candidate_count: 0, candidates: [], reused_existing_folder: false, resolution: 'create_new', selected_folder_id: null } } }];"
+      },
+      "id": "ResolveFinalOnboardingFolder",
+      "name": "Resolve Final Onboarding Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7616,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.final_onboarding_folder_id}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "IfFinalOnboardingFolderExists",
+      "name": "If Final Onboarding Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        7840,
+        72
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.finalization_plan.final_onboarding_folder_name || \"onboarding\"}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "id": "CreateFinalOnboardingFolder",
+      "name": "Create Final Onboarding Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        8064,
+        144
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Final Onboarding Folder').first().json || $('Resolve Final Base Folder').first().json || $('Adopt Created Final Base Folder').first().json || {};\nconst created = $json || {};\nconst folderId = root.final_onboarding_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  final_onboarding_folder_id: folderId,\n  final_onboarding_folder_name: root.final_onboarding_folder_name || created.name || root.finalization_plan?.final_onboarding_folder_name || 'onboarding',\n  onboarding_folder_search: {\n    ...(root.onboarding_folder_search || {}),\n    reused_existing_folder: root.onboarding_folder_search?.reused_existing_folder || false,\n    resolution: root.onboarding_folder_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedFinalOnboardingFolder",
+      "name": "Adopt Created Final Onboarding Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8288,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Resolve Temp Drive Folder').first().json || $('Adopt Created Temp Root Folder').first().json || $('Resolve Temp Root Folder').first().json || {};\nconst created = $json || {};\nconst folderId = root.temp_drive_folder_id || created.id || null;\nreturn [{ json: {\n  ...root,\n  temp_drive_root_id: root.temp_drive_root_id || root.temp_root_folder_id || root.context?.default_drive_root_id || root.default_drive_root_id || null,\n  temp_drive_folder_id: folderId,\n  temp_drive_folder_name: root.temp_drive_folder_name || created.name || root.ingestion_id || null,\n  temp_drive_folder_path: root.temp_drive_folder_path || (root.ingestion_id ? `SIGA_TEMP/${String(root.ingestion_id)}` : null),\n  temp_drive_folder_web_view_link: root.temp_drive_folder_web_view_link || created.webViewLink || null,\n  temp_drive_search: {\n    ...(root.temp_drive_search || {}),\n    reused_existing_folder: root.temp_drive_search?.reused_existing_folder || false,\n    resolution: root.temp_drive_search?.resolution || 'created_new',\n    selected_folder_id: folderId,\n  },\n} }];"
+      },
+      "id": "AdoptCreatedTempDriveFolder",
+      "name": "Adopt Created Temp Drive Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, time, gc\nfrom contextlib import contextmanager\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n@contextmanager\ndef db_con(path=DB_PATH, retries=5, delay=0.3):\n    con = None\n    for attempt in range(retries):\n        try:\n            con = duckdb.connect(path)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < retries - 1:\n                time.sleep(delay * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con is not None:\n            try: con.close()\n            except Exception: pass\n        gc.collect()\nout=[]\nwith db_con() as con:\n    for it in _items:\n        d = it.get('json', {}) or {}\n        row = con.execute(\"SELECT l.temp_drive_folder_id, e.final_drive_folder_id, e.final_drive_folder_path FROM equipment_ingestion_log l LEFT JOIN equipment e ON e.ingestion_id = l.ingestion_id WHERE l.ingestion_id = ? ORDER BY l.updated_at DESC NULLS LAST LIMIT 1\", [d.get('ingestion_id')]).fetchone()\n        temp_id = row[0] if row else None\n        final_id = row[1] if row else None\n        final_path = row[2] if row else None\n        out.append({'json': {**d, 'existing_temp_drive_folder_id': temp_id, 'existing_final_drive_folder_id': final_id, 'existing_final_drive_folder_path': final_path}})\nreturn out"
+      },
+      "id": "load_existing_folder_state",
+      "name": "Load Existing Folder State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "existing-temp-folder-known",
+              "leftValue": "={{ !!$json.existing_temp_drive_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if_existing_temp_folder_known",
+      "name": "If Existing Temp Folder Known",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1792,
+        -96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json || {};\nconst existingId = root.temp_drive_folder_id || root.existing_temp_drive_folder_id || null;\nconst existingPath = root.temp_drive_folder_path || (root.ingestion_id ? `SIGA_TEMP/${String(root.ingestion_id)}` : null);\nreturn [{\n  json: {\n    ...root,\n    temp_drive_root_id: root.temp_drive_root_id || root.temp_root_folder_id || root.context?.default_drive_root_id || root.default_drive_root_id || null,\n    temp_drive_folder_id: existingId,\n    temp_drive_folder_name: root.temp_drive_folder_name || root.ingestion_id || null,\n    temp_drive_folder_path: existingPath,\n    temp_drive_folder_web_view_link: root.temp_drive_folder_web_view_link || null,\n    temp_drive_search: {\n      ...(root.temp_drive_search || {}),\n      searched_parent_id: root.temp_root_folder_id || root.temp_drive_root_id || null,\n      searched_name: root.ingestion_id || null,\n      candidate_count: existingId ? Math.max(root.temp_drive_search?.candidate_count || 0, 1) : (root.temp_drive_search?.candidate_count || 0),\n      candidates: existingId ? [{ id: existingId, path: existingPath, source: 'duckdb' }, ...((root.temp_drive_search?.candidates || []).filter(c => c?.id !== existingId))] : (root.temp_drive_search?.candidates || []),\n      reused_existing_folder: existingId ? true : !!root.temp_drive_search?.reused_existing_folder,\n      resolution: existingId ? 'reused_existing_from_db' : (root.temp_drive_search?.resolution || null),\n      selected_folder_id: existingId || root.temp_drive_search?.selected_folder_id || null,\n    },\n  },\n}];"
+      },
+      "id": "adopt_existing_temp_folder_from_db",
+      "name": "Adopt Existing Temp Folder From DB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "existing-final-folder-known",
+              "leftValue": "={{ !!$json.existing_final_drive_folder_id }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if_existing_final_folder_known",
+      "name": "If Existing Final Folder Known",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6048,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json || {};\nconst folderId = root.final_drive_folder_id || root.existing_final_drive_folder_id || null;\nconst folderPath = root.final_drive_folder_path || root.existing_final_drive_folder_path || root.finalization_plan?.final_folder_path || null;\nreturn [{ json: {\n  ...root,\n  final_drive_folder_id: folderId,\n  final_drive_folder_name: root.final_drive_folder_name || root.ingestion_id || null,\n  final_drive_folder_path: folderPath,\n  final_drive_folder_web_view_link: root.final_drive_folder_web_view_link || null,\n  final_folder_search: {\n    ...(root.final_folder_search || {}),\n    searched_parent_id: root.final_month_folder_id || null,\n    searched_name: root.ingestion_id || null,\n    candidate_count: folderId ? Math.max(root.final_folder_search?.candidate_count || 0, 1) : (root.final_folder_search?.candidate_count || 0),\n    candidates: folderId ? [{ id: folderId, path: folderPath, source: 'duckdb' }, ...((root.final_folder_search?.candidates || []).filter(c => c?.id !== folderId))] : (root.final_folder_search?.candidates || []),\n    reused_existing_folder: folderId ? true : !!root.final_folder_search?.reused_existing_folder,\n    resolution: folderId ? 'reused_existing_from_db' : (root.final_folder_search?.resolution || null),\n    selected_folder_id: folderId || root.final_folder_search?.selected_folder_id || null,\n  },\n} }];"
+      },
+      "id": "adopt_existing_final_folder_from_db",
+      "name": "Adopt Existing Final Folder From DB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11648,
+        -144
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "can-finalize",
+              "leftValue": "={{ $json.can_finalize }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if_can_finalize_gate",
+      "name": "If Can Finalize",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        12320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $json || {};\nconst summary = j.equipment_summary || {};\nconst validation = j.validation || {};\nconst source = j.source || {};\nconst sender = source.sender || {};\nconst media = Array.isArray(j.media_summary) ? j.media_summary : [];\nconst label = [summary.brand, summary.model].filter(Boolean).join(' ').trim() || summary.label || summary.subtype || 'équipement';\nconst parts = [];\nparts.push(`SIGA terminé — ${label}`);\nparts.push(`${media.length} photo${media.length > 1 ? 's' : ''} traitée${media.length > 1 ? 's' : ''}`);\nif (j.final_drive_folder_web_view_link) parts.push(`Drive: ${j.final_drive_folder_web_view_link}`);\nelse if (j.temp_drive_folder_web_view_link) parts.push(`Temp: ${j.temp_drive_folder_web_view_link}`);\nif (validation.review_required === true) parts.push('Validation manuelle requise');\nelse if (j.finalization && j.finalization.final_drive_move_implemented) parts.push('Finalisation Drive OK');\nelse parts.push(`Statut: ${j.stage || j.processing_status || 'terminé'}`);\nconst msg = parts.join(' | ');\nreturn [{ json: { ...j, completion_message_target: sender.id || null, completion_message_text: msg } }];"
+      },
+      "id": "build_whatsapp_completion_message",
+      "name": "Build WhatsApp Completion Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        14784,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ...$json, completion_message_delivery: 'pending-external-callback', completion_message_error: 'No OpenClaw callback URL configured from n8n host', completion_message_preview: $json.completion_message_text } }];"
+      },
+      "id": "completion_message_prepared",
+      "name": "Completion Message Prepared",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        15008,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook In": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "Input Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Gate": {
+      "main": [
+        [
+          {
+            "node": "DuckDB Init Schema",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "DuckDB Init Schema": {
+      "main": [
+        [
+          {
+            "node": "Write Ingestion Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Ingestion Log": {
+      "main": [
+        [
+          {
+            "node": "Extract Message Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Message Facts": {
+      "main": [
+        [
+          {
+            "node": "Load Existing Folder State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Temp Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Temp Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Temp Folder Context": {
+      "main": [
+        [
+          {
+            "node": "Split Images",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Images": {
+      "main": [
+        [
+          {
+            "node": "Prepare Binary Inline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Binary Inline": {
+      "main": [
+        [
+          {
+            "node": "Binary Ready Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Binary Ready Gate": {
+      "main": [
+        [
+          {
+            "node": "Upload Temp to Drive",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Analyze Image OCR Inline",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Image Error Best Effort",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Temp to Drive": {
+      "main": [
+        []
+      ]
+    },
+    "Analyze Image OCR Inline": {
+      "main": [
+        [
+          {
+            "node": "Merge OCR + Drive Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Image Error Best Effort": {
+      "main": [
+        [
+          {
+            "node": "Merge OCR + Drive Metadata",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge OCR + Drive Metadata": {
+      "main": [
+        [
+          {
+            "node": "Build Draft v2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Draft v2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Finalization Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Equipment": {
+      "main": [
+        [
+          {
+            "node": "Write Equipment Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Equipment Media": {
+      "main": [
+        [
+          {
+            "node": "Update Ingestion Log Final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Ingestion Log Final": {
+      "main": [
+        [
+          {
+            "node": "Build Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Response": {
+      "main": [
+        [
+          {
+            "node": "Build WhatsApp Completion Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Finalization Plan": {
+      "main": [
+        [
+          {
+            "node": "If Existing Final Folder Known",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Final Year Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Final Year Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Final Month Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Final Month Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Final Ingestion Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Final Ingestion Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Final Folder Context": {
+      "main": [
+        [
+          {
+            "node": "Split Final Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Final Media": {
+      "main": [
+        [
+          {
+            "node": "If Can Finalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move Temp File to Final Folder": {
+      "main": [
+        [
+          {
+            "node": "Rename Final File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rename Final File": {
+      "main": [
+        [
+          {
+            "node": "Collapse Final Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collapse Final Media": {
+      "main": [
+        [
+          {
+            "node": "Build Manifest Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Manifest Text": {
+      "main": [
+        [
+          {
+            "node": "Upload Manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Manifest": {
+      "main": [
+        [
+          {
+            "node": "Apply Finalization To Draft",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Finalization To Draft": {
+      "main": [
+        [
+          {
+            "node": "Write Equipment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Temp Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Temp Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Temp Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "If Temp Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Temp Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Attach Temp Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Temp Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Final Year Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Final Year Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Final Year Folder": {
+      "main": [
+        [
+          {
+            "node": "If Final Year Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Final Year Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Final Month Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Final Year Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Final Year Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Final Month Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Final Month Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Final Month Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Final Month Folder": {
+      "main": [
+        [
+          {
+            "node": "If Final Month Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Final Month Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Final Ingestion Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Final Month Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Final Month Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Final Ingestion Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Final Ingestion Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Final Ingestion Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Final Ingestion Folder": {
+      "main": [
+        [
+          {
+            "node": "If Final Ingestion Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Final Ingestion Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Attach Final Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Final Ingestion Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Final Ingestion Folder": {
+      "main": [
+        [
+          {
+            "node": "Attach Final Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "If Temp Root Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Temp Root Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Temp Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Temp Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Final Base Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Final Base Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Final Base Folder": {
+      "main": [
+        [
+          {
+            "node": "If Final Base Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Final Base Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Final Onboarding Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Final Base Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Final Base Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Final Base Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Final Base Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Final Onboarding Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Final Onboarding Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Final Onboarding Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Final Onboarding Folder": {
+      "main": [
+        [
+          {
+            "node": "If Final Onboarding Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Final Onboarding Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Final Year Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Final Onboarding Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Final Onboarding Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Final Onboarding Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Final Onboarding Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Final Year Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Temp Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Attach Temp Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Existing Folder State": {
+      "main": [
+        [
+          {
+            "node": "If Existing Temp Folder Known",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Existing Temp Folder Known": {
+      "main": [
+        [
+          {
+            "node": "Adopt Existing Temp Folder From DB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Existing Temp Folder From DB": {
+      "main": [
+        [
+          {
+            "node": "Attach Temp Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Existing Final Folder Known": {
+      "main": [
+        [
+          {
+            "node": "Adopt Existing Final Folder From DB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Final Base Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Existing Final Folder From DB": {
+      "main": [
+        [
+          {
+            "node": "Attach Final Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Can Finalize": {
+      "main": [
+        [
+          {
+            "node": "Move Temp File to Final Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Collapse Final Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build WhatsApp Completion Message": {
+      "main": [
+        [
+          {
+            "node": "Completion Message Prepared",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Completion Message Prepared": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false,
+    "errorWorkflow": "XoKKPbpuYm0qapf1"
+  },
+  "versionId": "25f31c92-60bd-475f-82b7-b2d72854c82d",
+  "meta": {
+    "instanceId": "093ba1266e85fcaaa6abca411d9f7941951737b3920bfaa6e2db89226df2c82d"
+  },
+  "id": "THVms0LwRMEn0kBY",
+  "tags": []
+}

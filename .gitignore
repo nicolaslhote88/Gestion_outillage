@@ -1,0 +1,17 @@
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.db
+*.duckdb
+*.log
+*.tmp
+node_modules/
+dist/
+coverage/
+.vscode/
+.idea/
+tmp/*
+!tmp/siga_workflow_live.json
+!tmp/siga_workflow_live_summary.md
