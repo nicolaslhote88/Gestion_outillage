@@ -36,8 +36,41 @@
 - OpenAI credential name: `OpenAi account`
 - DuckDB path used in Python nodes: `/files/duckdb/siga_v1.duckdb`
 
+## Corrections appliquees
+
+### 2026-03-14 — Bug arborescence Drive (folderId root en dur)
+
+Tous les noeuds `Create *` avaient leur `folderId` fige a `root` (racine My Drive).
+Chaque dossier etait donc cree a plat a la racine au lieu d'etre imbrique.
+
+Noeuds corriges (6) :
+
+| Noeud | Parent avant (bug) | Parent apres (correct) |
+|---|---|---|
+| `Create Temp Drive Folder` | root | `$json.temp_root_folder_id` |
+| `Create Final Base Folder` | root | `$json.finalization_plan.default_drive_root_id` |
+| `Create Final Onboarding Folder` | root | `$json.final_base_folder_id` |
+| `Create Final Year Folder` | root | `$json.final_onboarding_folder_id` |
+| `Create Final Month Folder` | root | `$json.final_year_folder_id` |
+| `Create Final Ingestion Folder` | root | `$json.final_month_folder_id` |
+
+Note : `Create Temp Root Folder` reste a `root` — correct, SIGA_TEMP est bien a la racine.
+
+Arborescence attendue apres correction :
+```
+My Drive/
+  SIGA_TEMP/
+    {ingestion_id}/
+  {default_drive_root}/
+    SIGA/
+      onboarding/
+        {year}/
+          {month}/
+            {ingestion_id}/
+```
+
 ## Immediate focus
 
-- Prove one real end-to-end WhatsApp run
-- Capture exact failures before any refactor
-- Tighten orchestration only after the live path is stable
+- Reimporter `tmp/siga_workflow_live.json` dans n8n pour appliquer la correction
+- Faire un run reel WhatsApp et verifier que l'arborescence Drive est correcte
+- Capturer les erreurs exactes si un autre point casse
