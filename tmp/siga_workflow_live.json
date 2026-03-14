@@ -191,7 +191,7 @@
       "type": "@n8n/n8n-nodes-langchain.anthropic",
       "typeVersion": 1,
       "position": [
-        5152,
+        5600,
         -96
       ],
       "credentials": {
@@ -1735,6 +1735,25 @@
         }
       },
       "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "resize",
+        "width": 2000,
+        "height": 2000,
+        "resizeOption": "ignoreAspectRatio",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.editImage",
+      "typeVersion": 1,
+      "position": [
+        5376,
+        -96
+      ],
+      "id": "4016f27a-c5ce-4838-8aee-4f3fa2613f27",
+      "name": "Resize Image For OCR",
+      "continueOnFail": true
     }
   ],
   "pinData": {},
@@ -1859,7 +1878,7 @@
             "index": 0
           },
           {
-            "node": "Analyze Image OCR Inline",
+            "node": "Resize Image For OCR",
             "type": "main",
             "index": 0
           }
@@ -2065,7 +2084,7 @@
         ],
         [
           {
-            "node": "bf08673c-33a0-4498-9eff-d91361c97a36",
+            "node": "Delete Temp Drive Folder",
             "type": "main",
             "index": 0
           }
@@ -2596,6 +2615,17 @@
     "Completion Message Prepared": {
       "main": [
         []
+      ]
+    },
+    "Resize Image For OCR": {
+      "main": [
+        [
+          {
+            "node": "Analyze Image OCR Inline",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
