@@ -540,7 +540,9 @@
           "mode": "id",
           "value": "={{$json.temp_drive_file_id}}"
         },
-        "options": {}
+        "options": {
+          "fileName": "={{$json.final_drive_name}}"
+        }
       },
       "id": "rename_final_file",
       "name": "Rename Final File",
@@ -1700,6 +1702,39 @@
         15008,
         0
       ]
+    },
+    {
+      "parameters": {
+        "url": "=https://www.googleapis.com/drive/v3/files/{{$json.temp_drive_folder_id}}",
+        "method": "DELETE",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        13216,
+        200
+      ],
+      "id": "bf08673c-33a0-4498-9eff-d91361c97a36",
+      "name": "Delete Temp Drive Folder",
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "continueOnFail": true
     }
   ],
   "pinData": {},
@@ -2024,6 +2059,13 @@
         [
           {
             "node": "Build Manifest Text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "bf08673c-33a0-4498-9eff-d91361c97a36",
             "type": "main",
             "index": 0
           }
