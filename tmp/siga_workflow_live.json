@@ -598,7 +598,9 @@
           "mode": "id",
           "value": "={{$json.final_drive_folder_id}}"
         },
-        "options": {}
+        "options": {},
+        "name": "={{'manifest_' + $json.ingestion_id + '.json'}}",
+        "content": "={{$json.manifest_json_text}}"
       },
       "id": "upload_manifest",
       "name": "Upload Manifest",

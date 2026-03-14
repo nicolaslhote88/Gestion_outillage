@@ -69,8 +69,48 @@ My Drive/
             {ingestion_id}/
 ```
 
+### 2026-03-14 — Bug manifest vide et sans nom (Upload Manifest)
+
+Le noeud `Upload Manifest` utilisait l'operation `createFromText` mais n'avait
+ni `name` ni `content` definis — le fichier etait donc cree sans nom et sans contenu.
+
+Parametres ajoutes :
+
+| Parametre | Valeur |
+|---|---|
+| `name` | `={{'manifest_' + $json.ingestion_id + '.json'}}` |
+| `content` | `={{$json.manifest_json_text}}` |
+
+Le contenu JSON est produit par `Build Manifest Text` (champ `manifest_json_text`).
+
+---
+
+## Probleme : 3 photos envoyees -> 1 seule archivee
+
+**Cause : connecteur OpenClaw / WhatsApp, pas le workflow.**
+
+Le webhook n8n recoit `mediaCount: 1` et `images: [1 item]` meme si le message
+WhatsApp contient 3 photos. Le workflow est concu pour traiter N images en parallele
+(Split Images -> OCR -> Merge -> Build Draft), mais si le connecteur n'en transmet
+qu'une seule, une seule est traitee.
+
+**Action requise :** Configurer OpenClaw pour envoyer toutes les images en une seule
+requete webhook, avec la structure :
+```json
+{
+  "images": [
+    { "index": 1, "filename": "img1.jpg", "mime_type": "image/jpeg", "content_base64": "..." },
+    { "index": 2, "filename": "img2.jpg", "mime_type": "image/jpeg", "content_base64": "..." },
+    { "index": 3, "filename": "img3.jpg", "mime_type": "image/jpeg", "content_base64": "..." }
+  ]
+}
+```
+
+---
+
 ## Immediate focus
 
-- Reimporter `tmp/siga_workflow_live.json` dans n8n pour appliquer la correction
-- Faire un run reel WhatsApp et verifier que l'arborescence Drive est correcte
-- Capturer les erreurs exactes si un autre point casse
+- Reimporter `tmp/siga_workflow_live.json` dans n8n pour appliquer les 2 corrections
+- Verifier que le manifest est bien cree avec nom et contenu JSON dans le dossier final
+- Configurer OpenClaw pour envoyer toutes les photos dans un seul webhook
+- Faire un run reel avec 3 photos et verifier arborescence + manifest + nb photos
