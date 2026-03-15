@@ -1749,6 +1749,19 @@
       ],
       "id": "eae2072c-c51c-4b30-ab3a-8356057ef015",
       "name": "Enrich Rename Data"
+    },
+    {
+      "id": "compress_image_inline",
+      "name": "Compress Image Inline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5264,
+        -96
+      ],
+      "parameters": {
+        "jsCode": "const { execSync } = require('child_process');\nconst os = require('os');\nconst path = require('path');\nconst fs = require('fs');\n\nconst MAX_BYTES = 4 * 1024 * 1024; // 4 MB target — below Anthropic 5 MB limit\nconst items = $input.all();\nconst result = [];\n\nfor (const item of items) {\n  const binaryData = item.binary?.data;\n  if (!binaryData || !binaryData.data) {\n    result.push(item);\n    continue;\n  }\n\n  const rawBuf = Buffer.from(binaryData.data, 'base64');\n\n  // Skip if already under limit\n  if (rawBuf.length <= MAX_BYTES) {\n    result.push(item);\n    continue;\n  }\n\n  const uid = Date.now() + '_' + Math.random().toString(36).slice(2);\n  const tmpIn  = path.join(os.tmpdir(), `n8n_img_in_${uid}.jpg`);\n  const tmpOut = path.join(os.tmpdir(), `n8n_img_out_${uid}.jpg`);\n\n  let compressed = false;\n\n  try {\n    fs.writeFileSync(tmpIn, rawBuf);\n\n    // Try GraphicsMagick first, then ImageMagick as fallback\n    const cmds = [\n      `gm convert \"${tmpIn}\" -resize \"1600x1600>\" -quality 72 \"${tmpOut}\"`,\n      `convert \"${tmpIn}\" -resize \"1600x1600>\" -quality 72 \"${tmpOut}\"`,\n    ];\n\n    for (const cmd of cmds) {\n      try {\n        execSync(cmd, { timeout: 30000 });\n        if (fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 0) {\n          compressed = true;\n          break;\n        }\n      } catch (e) { /* try next */ }\n    }\n\n    if (compressed) {\n      const outBuf = fs.readFileSync(tmpOut);\n      result.push({\n        json: item.json,\n        binary: {\n          data: {\n            ...binaryData,\n            data: outBuf.toString('base64'),\n            fileSize: outBuf.length,\n          }\n        }\n      });\n    } else {\n      // Compression failed — pass original (Anthropic may reject, but don't drop item)\n      result.push(item);\n    }\n  } finally {\n    try { fs.unlinkSync(tmpIn);  } catch(e) {}\n    try { fs.unlinkSync(tmpOut); } catch(e) {}\n  }\n}\n\nreturn result;"
+      }
     }
   ],
   "pinData": {},
@@ -1873,7 +1886,7 @@
             "index": 0
           },
           {
-            "node": "Analyze Image OCR Inline",
+            "node": "Compress Image Inline",
             "type": "main",
             "index": 0
           }
@@ -2615,6 +2628,17 @@
         [
           {
             "node": "Rename Final File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compress Image Inline": {
+      "main": [
+        [
+          {
+            "node": "Analyze Image OCR Inline",
             "type": "main",
             "index": 0
           }
