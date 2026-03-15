@@ -1751,7 +1751,7 @@
       "name": "Enrich Rename Data"
     },
     {
-      "id": "compress_image_inline",
+      "id": "fde135f2-e922-41bd-955a-4746da48be1d",
       "name": "Compress Image Inline",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
