@@ -1738,24 +1738,6 @@
     },
     {
       "parameters": {
-        "operation": "resize",
-        "width": 50,
-        "height": 50,
-        "resizeOption": "percent",
-        "options": {}
-      },
-      "type": "n8n-nodes-base.editImage",
-      "typeVersion": 1,
-      "position": [
-        5376,
-        -96
-      ],
-      "id": "4016f27a-c5ce-4838-8aee-4f3fa2613f27",
-      "name": "Resize Image For OCR",
-      "onError": "continueRegularOutput"
-    },
-    {
-      "parameters": {
         "mode": "runOnceForEachItem",
         "jsCode": "// After Move Temp File, $json = Drive API response\n// Re-attach final_drive_name and media_id from upstream for Rename + Collapse\nlet splitData = {};\ntry { splitData = $('Split Final Media').item.json || {}; } catch(e1) {\n  try { splitData = $('If Can Finalize').item.json || {}; } catch(e2) {}\n}\nreturn {\n  json: {\n    ...$json,\n    final_drive_name: splitData.final_drive_name || $json.name || '',\n    media_id: splitData.media_id || '',\n    image_index: splitData.image_index || 0,\n    image_uid: splitData.image_uid || '',\n    temp_drive_file_id: $json.id\n  }\n};"
       },
@@ -1891,7 +1873,7 @@
             "index": 0
           },
           {
-            "node": "Resize Image For OCR",
+            "node": "Analyze Image OCR Inline",
             "type": "main",
             "index": 0
           }
@@ -2626,17 +2608,6 @@
     "Completion Message Prepared": {
       "main": [
         []
-      ]
-    },
-    "Resize Image For OCR": {
-      "main": [
-        [
-          {
-            "node": "Analyze Image OCR Inline",
-            "type": "main",
-            "index": 0
-          }
-        ]
       ]
     },
     "Enrich Rename Data": {
