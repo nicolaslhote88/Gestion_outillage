@@ -545,7 +545,7 @@ def render_validation():
         st.session_state.pop("edit_equipment_id", None)
         st.session_state.pop("edit_return_to",    None)
         if _return_to:
-            st.session_state["nav_radio"] = _return_to
+            st.session_state["_nav_request"] = _return_to
 
     if edit_target_id:
         items_df = run_query("""
@@ -952,7 +952,7 @@ def show_equipment_modal(equipment_id: str):
     if footer_right.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
         st.session_state["edit_equipment_id"] = equipment_id
         st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
-        st.session_state["nav_radio"] = "⚠ Centre de Validation"
+        st.session_state["_nav_request"] = "⚠ Centre de Validation"
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────
@@ -1309,6 +1309,10 @@ def render_sidebar():
             unsafe_allow_html=True,
         )
         st.markdown("---")
+
+        # Appliquer une demande de navigation avant que le widget soit instancié
+        if "_nav_request" in st.session_state:
+            st.session_state["nav_radio"] = st.session_state.pop("_nav_request")
 
         page = st.radio(
             "Navigation",
