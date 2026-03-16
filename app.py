@@ -875,6 +875,9 @@ def show_equipment_modal(equipment_id: str):
         st.markdown("**Identification**")
         info_data = {
             "Type"       : null_str(row.get("subtype")),
+            "Marque"     : null_str(row.get("brand")),
+            "Modèle"     : null_str(row.get("model")),
+            "État"       : null_str(row.get("condition_label")),
             "Catégorie"  : null_str(row.get("category")),
             "N° de série": null_str(row.get("serial_number")),
             "Emplacement": null_str(row.get("location_hint")),
