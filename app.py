@@ -930,7 +930,10 @@ def _parse_access_log(lines: list[str]) -> list[dict]:
 
         path = m.group("path")
         # Filtre le bruit (health-checks, fichiers statiques)
-        if any(path.startswith(p) for p in ("/_stcore", "/static", "/healthz", "/favicon")):
+        # /_stcore/stream est conservé : c'est la connexion WebSocket de l'utilisateur
+        if path.startswith("/_stcore/") and path != "/_stcore/stream":
+            continue
+        if any(path.startswith(p) for p in ("/static", "/healthz", "/favicon")):
             continue
 
         entries.append({
