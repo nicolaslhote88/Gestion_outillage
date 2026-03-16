@@ -260,8 +260,8 @@ def get_drive_image_bytes(file_id: str) -> bytes | None:
         svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
         return svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
     except Exception as e:
-        import logging
-        logging.warning("get_drive_image_bytes(%s): %s", file_id, e)
+        import sys
+        print(f"[DRIVE_ERR] file_id={file_id} → {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return None
 
 
