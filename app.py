@@ -536,11 +536,14 @@ def render_validation():
     st.markdown('<p class="section-subtitle">Équipements détectés par l\'IA nécessitant une vérification humaine</p>', unsafe_allow_html=True)
 
     # Équipement ciblé depuis la modale (édition directe depuis Parc Matériel)
-    edit_target_id = st.session_state.pop("edit_equipment_id", None)
-    _return_to = st.session_state.pop("edit_return_to", None)
+    # On garde ces valeurs en session tant que l'édition n'est pas terminée
+    edit_target_id = st.session_state.get("edit_equipment_id", None)
+    _return_to     = st.session_state.get("edit_return_to",    None)
 
-    def _go_back():
-        """Retourne à la page d'origine si on vient d'une autre vue."""
+    def _finish_edit():
+        """Nettoie la session et retourne à la page d'origine."""
+        st.session_state.pop("edit_equipment_id", None)
+        st.session_state.pop("edit_return_to",    None)
         if _return_to:
             st.session_state["nav_radio"] = _return_to
 
@@ -751,7 +754,7 @@ def render_validation():
                     if ok:
                         st.success("✅ Équipement validé et mis à jour.")
                         st.cache_data.clear()
-                        _go_back()
+                        _finish_edit()
                         st.rerun()
 
                 # ── Bouton Supprimer avec confirmation ─────────────
@@ -780,11 +783,11 @@ def render_validation():
                                 st.warning("⚠️ Suppression DB OK mais le dossier Drive n'a pas pu être mis à la corbeille.")
                         st.session_state.pop(confirm_key, None)
                         st.cache_data.clear()
-                        _go_back()
+                        _finish_edit()
                         st.rerun()
                     if c2.button("↩ Annuler", key=f"del_no_{eq_id}"):
                         st.session_state.pop(confirm_key, None)
-                        _go_back()
+                        _finish_edit()
                         st.rerun()
 
                 # Specs techniques (lecture seule)
