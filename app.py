@@ -258,8 +258,10 @@ def get_drive_image_bytes(file_id: str) -> bytes | None:
             scopes=["https://www.googleapis.com/auth/drive.readonly"],
         )
         svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
-        return svc.files().get_media(fileId=file_id).execute()
-    except Exception:
+        return svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
+    except Exception as e:
+        import logging
+        logging.warning("get_drive_image_bytes(%s): %s", file_id, e)
         return None
 
 
