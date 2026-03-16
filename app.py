@@ -901,22 +901,8 @@ _CLF_RE = re.compile(
 )
 
 
-@st.cache_data(ttl=2, show_spinner=False)
 def _read_traefik_logs(n: int) -> list[str] | None:
-    """Retourne les N dernières lignes de logs Traefik (docker logs ou fichier)."""
-    # 1) Via docker logs (nécessite le socket Docker monté)
-    try:
-        result = subprocess.run(
-            ["docker", "logs", "--tail", str(n), TRAEFIK_CONTAINER],
-            capture_output=True, text=True, timeout=5,
-        )
-        lines = (result.stdout + result.stderr).splitlines()
-        if lines:
-            return lines
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # 2) Via fichier log monté en volume
+    """Retourne les N dernières lignes du fichier access.log de Traefik."""
     log_path = Path(TRAEFIK_LOG_FILE)
     if log_path.exists():
         try:
@@ -924,7 +910,6 @@ def _read_traefik_logs(n: int) -> list[str] | None:
             return all_lines[-n:] if len(all_lines) > n else all_lines
         except OSError:
             pass
-
     return None
 
 
@@ -996,6 +981,18 @@ def render_access_log():
 
     # ── Lecture ───────────────────────────────────────────────
     raw = _read_traefik_logs(nb_lines)
+
+    # ── Infos fichier (diagnostic) ────────────────────────────
+    log_path = Path(TRAEFIK_LOG_FILE)
+    if log_path.exists():
+        import os, datetime as _dt
+        mtime = _dt.datetime.fromtimestamp(os.path.getmtime(log_path), tz=_PARIS_TZ)
+        size_kb = os.path.getsize(log_path) / 1024
+        st.caption(
+            f"Fichier : `{TRAEFIK_LOG_FILE}` — "
+            f"{size_kb:.1f} Ko — "
+            f"dernière écriture : **{mtime.strftime('%d/%m/%Y %H:%M:%S')}**"
+        )
 
     if raw is None:
         st.error(
