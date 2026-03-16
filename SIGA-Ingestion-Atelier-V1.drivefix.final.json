@@ -1775,7 +1775,7 @@
         80
       ],
       "parameters": {
-        "jsCode": "// Réinjecte le JSON original (perdu par Convert to File) en gardant le binaire compressé\nreturn [{\n  json: $('Binary Ready Gate').item.json,\n  binary: $input.item.binary\n}];"
+        "jsCode": "// Réinjecte le JSON original (perdu par Convert to File) en gardant le binaire compressé\n// pairedItem:0 garantit la bonne association d'items dans le loop splitInBatches\nconst sourceJson = $('Binary Ready Gate').item.json;\n\n// Construit ocr_context_prompt si absent — requis par Analyze Image OCR Inline\nconst ocr_context_prompt = sourceJson.ocr_context_prompt || (() => {\n  const idx = sourceJson.image_index || 1;\n  const filename = sourceJson.original_filename || ('image_' + idx + '.jpg');\n  const mime = sourceJson.mime_type || 'image/jpeg';\n  return `Tu es un assistant spécialisé en inventaire d'outillage industriel. Analyse cette image (image ${idx}, fichier: ${filename}, type: ${mime}).\\n\\nExtrait les informations suivantes si visibles :\\n- Marque / fabricant\\n- Modèle / référence\\n- Numéro de série\\n- Type d'équipement\\n- État apparent\\n- Accessoires ou consommables visibles\\n\\nRéponds en JSON avec les clés: brand, model, serial_number, equipment_type, condition, accessories, raw_text_visible, confidence_score.`;\n})();\n\nreturn [{\n  json: { ...sourceJson, ocr_context_prompt },\n  binary: $input.item.binary,\n  pairedItem: 0\n}];"
       }
     }
   ],
