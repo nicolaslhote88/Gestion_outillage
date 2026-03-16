@@ -200,6 +200,24 @@ def run_query(sql: str, params=None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def run_write(sql: str, params=None) -> bool:
+    """Exécute une requête SQL en écriture (UPDATE/INSERT).
+    Retourne True si succès, False sinon."""
+    try:
+        with duckdb.connect(DB_PATH, read_only=False) as conn:
+            if params:
+                conn.execute(sql, params)
+            else:
+                conn.execute(sql)
+        return True
+    except duckdb.IOException as e:
+        st.error(f"❌ Base de données inaccessible (verrou en cours ?) : {e}")
+        return False
+    except Exception as e:
+        st.error(f"Erreur SQL écriture : {e}")
+        return False
+
+
 def db_is_reachable() -> bool:
     """Vérifie la disponibilité de la DB sans garder la connexion ouverte."""
     try:
@@ -568,56 +586,97 @@ def render_validation():
                 else:
                     st.info("📷 Aucune image disponible")
 
-            # ── Informations détectées ──────────────────────────
+            # ── Formulaire d'édition ────────────────────────────
             with info_col:
                 missing = safe_json(row.get("missing_fields_json"), [])
                 if isinstance(missing, dict):
                     missing = list(missing.keys())
                 missing_set = {str(f).lower() for f in missing}
 
-                st.markdown("**Informations détectées par l'IA**")
+                eq_id = row["equipment_id"]
 
-                def field_row(field_key: str, field_label: str, value):
-                    """Affiche un champ avec surbrillance si manquant."""
-                    val_str = null_str(value)
+                # Raisons de révision (lecture seule)
+                if reasons:
+                    st.markdown("**Raisons de la révision**")
+                    for r in reasons:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;⚠ {r}")
+                    st.markdown("---")
+
+                st.markdown("**Corriger les informations**")
+
+                def _label(field_key: str, field_label: str) -> str:
                     if field_key.lower() in missing_set:
-                        st.markdown(
-                            f"🔴 **{field_label}** : "
-                            f'<span style="color:#fca5a5">{val_str}</span> '
-                            f'<span class="badge badge-red">Manquant</span>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(f"✅ **{field_label}** : {val_str}")
+                        return f"🔴 {field_label} *(manquant)*"
+                    return f"✅ {field_label}"
 
-                field_row("label",         "Nom / Désignation",  row.get("label"))
-                field_row("brand",         "Marque",             row.get("brand"))
-                field_row("model",         "Modèle",             row.get("model"))
-                field_row("serial_number", "N° de série",        row.get("serial_number"))
-                field_row("subtype",       "Type d'outil",       row.get("subtype"))
-                field_row("condition_label","État",              row.get("condition_label"))
-                field_row("location_hint", "Emplacement",        row.get("location_hint"))
+                CONDITION_OPTIONS = ["neuf", "bon", "use", "tres use", "hors service", "inconnu"]
 
-                # Specs techniques
+                with st.form(key=f"form_{eq_id}"):
+                    f_label    = st.text_input(_label("label",          "Nom / Désignation"),
+                                               value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
+                    f_brand    = st.text_input(_label("brand",          "Marque"),
+                                               value=null_str(row.get("brand"), ""),         key=f"brand_{eq_id}")
+                    f_model    = st.text_input(_label("model",          "Modèle"),
+                                               value=null_str(row.get("model"), ""),         key=f"model_{eq_id}")
+                    f_serial   = st.text_input(_label("serial_number",  "N° de série"),
+                                               value=null_str(row.get("serial_number"), ""), key=f"serial_{eq_id}")
+                    f_subtype  = st.text_input(_label("subtype",        "Type d'outil"),
+                                               value=null_str(row.get("subtype"), ""),       key=f"subtype_{eq_id}")
+
+                    cur_cond = null_str(row.get("condition_label"), "inconnu").lower()
+                    cond_idx = CONDITION_OPTIONS.index(cur_cond) if cur_cond in CONDITION_OPTIONS else len(CONDITION_OPTIONS) - 1
+                    f_condition = st.selectbox(_label("condition_label", "État"),
+                                               options=CONDITION_OPTIONS, index=cond_idx,    key=f"cond_{eq_id}")
+
+                    f_location = st.text_input(_label("location_hint",  "Emplacement"),
+                                               value=null_str(row.get("location_hint"), ""), key=f"loc_{eq_id}")
+                    f_notes    = st.text_area("📝 Notes",
+                                              value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
+                                              height=80)
+
+                    btn_col1, btn_col2 = st.columns([2, 1])
+                    submitted = btn_col1.form_submit_button("✅ Valider et enregistrer", type="primary", use_container_width=True)
+                    rejected  = btn_col2.form_submit_button("🗑 Rejeter",                 type="secondary", use_container_width=True)
+
+                if submitted:
+                    ok = run_write("""
+                        UPDATE equipment SET
+                            label           = ?,
+                            brand           = ?,
+                            model           = ?,
+                            serial_number   = ?,
+                            subtype         = ?,
+                            condition_label = ?,
+                            location_hint   = ?,
+                            notes           = ?,
+                            review_required = false
+                        WHERE equipment_id = ?
+                    """, [
+                        f_label or None, f_brand or None, f_model or None,
+                        f_serial or None, f_subtype or None, f_condition,
+                        f_location or None, f_notes or None, eq_id,
+                    ])
+                    if ok:
+                        st.success("✅ Équipement validé et mis à jour.")
+                        st.cache_data.clear()
+                        st.rerun()
+
+                if rejected:
+                    ok = run_write(
+                        "DELETE FROM equipment WHERE equipment_id = ?", [eq_id]
+                    )
+                    if ok:
+                        st.warning("🗑 Équipement supprimé.")
+                        st.cache_data.clear()
+                        st.rerun()
+
+                # Specs techniques (lecture seule)
                 specs = safe_json(row.get("technical_specs_json"), {})
                 if specs:
                     st.markdown("---")
                     st.markdown("**Spécifications techniques**")
                     for k, v in specs.items():
                         st.markdown(f"&nbsp;&nbsp;&nbsp;• **{k}** : {v}")
-
-                # Raisons de révision
-                if reasons:
-                    st.markdown("---")
-                    st.markdown("**Raisons de la révision**")
-                    for r in reasons:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;⚠ {r}")
-
-                # Notes
-                notes = null_str(row.get("notes"))
-                if notes != "—":
-                    st.markdown("---")
-                    st.markdown(f"📝 **Notes** : _{notes}_")
 
                 # Lien Drive
                 folder_url = drive_folder_url(row.get("final_drive_folder_id"))
