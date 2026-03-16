@@ -291,6 +291,27 @@ def null_str(value, fallback: str = "—") -> str:
     s = str(value).strip()
     return s if s and s.lower() not in ("nan", "none", "null") else fallback
 
+
+_PARIS_TZ = "Europe/Paris"
+
+def fmt_datetime(ts) -> str:
+    """Formate un timestamp UTC (naïf ou localisé) en heure locale Europe/Paris."""
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "N/A"
+    dt = pd.to_datetime(ts)
+    if dt.tzinfo is None:
+        dt = dt.tz_localize("UTC")
+    dt = dt.tz_convert(_PARIS_TZ)
+    return dt.strftime("%d/%m/%Y %H:%M")
+
+
+def fmt_datetime_series(series: pd.Series) -> pd.Series:
+    """Applique fmt_datetime sur une Series pandas."""
+    dt = pd.to_datetime(series)
+    if dt.dt.tz is None:
+        dt = dt.dt.tz_localize("UTC")
+    return dt.dt.tz_convert(_PARIS_TZ).dt.strftime("%d/%m/%Y %H:%M")
+
 # ─────────────────────────────────────────────────────────────
 #  VUE 1 : DASHBOARD
 # ─────────────────────────────────────────────────────────────
@@ -320,7 +341,7 @@ def render_dashboard():
     dernier     = row.get("dernier_ajout")
 
     valeur_str  = f"{valeur:,.0f} €".replace(",", " ") if valeur and not pd.isna(valeur) else "N/A"
-    dernier_str = pd.to_datetime(dernier).strftime("%d/%m/%Y %H:%M") if dernier and not pd.isna(dernier) else "N/A"
+    dernier_str = fmt_datetime(dernier)
 
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("🔧 Total équipements",     total)
@@ -410,7 +431,7 @@ def render_dashboard():
     if not last_df.empty:
         # Formatter pour affichage propre
         display_df = last_df.copy()
-        display_df["Date"] = pd.to_datetime(display_df["received_at"]).dt.strftime("%d/%m/%Y %H:%M")
+        display_df["Date"] = fmt_datetime_series(display_df["received_at"])
         display_df["Équipement"] = display_df["label"].fillna("—")
         display_df["Marque"]     = display_df["brand"].fillna("—")
         display_df["Type"]       = display_df["subtype"].fillna("—")
