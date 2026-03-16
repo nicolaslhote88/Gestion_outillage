@@ -901,6 +901,7 @@ _CLF_RE = re.compile(
 )
 
 
+@st.cache_data(ttl=2, show_spinner=False)
 def _read_traefik_logs(n: int) -> list[str] | None:
     """Retourne les N dernières lignes de logs Traefik (docker logs ou fichier)."""
     # 1) Via docker logs (nécessite le socket Docker monté)
