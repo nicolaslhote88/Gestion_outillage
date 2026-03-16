@@ -177,29 +177,28 @@
     {
       "parameters": {
         "resource": "image",
-        "operation": "analyze",
         "modelId": {
           "__rl": true,
-          "value": "gpt-4o",
+          "value": "claude-sonnet-4-6",
           "mode": "list",
-          "cachedResultName": "GPT-4O"
+          "cachedResultName": "claude-sonnet-4-6"
         },
-        "text": "Analyse cette photo d’outil ou machine d’atelier. Réponds UNIQUEMENT en JSON strict selon ce schéma exact: {\"image_role\":\"overview|nameplate|detail|unknown\",\"contains_nameplate\":true,\"detected_object_type\":\"\",\"brand\":\"\",\"model\":\"\",\"serial_number\":null,\"nameplate_text\":\"\",\"technical_specs\":{},\"condition_notes\":[],\"equipment_count_estimate\":1,\"readability\":0.0,\"confidence\":0.0,\"is_primary_equipment_candidate\":false,\"primary_equipment_confidence\":0.0,\"is_accessory_or_consumable\":false,\"accessory_type\":\"\",\"secondary_objects\":[],\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"item_role\":\"primary|accessory|consumable|associated_item|packaging|unknown\",\"packaging_detected\":false,\"is_packaged_item\":false,\"missing_visual_information\":[]}. Pour secondary_objects, utilise une liste d’objets de forme {\"label\":\"\",\"object_type\":\"\",\"item_role\":\"accessory|consumable|associated_item|packaging|unknown\",\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"packaging_detected\":false,\"is_packaged_item\":false,\"brand\":\"\",\"model\":\"\",\"confidence\":0.0,\"evidence\":[]}. Règles: 1) image_role=overview pour vue globale de l'équipement, nameplate pour plaque signalétique / étiquette technique, detail pour détail/état/usure, unknown sinon. 2) brand/model/serial/specs prioritairement si lisibles. 3) condition_notes = liste courte de constats visuels factuels. 4) confidence, readability et primary_equipment_confidence entre 0 et 1. 5) Si l’image montre surtout un emballage, un disque, une lame, une boîte, un consommable ou un accessoire isolé, renseigne is_accessory_or_consumable=true, accessory_type si possible, et n’en fais pas l’équipement principal. 6) Si l’image montre clairement la machine / l’outil principal, renseigne is_primary_equipment_candidate=true. 7) Détecte aussi les objets secondaires visibles autour de l’équipement principal: disque, lame, batterie, chargeur, emballage, boîte, lot de consommables, etc. Remplis secondary_objects même si l’objet principal reste la machine. 8) Pour les consommables de coupe (disque/lame), qualifie au mieux consumable_state: new si neuf / emballé / très peu utilisé, used si usure visible modérée, very_used si très forte usure, inconnu sinon. 9) packaging_detected=true si emballage/boîte/sachet visible; is_packaged_item=true si l’objet semble encore dans son emballage ou présenté comme produit emballé. 10) item_role doit refléter la fonction métier de l’objet observé, sans jamais promouvoir un objet secondaire comme équipement principal. 11) Si le modèle d’un disque/accessoire n’est pas lisible, ne l’invente pas. 12) Pas de markdown, pas d’explication, JSON strict seulement.",
-        "inputType": "base64",
+        "text": "={{$json.ocr_context_prompt}}",
+        "inputType": "binary",
         "options": {}
       },
       "id": "analyze_image_inline",
       "name": "Analyze Image OCR Inline",
-      "type": "@n8n/n8n-nodes-langchain.openAi",
-      "typeVersion": 2.1,
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
       "position": [
-        5152,
-        -96
+        5376,
+        -288
       ],
       "credentials": {
-        "openAiApi": {
-          "id": "rILpYjTayqc4jXXZ",
-          "name": "OpenAi account"
+        "anthropicApi": {
+          "id": "99IcBcafnZl2jhHG",
+          "name": "Anthropic account 2"
         }
       },
       "onError": "continueRegularOutput"
@@ -1705,6 +1704,79 @@
         15008,
         0
       ]
+    },
+    {
+      "id": "loop_over_items_compress",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        5152,
+        -96
+      ],
+      "parameters": {
+        "options": {}
+      }
+    },
+    {
+      "id": "extract_to_b64",
+      "name": "Extract from File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        5376,
+        80
+      ],
+      "parameters": {
+        "operation": "binaryToPropery",
+        "destinationKey": "image_b64",
+        "options": {}
+      }
+    },
+    {
+      "id": "compress_image_python",
+      "name": "Code in Python",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5600,
+        80
+      ],
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import base64\nfrom io import BytesIO\nfrom PIL import Image\n\nMAX_BYTES = 4 * 1024 * 1024  # 4 Mo max\n\ntry:\n    RESAMPLE_FILTER = Image.Resampling.LANCZOS\nexcept AttributeError:\n    RESAMPLE_FILTER = Image.LANCZOS\n\nfor item in _items:\n    raw_b64 = item.get(\"json\", {}).get(\"image_b64\", \"\")\n    if not raw_b64:\n        continue\n\n    raw_bytes = base64.b64decode(raw_b64)\n    if len(raw_bytes) <= MAX_BYTES:\n        continue\n\n    img = Image.open(BytesIO(raw_bytes))\n    if img.mode not in (\"RGB\", \"L\"):\n        img = img.convert(\"RGB\")\n\n    w, h = img.size\n    if w > 2500 or h > 2500:\n        ratio = min(2500 / w, 2500 / h)\n        img = img.resize((int(w * ratio), int(h * ratio)), RESAMPLE_FILTER)\n\n    out_buf = BytesIO()\n    quality = 85\n    img.save(out_buf, format=\"JPEG\", quality=quality, optimize=True)\n\n    while out_buf.tell() > MAX_BYTES and quality > 40:\n        quality -= 10\n        out_buf = BytesIO()\n        img.save(out_buf, format=\"JPEG\", quality=quality, optimize=True)\n\n    item[\"json\"][\"image_b64\"] = base64.b64encode(out_buf.getvalue()).decode(\"utf-8\")\n\nreturn _items"
+      }
+    },
+    {
+      "id": "convert_to_binary",
+      "name": "Convert to File",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        5824,
+        80
+      ],
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "image_b64",
+        "options": {
+          "fileName": "image.jpg",
+          "mimeType": "image/jpeg"
+        }
+      }
+    },
+    {
+      "id": "restore_json_after_compress",
+      "name": "Restore JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6048,
+        80
+      ],
+      "parameters": {
+        "jsCode": "// Réinjecte le JSON original (perdu par Convert to File) en gardant le binaire compressé\nreturn [{\n  json: $('Binary Ready Gate').item.json,\n  binary: $input.item.binary\n}];"
+      }
     }
   ],
   "pinData": {},
@@ -1829,7 +1901,7 @@
             "index": 0
           },
           {
-            "node": "Analyze Image OCR Inline",
+            "node": "Loop Over Items",
             "type": "main",
             "index": 0
           }
@@ -2559,6 +2631,68 @@
     "Completion Message Prepared": {
       "main": [
         []
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Analyze Image OCR Inline",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Code in Python",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in Python": {
+      "main": [
+        [
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        [
+          {
+            "node": "Restore JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore JSON": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
