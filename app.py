@@ -509,22 +509,41 @@ def render_validation():
     st.markdown('<p class="section-title">⚠ Centre de Validation</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-subtitle">Équipements détectés par l\'IA nécessitant une vérification humaine</p>', unsafe_allow_html=True)
 
-    items_df = run_query("""
-        SELECT
-            e.equipment_id, e.label, e.brand, e.model, e.serial_number,
-            e.subtype, e.category, e.condition_label, e.location_hint,
-            e.confidence, e.notes,
-            e.review_reasons_json, e.missing_fields_json,
-            e.technical_specs_json, e.business_context_json,
-            e.final_drive_folder_id,
-            e.received_at
-        FROM equipment e
-        WHERE e.review_required = true
-        ORDER BY e.received_at DESC
-    """)
+    # Équipement ciblé depuis la modale (édition directe depuis Parc Matériel)
+    edit_target_id = st.session_state.pop("edit_equipment_id", None)
+
+    if edit_target_id:
+        items_df = run_query("""
+            SELECT
+                e.equipment_id, e.label, e.brand, e.model, e.serial_number,
+                e.subtype, e.category, e.condition_label, e.location_hint,
+                e.confidence, e.notes,
+                e.review_reasons_json, e.missing_fields_json,
+                e.technical_specs_json, e.business_context_json,
+                e.final_drive_folder_id,
+                e.received_at
+            FROM equipment e
+            WHERE e.review_required = true OR e.equipment_id = ?
+            ORDER BY e.equipment_id = ? DESC, e.received_at DESC
+        """, [edit_target_id, edit_target_id])
+    else:
+        items_df = run_query("""
+            SELECT
+                e.equipment_id, e.label, e.brand, e.model, e.serial_number,
+                e.subtype, e.category, e.condition_label, e.location_hint,
+                e.confidence, e.notes,
+                e.review_reasons_json, e.missing_fields_json,
+                e.technical_specs_json, e.business_context_json,
+                e.final_drive_folder_id,
+                e.received_at
+            FROM equipment e
+            WHERE e.review_required = true
+            ORDER BY e.received_at DESC
+        """)
 
     if items_df.empty:
-        st.success("✅ Aucun équipement en attente de validation. Le parc est à jour !")
+        if not edit_target_id:
+            st.success("✅ Aucun équipement en attente de validation. Le parc est à jour !")
         return
 
     st.info(f"**{len(items_df)} équipement(s)** en attente de révision.", icon="ℹ️")
@@ -542,7 +561,8 @@ def render_validation():
 
         expander_title = f"🔧 {label}   |   Confiance IA : {conf_str}   |   {reasons_str}"
 
-        with st.expander(expander_title, expanded=False):
+        is_target = (edit_target_id is not None and row["equipment_id"] == edit_target_id)
+        with st.expander(expander_title, expanded=is_target):
             img_col, info_col = st.columns([1, 2])
 
             # ── Photo ──────────────────────────────────────────
@@ -822,11 +842,16 @@ def show_equipment_modal(equipment_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
-    # Lien Drive
+    # Lien Drive + bouton édition
+    st.markdown("---")
+    footer_left, footer_right = st.columns([2, 1])
     folder_url = drive_folder_url(row.get("final_drive_folder_id"))
     if folder_url:
-        st.markdown("---")
-        st.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
+        footer_left.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
+    if footer_right.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
+        st.session_state["edit_equipment_id"] = equipment_id
+        st.session_state["nav_radio"] = "⚠ Centre de Validation"
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 3 : PARC MATÉRIEL — Galerie & Recherche
@@ -1187,6 +1212,7 @@ def render_sidebar():
             "Navigation",
             options=["📊 Dashboard", "🏭 Parc Matériel", "⚠ Centre de Validation", "🔒 Journal des Accès"],
             label_visibility="collapsed",
+            key="nav_radio",
         )
 
         # Badge count validation dans le menu
