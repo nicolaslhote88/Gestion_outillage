@@ -977,16 +977,18 @@ def render_access_log():
     st.markdown('<p class="section-subtitle">Connexions enregistrées par Traefik</p>', unsafe_allow_html=True)
 
     # ── Options ───────────────────────────────────────────────
-    col_a, col_b, col_c, col_d = st.columns([2, 2, 2, 1])
+    col_a, col_b, col_c, col_d, col_e = st.columns([2, 2, 2, 2, 1])
     with col_a:
         nb_lines = st.select_slider(
             "Dernières lignes", options=[50, 100, 200, 500, 1000], value=200,
         )
     with col_b:
-        only_401 = st.checkbox("Seulement les refus (401)")
+        only_logins = st.checkbox("Connexions uniquement", value=True)
     with col_c:
-        search_ip = st.text_input("Filtrer par IP", placeholder="176.152…")
+        only_401 = st.checkbox("Seulement les refus (401)")
     with col_d:
+        search_ip = st.text_input("Filtrer par IP", placeholder="176.152…")
+    with col_e:
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔄 Actualiser"):
             st.rerun()
@@ -1015,6 +1017,8 @@ def render_access_log():
     entries = _parse_access_log(raw)
 
     # ── Filtres ───────────────────────────────────────────────
+    if only_logins:
+        entries = [e for e in entries if e["Utilisateur"] != "-" or e["Statut"] == 401]
     if only_401:
         entries = [e for e in entries if e["Statut"] == 401]
     if search_ip.strip():
@@ -1031,8 +1035,8 @@ def render_access_log():
     users     = {e["Utilisateur"] for e in entries if e["Utilisateur"] != "-"}
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Requêtes affichées", len(entries))
-    k2.metric("Accès autorisés (2xx)", nb_ok)
+    k1.metric("Connexions affichées" if only_logins else "Requêtes affichées", len(entries))
+    k2.metric("Connexions réussies" if only_logins else "Accès autorisés (2xx)", nb_ok)
     k3.metric("Refus 401", nb_401)
     k4.metric("IPs uniques", unique_ip)
 
