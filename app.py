@@ -177,29 +177,32 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 #  UTILITAIRES BASE DE DONNÉES
 # ─────────────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
-def get_connection():
-    """Connexion DuckDB en lecture seule (compatible n8n concurrent)."""
-    try:
-        conn = duckdb.connect(DB_PATH, read_only=True)
-        return conn
-    except Exception as e:
-        return None
-
-
 def run_query(sql: str, params=None) -> pd.DataFrame:
-    """Exécute une requête SQL et retourne un DataFrame. Gère les erreurs proprement."""
-    conn = get_connection()
-    if conn is None:
-        st.error("❌ Impossible de se connecter à la base de données. Vérifiez que le fichier DuckDB est accessible.")
-        return pd.DataFrame()
+    """Exécute une requête SQL et retourne un DataFrame.
+    Ouvre et ferme la connexion à chaque appel pour ne jamais bloquer
+    les écritures concurrentes de n8n (DuckDB file-lock).
+    """
     try:
-        if params:
-            return conn.execute(sql, params).df()
-        return conn.execute(sql).df()
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            if params:
+                return conn.execute(sql, params).df()
+            return conn.execute(sql).df()
+    except duckdb.IOException as e:
+        st.error(f"❌ Base de données inaccessible (verrou en cours ?) : {e}")
+        return pd.DataFrame()
     except Exception as e:
         st.error(f"Erreur SQL : {e}")
         return pd.DataFrame()
+
+
+def db_is_reachable() -> bool:
+    """Vérifie la disponibilité de la DB sans garder la connexion ouverte."""
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
 
 
 def safe_json(value, default=None):
@@ -226,6 +229,13 @@ def drive_direct_url(file_id: str) -> str:
     if not file_id:
         return ""
     return f"https://drive.google.com/uc?export=view&id={file_id}"
+
+
+def drive_folder_url(folder_id: str) -> str:
+    """Construit l'URL web d'un dossier Drive à partir de son ID."""
+    if not folder_id or str(folder_id) in ("nan", "None", ""):
+        return ""
+    return f"https://drive.google.com/drive/folders/{folder_id}"
 
 # ─────────────────────────────────────────────────────────────
 #  UTILITAIRES UI
@@ -432,7 +442,7 @@ def render_validation():
             e.confidence, e.notes,
             e.review_reasons_json, e.missing_fields_json,
             e.technical_specs_json, e.business_context_json,
-            e.final_drive_folder_web_view_link,
+            e.final_drive_folder_id,
             e.received_at
         FROM equipment e
         WHERE e.review_required = true
@@ -554,9 +564,9 @@ def render_validation():
                     st.markdown(f"📝 **Notes** : _{notes}_")
 
                 # Lien Drive
-                drive_link = row.get("final_drive_folder_web_view_link")
-                if drive_link and not pd.isna(drive_link) if isinstance(drive_link, float) else drive_link:
-                    st.markdown(f"[📁 Ouvrir le dossier Drive]({drive_link})", unsafe_allow_html=False)
+                folder_url = drive_folder_url(row.get("final_drive_folder_id"))
+                if folder_url:
+                    st.markdown(f"[📁 Ouvrir le dossier Drive]({folder_url})")
 
 # ─────────────────────────────────────────────────────────────
 #  MODALE DÉTAIL ÉQUIPEMENT  (st.dialog — Streamlit ≥ 1.32)
@@ -681,10 +691,10 @@ def show_equipment_modal(equipment_id: str):
             st.info(f"📝 {notes}")
 
     # Lien Drive
-    drive_link = row.get("final_drive_folder_web_view_link")
-    if drive_link and str(drive_link) not in ("nan", "None", ""):
+    folder_url = drive_folder_url(row.get("final_drive_folder_id"))
+    if folder_url:
         st.markdown("---")
-        st.markdown(f"[📁 Ouvrir le dossier Drive complet]({drive_link})")
+        st.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 3 : PARC MATÉRIEL — Galerie & Recherche
@@ -876,8 +886,7 @@ def render_sidebar():
         )
 
         # Indicateur connexion DB
-        conn = get_connection()
-        if conn:
+        if db_is_reachable():
             st.markdown(
                 '<span class="badge badge-green">● DB connectée</span>',
                 unsafe_allow_html=True,
