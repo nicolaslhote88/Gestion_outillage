@@ -986,7 +986,8 @@ def render_access_log():
     log_path = Path(TRAEFIK_LOG_FILE)
     if log_path.exists():
         import os, datetime as _dt
-        mtime = _dt.datetime.fromtimestamp(os.path.getmtime(log_path), tz=_PARIS_TZ)
+        import zoneinfo as _zi
+        mtime = _dt.datetime.fromtimestamp(os.path.getmtime(log_path), tz=_zi.ZoneInfo("Europe/Paris"))
         size_kb = os.path.getsize(log_path) / 1024
         st.caption(
             f"Fichier : `{TRAEFIK_LOG_FILE}` — "
