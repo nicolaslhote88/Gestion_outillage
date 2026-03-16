@@ -7,6 +7,8 @@ Connexion DuckDB en read_only=True (compatible avec n8n qui écrit en parallèle
 """
 
 import json
+import re
+import subprocess
 import streamlit as st
 import duckdb
 import pandas as pd
@@ -884,6 +886,190 @@ def render_parc_materiel():
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
+#  VUE 4 : JOURNAL DES ACCÈS (logs Traefik)
+# ─────────────────────────────────────────────────────────────
+
+# Nom du conteneur Traefik (ajustez si différent)
+TRAEFIK_CONTAINER = "traefik"
+# Chemin alternatif si les logs sont montés en fichier
+TRAEFIK_LOG_FILE  = "/var/log/traefik/access.log"
+
+# Regex Apache Combined Log Format
+_CLF_RE = re.compile(
+    r'(?P<ip>\S+)\s+-\s+(?P<user>\S+)\s+\[(?P<date>[^\]]+)\]\s+'
+    r'"(?P<method>\S+)\s+(?P<path>\S+)\s+\S+"\s+(?P<status>\d{3})\s+(?P<size>\S+)'
+)
+
+
+def _read_traefik_logs(n: int) -> list[str] | None:
+    """Retourne les N dernières lignes de logs Traefik (docker logs ou fichier)."""
+    # 1) Via docker logs (nécessite le socket Docker monté)
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--tail", str(n), TRAEFIK_CONTAINER],
+            capture_output=True, text=True, timeout=5,
+        )
+        lines = (result.stdout + result.stderr).splitlines()
+        if lines:
+            return lines
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # 2) Via fichier log monté en volume
+    log_path = Path(TRAEFIK_LOG_FILE)
+    if log_path.exists():
+        try:
+            all_lines = log_path.read_text(errors="replace").splitlines()
+            return all_lines[-n:] if len(all_lines) > n else all_lines
+        except OSError:
+            pass
+
+    return None
+
+
+def _parse_access_log(lines: list[str]) -> list[dict]:
+    """Parse les lignes CLF en liste de dicts."""
+    entries = []
+    for line in lines:
+        m = _CLF_RE.search(line)
+        if not m:
+            continue
+        # Conversion heure UTC → Paris
+        try:
+            ts = pd.to_datetime(m.group("date"), format="%d/%b/%Y:%H:%M:%S %z")
+            ts_paris = ts.tz_convert(_PARIS_TZ)
+            date_str = ts_paris.strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            date_str = m.group("date")
+
+        path = m.group("path")
+        # Filtre le bruit (health-checks, fichiers statiques)
+        if any(path.startswith(p) for p in ("/_stcore", "/static", "/healthz", "/favicon")):
+            continue
+
+        entries.append({
+            "Heure":    date_str,
+            "IP":       m.group("ip"),
+            "Utilisateur": m.group("user"),
+            "Chemin":   path[:80],
+            "Méthode":  m.group("method"),
+            "Statut":   int(m.group("status")),
+        })
+    return entries
+
+
+def _status_badge(code: int) -> str:
+    if code < 300:
+        color = "#22c55e"
+    elif code < 400:
+        color = "#3b82f6"
+    elif code == 401:
+        color = "#ef4444"
+    elif code < 500:
+        color = "#f97316"
+    else:
+        color = "#dc2626"
+    return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:.8rem;font-weight:600">{code}</span>'
+
+
+def render_access_log():
+    st.markdown('<p class="section-title">🔒 Journal des Accès</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-subtitle">Connexions enregistrées par Traefik</p>', unsafe_allow_html=True)
+
+    # ── Options ───────────────────────────────────────────────
+    col_a, col_b, col_c, col_d = st.columns([2, 2, 2, 1])
+    with col_a:
+        nb_lines = st.select_slider(
+            "Dernières lignes", options=[50, 100, 200, 500, 1000], value=200,
+        )
+    with col_b:
+        only_401 = st.checkbox("Seulement les refus (401)")
+    with col_c:
+        search_ip = st.text_input("Filtrer par IP", placeholder="176.152…")
+    with col_d:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Actualiser"):
+            st.rerun()
+
+    # ── Lecture ───────────────────────────────────────────────
+    raw = _read_traefik_logs(nb_lines)
+
+    if raw is None:
+        st.error(
+            "Impossible de lire les logs Traefik. "
+            "Deux options :\n\n"
+            "**Option A — Docker socket** : montez `/var/run/docker.sock` "
+            "dans le conteneur Streamlit.\n\n"
+            "**Option B — Fichier log** : ajoutez dans votre `docker-compose.yml` Traefik :\n"
+            "```yaml\n"
+            "command:\n"
+            "  - --accesslog=true\n"
+            "  - --accesslog.filepath=/var/log/traefik/access.log\n"
+            "volumes:\n"
+            "  - traefik_logs:/var/log/traefik\n"
+            "```\n"
+            f"et montez le même volume dans le conteneur SIGA à `{TRAEFIK_LOG_FILE}`."
+        )
+        return
+
+    entries = _parse_access_log(raw)
+
+    # ── Filtres ───────────────────────────────────────────────
+    if only_401:
+        entries = [e for e in entries if e["Statut"] == 401]
+    if search_ip.strip():
+        entries = [e for e in entries if search_ip.strip() in e["IP"]]
+
+    if not entries:
+        st.info("Aucune entrée correspondant aux filtres.")
+        return
+
+    # ── KPIs ──────────────────────────────────────────────────
+    nb_401   = sum(1 for e in entries if e["Statut"] == 401)
+    nb_ok    = sum(1 for e in entries if 200 <= e["Statut"] < 300)
+    unique_ip = len({e["IP"] for e in entries})
+    users     = {e["Utilisateur"] for e in entries if e["Utilisateur"] != "-"}
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Requêtes affichées", len(entries))
+    k2.metric("Accès autorisés (2xx)", nb_ok)
+    k3.metric("Refus 401", nb_401)
+    k4.metric("IPs uniques", unique_ip)
+
+    if users:
+        st.caption(f"Utilisateurs identifiés : {', '.join(sorted(users))}")
+
+    st.markdown("---")
+
+    # ── Tableau ───────────────────────────────────────────────
+    rows_html = ""
+    for e in reversed(entries):   # plus récent en haut
+        badge = _status_badge(e["Statut"])
+        user  = e["Utilisateur"] if e["Utilisateur"] != "-" else '<span style="color:#94a3b8">—</span>'
+        rows_html += (
+            f"<tr>"
+            f"<td style='color:#94a3b8;font-size:.82rem'>{e['Heure']}</td>"
+            f"<td><code style='font-size:.82rem'>{e['IP']}</code></td>"
+            f"<td>{user}</td>"
+            f"<td><code style='font-size:.82rem'>{e['Chemin']}</code></td>"
+            f"<td>{badge}</td>"
+            f"</tr>"
+        )
+
+    st.markdown(
+        "<table style='width:100%;border-collapse:collapse'>"
+        "<thead><tr style='border-bottom:1px solid #334155;color:#94a3b8;font-size:.8rem'>"
+        "<th align='left'>Heure</th><th align='left'>IP</th>"
+        "<th align='left'>Utilisateur</th><th align='left'>Chemin</th>"
+        "<th align='left'>Statut</th>"
+        "</tr></thead>"
+        f"<tbody>{rows_html}</tbody>"
+        "</table>",
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 #  SIDEBAR PRINCIPALE — Navigation
 # ─────────────────────────────────────────────────────────────
 
@@ -901,7 +1087,7 @@ def render_sidebar():
 
         page = st.radio(
             "Navigation",
-            options=["📊 Dashboard", "🏭 Parc Matériel", "⚠ Centre de Validation"],
+            options=["📊 Dashboard", "🏭 Parc Matériel", "⚠ Centre de Validation", "🔒 Journal des Accès"],
             label_visibility="collapsed",
         )
 
@@ -950,6 +1136,8 @@ def main():
         render_parc_materiel()
     elif page == "⚠ Centre de Validation":
         render_validation()
+    elif page == "🔒 Journal des Accès":
+        render_access_log()
 
 
 if __name__ == "__main__":
