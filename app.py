@@ -568,7 +568,7 @@ def render_validation():
             # ── Photo ──────────────────────────────────────────
             with img_col:
                 media_df = run_query("""
-                    SELECT final_drive_file_id, image_role
+                    SELECT final_drive_file_id, image_role, image_index
                     FROM equipment_media
                     WHERE equipment_id = ?
                     ORDER BY
@@ -577,31 +577,34 @@ def render_validation():
                             WHEN 'nameplate'  THEN 2
                             WHEN 'detail'     THEN 3
                             ELSE 4
-                        END
-                    LIMIT 3
+                        END,
+                        image_index
                 """, [row["equipment_id"]])
 
                 if not media_df.empty:
-                    # Affiche la photo principale
+                    # Photo principale (grande)
                     main_media = media_df.iloc[0]
                     file_id    = main_media.get("final_drive_file_id")
                     img_src    = drive_img_src(file_id, 600) if file_id else None
                     if img_src:
                         st.image(img_src, use_container_width=True,
-                                 caption=f"Vue : {null_str(main_media.get('image_role'))}")
+                                 caption=f"Photo 1 · {null_str(main_media.get('image_role'))}")
                     else:
                         st.info("📷 Aucune image disponible")
 
-                    # Miniatures supplémentaires
-                    if len(media_df) > 1:
-                        thumb_cols = st.columns(len(media_df) - 1)
-                        for idx, (_, m) in enumerate(media_df.iloc[1:].iterrows()):
+                    # Toutes les photos restantes (3 par ligne)
+                    remaining_media = media_df.iloc[1:]
+                    for chunk_start in range(0, len(remaining_media), 3):
+                        chunk = remaining_media.iloc[chunk_start:chunk_start + 3]
+                        tcols = st.columns(3)
+                        for j, (_, m) in enumerate(chunk.iterrows()):
                             fid = m.get("final_drive_file_id")
                             if fid:
-                                thumb_cols[idx].image(
+                                photo_num = chunk_start + j + 2  # 2-based (1 = main)
+                                tcols[j].image(
                                     drive_img_src(fid, 200),
                                     use_container_width=True,
-                                    caption=null_str(m.get("image_role")),
+                                    caption=f"Photo {photo_num} · {null_str(m.get('image_role'))}",
                                 )
                 else:
                     st.info("📷 Aucune image disponible")
@@ -631,7 +634,35 @@ def render_validation():
 
                 CONDITION_OPTIONS = ["neuf", "bon", "use", "tres use", "hors service", "inconnu"]
 
+                # ── Sélecteur vignette principale ──────────────────
+                photo_options = {}
+                if not media_df.empty:
+                    for idx, (_, m) in enumerate(media_df.iterrows()):
+                        fid = m.get("final_drive_file_id")
+                        if fid:
+                            role = null_str(m.get("image_role"), "autre")
+                            photo_options[f"Photo {idx + 1} ({role})"] = fid
+
                 with st.form(key=f"form_{eq_id}"):
+                    if photo_options:
+                        current_main_fid = media_df.iloc[0].get("final_drive_file_id") if not media_df.empty else None
+                        # Trouver l'option qui correspond à la vignette actuelle
+                        option_keys = list(photo_options.keys())
+                        default_idx = 0
+                        for i, (k, v) in enumerate(photo_options.items()):
+                            if v == current_main_fid:
+                                default_idx = i
+                                break
+                        f_main_photo_label = st.selectbox(
+                            "🖼 Vignette principale (Parc Matériel)",
+                            options=option_keys,
+                            index=default_idx,
+                            key=f"main_photo_{eq_id}",
+                        )
+                        f_main_photo_fid = photo_options[f_main_photo_label]
+                    else:
+                        f_main_photo_fid = None
+
                     f_label    = st.text_input(_label("label",          "Nom / Désignation"),
                                                value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
                     f_brand    = st.text_input(_label("brand",          "Marque"),
@@ -676,6 +707,17 @@ def render_validation():
                         f_serial or None, f_subtype or None, f_condition,
                         f_location or None, f_notes or None, eq_id,
                     ])
+                    # Mise à jour vignette principale
+                    if ok and f_main_photo_fid:
+                        run_write("""
+                            UPDATE equipment_media
+                            SET image_role = CASE
+                                WHEN final_drive_file_id = ? THEN 'overview'
+                                WHEN image_role = 'overview' THEN 'detail'
+                                ELSE image_role
+                            END
+                            WHERE equipment_id = ?
+                        """, [f_main_photo_fid, eq_id])
                     if ok:
                         st.success("✅ Équipement validé et mis à jour.")
                         st.cache_data.clear()
@@ -754,14 +796,15 @@ def show_equipment_modal(equipment_id: str):
             fid  = main.get("final_drive_file_id")
             if fid:
                 st.image(drive_img_src(fid, 700), use_container_width=True)
-            # Galerie miniatures
-            if len(media_df) > 1:
-                nb = min(len(media_df) - 1, 3)
-                thumb_cols = st.columns(nb)
-                for i, (_, m) in enumerate(media_df.iloc[1:nb+1].iterrows()):
+            # Galerie toutes les photos restantes (3 par ligne)
+            remaining = media_df.iloc[1:]
+            for chunk_start in range(0, len(remaining), 3):
+                chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                cols = st.columns(3)
+                for j, (_, m) in enumerate(chunk.iterrows()):
                     fid2 = m.get("final_drive_file_id")
                     if fid2:
-                        thumb_cols[i].image(
+                        cols[j].image(
                             drive_img_src(fid2, 250),
                             use_container_width=True,
                             caption=null_str(m.get("image_role")),
