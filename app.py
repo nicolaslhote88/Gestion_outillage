@@ -7,6 +7,7 @@ Connexion DuckDB en read_only=True (compatible avec n8n qui écrit en parallèle
 """
 
 import json
+import os
 import re
 import subprocess
 import streamlit as st
@@ -15,6 +16,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as _build_gdrive
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION GLOBALE
@@ -238,6 +241,34 @@ def drive_folder_url(folder_id: str) -> str:
     if not folder_id or str(folder_id) in ("nan", "None", ""):
         return ""
     return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_drive_image_bytes(file_id: str) -> bytes | None:
+    """Télécharge une image Drive côté serveur via service account.
+    Retourne None si le service account n'est pas configuré (fallback URL)."""
+    if not file_id or str(file_id) in ("nan", "None", ""):
+        return None
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
+        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+        return svc.files().get_media(fileId=file_id).execute()
+    except Exception:
+        return None
+
+
+def drive_img_src(file_id: str, size: int = 400):
+    """Retourne bytes (proxy SA) ou URL Drive en fallback.
+    Permet d'afficher les images sans que l'utilisateur ait accès au Drive."""
+    data = get_drive_image_bytes(file_id)
+    return data if data is not None else drive_thumbnail_url(file_id, size)
+
 
 # ─────────────────────────────────────────────────────────────
 #  UTILITAIRES UI
@@ -514,9 +545,9 @@ def render_validation():
                     # Affiche la photo principale
                     main_media = media_df.iloc[0]
                     file_id    = main_media.get("final_drive_file_id")
-                    img_url    = drive_thumbnail_url(file_id, 600) if file_id else None
-                    if img_url:
-                        st.image(img_url, use_container_width=True,
+                    img_src    = drive_img_src(file_id, 600) if file_id else None
+                    if img_src:
+                        st.image(img_src, use_container_width=True,
                                  caption=f"Vue : {null_str(main_media.get('image_role'))}")
                     else:
                         st.info("📷 Aucune image disponible")
@@ -528,7 +559,7 @@ def render_validation():
                             fid = m.get("final_drive_file_id")
                             if fid:
                                 thumb_cols[idx].image(
-                                    drive_thumbnail_url(fid, 200),
+                                    drive_img_src(fid, 200),
                                     use_container_width=True,
                                     caption=null_str(m.get("image_role")),
                                 )
@@ -641,7 +672,7 @@ def show_equipment_modal(equipment_id: str):
             main = media_df.iloc[0]
             fid  = main.get("final_drive_file_id")
             if fid:
-                st.image(drive_thumbnail_url(fid, 700), use_container_width=True)
+                st.image(drive_img_src(fid, 700), use_container_width=True)
             # Galerie miniatures
             if len(media_df) > 1:
                 nb = min(len(media_df) - 1, 3)
@@ -650,7 +681,7 @@ def show_equipment_modal(equipment_id: str):
                     fid2 = m.get("final_drive_file_id")
                     if fid2:
                         thumb_cols[i].image(
-                            drive_thumbnail_url(fid2, 250),
+                            drive_img_src(fid2, 250),
                             use_container_width=True,
                             caption=null_str(m.get("image_role")),
                         )
@@ -852,7 +883,7 @@ def render_parc_materiel():
                 file_id = item.get("main_file_id")
                 if file_id and str(file_id) not in ("nan", "None", ""):
                     st.image(
-                        drive_thumbnail_url(file_id, 400),
+                        drive_img_src(file_id, 400),
                         use_container_width=True,
                     )
                 else:
