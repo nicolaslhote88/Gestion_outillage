@@ -247,6 +247,32 @@ def drive_thumbnail_url(file_id: str, size: int = 400) -> str:
     return f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size}"
 
 
+def trash_drive_folder(folder_id: str) -> bool:
+    """Déplace un dossier Drive à la corbeille via service account.
+    Retourne True si succès, False sinon."""
+    if not folder_id or str(folder_id) in ("nan", "None", ""):
+        return False
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return False
+    try:
+        import sys
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path,
+            scopes=["https://www.googleapis.com/auth/drive"],
+        )
+        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+        svc.files().update(
+            fileId=folder_id,
+            body={"trashed": True},
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"[DRIVE_TRASH] folder_id={folder_id} → {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return False
+
+
 def drive_direct_url(file_id: str) -> str:
     """URL de rendu direct Google Drive (uc?export=view)."""
     if not file_id:
@@ -685,9 +711,7 @@ def render_validation():
                                               value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
                                               height=80)
 
-                    btn_col1, btn_col2 = st.columns([2, 1])
-                    submitted = btn_col1.form_submit_button("✅ Valider et enregistrer", type="primary", use_container_width=True)
-                    rejected  = btn_col2.form_submit_button("🗑 Rejeter",                 type="secondary", use_container_width=True)
+                    submitted = st.form_submit_button("✅ Valider et enregistrer", type="primary", use_container_width=True)
 
                 if submitted:
                     ok = run_write("""
@@ -723,13 +747,35 @@ def render_validation():
                         st.cache_data.clear()
                         st.rerun()
 
-                if rejected:
-                    ok = run_write(
-                        "DELETE FROM equipment WHERE equipment_id = ?", [eq_id]
+                # ── Bouton Supprimer avec confirmation ─────────────
+                folder_id_for_del = null_str(row.get("final_drive_folder_id"), "")
+                confirm_key = f"confirm_del_{eq_id}"
+
+                if not st.session_state.get(confirm_key):
+                    if st.button("🗑 Supprimer définitivement", key=f"del_btn_{eq_id}",
+                                 use_container_width=False):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    st.warning(
+                        "⚠️ Supprimer **définitivement** cet équipement de la base "
+                        + ("**et mettre son dossier Drive à la corbeille** ?" if folder_id_for_del else "?")
                     )
-                    if ok:
-                        st.warning("🗑 Équipement supprimé.")
+                    c1, c2 = st.columns(2)
+                    if c1.button("✅ Confirmer la suppression", key=f"del_yes_{eq_id}", type="primary"):
+                        run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [eq_id])
+                        run_write("DELETE FROM equipment WHERE equipment_id = ?", [eq_id])
+                        if folder_id_for_del:
+                            drive_ok = trash_drive_folder(folder_id_for_del)
+                            if drive_ok:
+                                st.info("📁 Dossier Drive déplacé à la corbeille.")
+                            else:
+                                st.warning("⚠️ Suppression DB OK mais le dossier Drive n'a pas pu être mis à la corbeille.")
+                        st.session_state.pop(confirm_key, None)
                         st.cache_data.clear()
+                        st.rerun()
+                    if c2.button("↩ Annuler", key=f"del_no_{eq_id}"):
+                        st.session_state.pop(confirm_key, None)
                         st.rerun()
 
                 # Specs techniques (lecture seule)
