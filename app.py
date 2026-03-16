@@ -666,23 +666,40 @@ def show_equipment_modal(equipment_id: str):
         consumables = biz.get("consumables") or biz.get("consommables") or []
         associated  = biz.get("associated_items") or biz.get("elements_associes") or []
 
+        def _fmt_item(item) -> str:
+            """Formate un item (dict ou str) en ligne lisible."""
+            if isinstance(item, dict):
+                label = item.get("label") or item.get("raw_label") or item.get("detected_object_type") or "?"
+                brand = item.get("brand", "")
+                model = item.get("model", "")
+                condition = item.get("item_condition") or item.get("consumable_state") or ""
+                parts = [label]
+                if brand:
+                    parts.append(brand)
+                if model:
+                    parts.append(model)
+                if condition:
+                    parts.append(f"*({condition})*")
+                return " · ".join(parts)
+            return str(item)
+
         if accessories:
             st.markdown("---")
             st.markdown("**Accessoires livrés**")
             for a in accessories:
-                st.markdown(f"&nbsp;&nbsp;✦ {a}")
+                st.markdown(f"&nbsp;&nbsp;✦ {_fmt_item(a)}")
 
         if consumables:
             st.markdown("---")
             st.markdown("**Consommables associés**")
             for c in consumables:
-                st.markdown(f"&nbsp;&nbsp;⚙ {c}")
+                st.markdown(f"&nbsp;&nbsp;⚙ {_fmt_item(c)}")
 
         if associated:
             st.markdown("---")
             st.markdown("**Éléments associés**")
             for item in associated:
-                st.markdown(f"&nbsp;&nbsp;🔗 {item}")
+                st.markdown(f"&nbsp;&nbsp;🔗 {_fmt_item(item)}")
 
         # Notes
         notes = null_str(row.get("notes"))
