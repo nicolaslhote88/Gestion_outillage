@@ -890,7 +890,7 @@ def render_parc_materiel():
 # ─────────────────────────────────────────────────────────────
 
 # Nom du conteneur Traefik (ajustez si différent)
-TRAEFIK_CONTAINER = "traefik"
+TRAEFIK_CONTAINER = "root-traefik-1"
 # Chemin alternatif si les logs sont montés en fichier
 TRAEFIK_LOG_FILE  = "/var/log/traefik/access.log"
 
