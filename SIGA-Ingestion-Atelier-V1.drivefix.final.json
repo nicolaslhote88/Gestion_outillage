@@ -19,7 +19,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const payload = $json.body || $json;\nconst images = Array.isArray(payload.images) ? payload.images : [];\nconst sender = payload.sender || {};\nconst message = payload.message || {};\nconst now = new Date();\nconst rand = Math.random().toString(36).slice(2, 6).toUpperCase();\nconst providedIngestionId = typeof payload.ingestion_id === 'string' ? payload.ingestion_id.trim() : '';\nconst ingestion_id = providedIngestionId || ('SIGA-ING-' + now.getUTCFullYear() + String(now.getUTCMonth()+1).padStart(2,'0') + String(now.getUTCDate()).padStart(2,'0') + '-' + String(now.getUTCHours()).padStart(2,'0') + String(now.getUTCMinutes()).padStart(2,'0') + String(now.getUTCSeconds()).padStart(2,'0') + '-' + String(now.getUTCMilliseconds()).padStart(3,'0') + '-' + rand);\nconst context = payload.context || {};\nconst readEnv = (name) => {\n  try {\n    if (typeof process !== 'undefined' && process?.env && typeof process.env[name] === 'string') {\n      const v = process.env[name].trim();\n      if (v) return v;\n    }\n  } catch {}\n  return '';\n};\nconst configuredSecret = [\n  'SIGA_WEBHOOK_SECRET',\n  'SIGA_SHARED_SECRET',\n  'N8N_SIGA_WEBHOOK_SECRET',\n  'N8N_SIGA_SHARED_SECRET'\n].map(readEnv).find(Boolean) || '';\nconst headerSecret = $json.headers?.['x-siga-shared-secret'] || $json.headers?.['X-SIGA-SHARED-SECRET'] || null;\nconst authHeader = $json.headers?.authorization || $json.headers?.Authorization || null;\nconst bearerToken = typeof authHeader === 'string' ? authHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst authConfigured = !!configuredSecret;\nconst authPassed = !authConfigured || headerSecret === configuredSecret || bearerToken === configuredSecret;\nconst normalizedImages = images.map((img, idx) => ({\n  index: Number(img.index || idx + 1),\n  filename: img.filename || ('image_' + (idx + 1) + '.jpg'),\n  mime_type: img.mime_type || 'image/jpeg',\n  content_base64: img.content_base64 || null\n}));\nconst validImageCount = normalizedImages.filter(img => !!img.content_base64).length;\nconst errors = [];\nif (normalizedImages.length === 0) errors.push({ code: 'no_images', message: 'At least one image is required' });\nif (!authPassed) errors.push({ code: 'unauthorized', message: 'Invalid shared secret' });\nreturn [{ json: {\n  ok: errors.length === 0,\n  stage: errors.length === 0 ? 'accepted' : 'rejected',\n  error: errors.length ? errors[0].message : null,\n  errors,\n  auth: {\n    configured: authConfigured,\n    passed: authPassed,\n    mode: authConfigured ? 'server_secret_enforced' : 'open_unconfigured',\n    accepted_via: !authConfigured ? 'open_unconfigured' : (headerSecret === configuredSecret ? 'x-siga-shared-secret' : (bearerToken === configuredSecret ? 'authorization_bearer' : 'rejected')),\n    secret_source: authConfigured ? 'server_env' : 'not_configured'\n  },\n  project: payload.project || 'SIGA',\n  entity_type: payload.entity_type || 'equipment',\n  source: payload.source || 'whatsapp',\n  ingestion_id,\n  sender: { id: sender.id || null, display_name: sender.display_name || null },\n  message: { id: message.id || null, text: message.text || '', received_at: message.received_at || now.toISOString() },\n  images: normalizedImages,\n  image_count: normalizedImages.length,\n  valid_image_count: validImageCount,\n  context,\n  raw_payload: payload\n} }];"
+        "jsCode": "const payload = $json.body || $json;\nconst sender = payload.sender || {};\nconst message = payload.message || {};\nconst now = new Date();\nconst rand = Math.random().toString(36).slice(2, 6).toUpperCase();\nconst providedIngestionId = typeof payload.ingestion_id === 'string' ? payload.ingestion_id.trim() : '';\nconst ingestion_id = providedIngestionId || ('SIGA-ING-' + now.getUTCFullYear() + String(now.getUTCMonth()+1).padStart(2,'0') + String(now.getUTCDate()).padStart(2,'0') + '-' + String(now.getUTCHours()).padStart(2,'0') + String(now.getUTCMinutes()).padStart(2,'0') + String(now.getUTCSeconds()).padStart(2,'0') + '-' + String(now.getUTCMilliseconds()).padStart(3,'0') + '-' + rand);\nconst context = payload.context || {};\nconst readEnv = (name) => {\n  try {\n    if (typeof process !== 'undefined' && process?.env && typeof process.env[name] === 'string') {\n      const v = process.env[name].trim();\n      if (v) return v;\n    }\n  } catch {}\n  return '';\n};\nconst configuredSecret = [\n  'SIGA_WEBHOOK_SECRET',\n  'SIGA_SHARED_SECRET',\n  'N8N_SIGA_WEBHOOK_SECRET',\n  'N8N_SIGA_SHARED_SECRET'\n].map(readEnv).find(Boolean) || '';\nconst headerSecret = $json.headers?.['x-siga-shared-secret'] || $json.headers?.['X-SIGA-SHARED-SECRET'] || null;\nconst authHeader = $json.headers?.authorization || $json.headers?.Authorization || null;\nconst bearerToken = typeof authHeader === 'string' ? authHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst authConfigured = !!configuredSecret;\nconst authPassed = !authConfigured || headerSecret === configuredSecret || bearerToken === configuredSecret;\n\n// ── Détection des images : JSON body OU pièces jointes binaires ──────────────\nconst jsonImages = Array.isArray(payload.images) ? payload.images : [];\n\n// Lire les binaires attachés au webhook (multipart : image_upload0, image_upload1, …)\nconst binaryData = $input.first()?.binary || {};\nconst binaryKeys = Object.keys(binaryData)\n  .filter(k => /^image_upload\\d+$/.test(k) || /^image\\d+$/.test(k))\n  .sort((a, b) => {\n    const na = parseInt(a.replace(/\\D+/g, ''), 10);\n    const nb = parseInt(b.replace(/\\D+/g, ''), 10);\n    return na - nb;\n  });\n\nconst normalizedImages = jsonImages.length > 0\n  // Mode JSON : images encodées en base64 dans le corps de la requête\n  ? jsonImages.map((img, idx) => ({\n      index: Number(img.index || idx + 1),\n      filename: img.filename || ('image_' + (idx + 1) + '.jpg'),\n      mime_type: img.mime_type || 'image/jpeg',\n      content_base64: img.content_base64 || null,\n      binary_key: img.binary_key || null\n    }))\n  // Mode binaire : pièces jointes multipart (ex. envoi depuis app mobile)\n  : binaryKeys.map((bkey, idx) => {\n      const b = binaryData[bkey];\n      return {\n        index: idx + 1,\n        filename: b.fileName || b.filename || ('image_' + (idx + 1) + '.jpg'),\n        mime_type: b.mimeType || 'image/jpeg',\n        content_base64: null,\n        binary_key: bkey\n      };\n    });\n\n// Une image est valide si elle a du contenu base64 OU un binaire attaché\nconst validImageCount = normalizedImages.filter(img => !!img.content_base64 || !!img.binary_key).length;\n\nconst errors = [];\nif (normalizedImages.length === 0) errors.push({ code: 'no_images', message: 'At least one image is required' });\nif (!authPassed) errors.push({ code: 'unauthorized', message: 'Invalid shared secret' });\n\nreturn [{ json: {\n  ok: errors.length === 0,\n  stage: errors.length === 0 ? 'accepted' : 'rejected',\n  error: errors.length ? errors[0].message : null,\n  errors,\n  auth: {\n    configured: authConfigured,\n    passed: authPassed,\n    mode: authConfigured ? 'server_secret_enforced' : 'open_unconfigured',\n    accepted_via: !authConfigured ? 'open_unconfigured' : (headerSecret === configuredSecret ? 'x-siga-shared-secret' : (bearerToken === configuredSecret ? 'authorization_bearer' : 'rejected')),\n    secret_source: authConfigured ? 'server_env' : 'not_configured'\n  },\n  project: payload.project || 'SIGA',\n  entity_type: payload.entity_type || 'equipment',\n  source: payload.source || 'whatsapp',\n  ingestion_id,\n  sender: { id: sender.id || null, display_name: sender.display_name || null },\n  message: { id: message.id || null, text: message.text || '', received_at: message.received_at || now.toISOString() },\n  images: normalizedImages,\n  image_count: normalizedImages.length,\n  valid_image_count: validImageCount,\n  context,\n  raw_payload: payload\n} }];"
       },
       "id": "normalize_input",
       "name": "Normalize Input",
@@ -119,7 +119,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const root = $json;\nconst images = Array.isArray(root.images) ? root.images : [];\nreturn images.map((img, idx) => {\n  const content = img.content_base64 || null;\n  const hasBase64 = !!content;\n  const imageIndex = Number(img.index || idx + 1);\n  const imageUid = String(root.ingestion_id || 'SIGA') + '-IMG' + String(imageIndex).padStart(3, '0');\n  const base = {\n    ...root,\n    image_index: imageIndex,\n    image_uid: imageUid,\n    current_image: img,\n    original_filename: img.filename || ('image_' + imageIndex + '.jpg'),\n    mime_type: img.mime_type || 'image/jpeg'\n  };\n  if (!hasBase64) {\n    return {\n      json: {\n        ...base,\n        processing_status: 'image_error',\n        image_error: { code: 'missing_content_base64', message: 'content_base64 is required for OCR and staging in this workflow version' }\n      }\n    };\n  }\n  return { json: { ...base, processing_status: 'ready_for_ocr_and_staging', image_error: null } };\n});"
+        "jsCode": "const root = $json;\nconst images = Array.isArray(root.images) ? root.images : [];\nreturn images.map((img, idx) => {\n  const imageIndex = Number(img.index || idx + 1);\n  const imageUid = String(root.ingestion_id || 'SIGA') + '-IMG' + String(imageIndex).padStart(3, '0');\n  const base = {\n    ...root,\n    image_index: imageIndex,\n    image_uid: imageUid,\n    current_image: img,\n    original_filename: img.filename || ('image_' + imageIndex + '.jpg'),\n    mime_type: img.mime_type || 'image/jpeg'\n  };\n  // Accepte soit base64 dans le JSON, soit une pièce jointe binaire identifiée par binary_key\n  const hasContent = !!img.content_base64 || !!img.binary_key;\n  if (!hasContent) {\n    return {\n      json: {\n        ...base,\n        processing_status: 'image_error',\n        image_error: { code: 'missing_content', message: 'Neither content_base64 nor binary_key is available for this image' }\n      }\n    };\n  }\n  return { json: { ...base, processing_status: 'ready_for_ocr_and_staging', image_error: null } };\n});"
       },
       "id": "split_images",
       "name": "Split Images",
@@ -132,7 +132,7 @@
     },
     {
       "parameters": {
-        "jsCode": "return $input.all().map(item => {\n  const j = item.json || {};\n  const img = j.current_image || {};\n  if (!img.content_base64) {\n    return { json: { ...j, _binary_ready: false } };\n  }\n  return {\n    json: { ...j, _binary_ready: true },\n    binary: {\n      data: {\n        data: img.content_base64,\n        mimeType: img.mime_type || 'image/jpeg',\n        fileName: img.filename || ('image_' + (j.image_index || 1) + '.jpg')\n      }\n    }\n  };\n});"
+        "jsCode": "return $input.all().map(item => {\n  const j = item.json || {};\n  const img = j.current_image || {};\n\n  // Mode 1 : base64 fourni directement dans le JSON\n  if (img.content_base64) {\n    return {\n      json: { ...j, _binary_ready: true },\n      binary: {\n        data: {\n          data: img.content_base64,\n          mimeType: img.mime_type || 'image/jpeg',\n          fileName: img.filename || ('image_' + (j.image_index || 1) + '.jpg')\n        }\n      }\n    };\n  }\n\n  // Mode 2 : pièce jointe binaire du webhook (multipart)\n  const binaryKey = img.binary_key;\n  if (binaryKey) {\n    const webhookBinary = $('Webhook In').all()[0]?.binary || {};\n    const binaryFile = webhookBinary[binaryKey];\n    if (binaryFile) {\n      return {\n        json: { ...j, _binary_ready: true },\n        binary: { data: binaryFile }\n      };\n    }\n  }\n\n  return { json: { ...j, _binary_ready: false } };\n});"
       },
       "id": "prepare_binary_inline",
       "name": "Prepare Binary Inline",
@@ -177,29 +177,28 @@
     {
       "parameters": {
         "resource": "image",
-        "operation": "analyze",
         "modelId": {
           "__rl": true,
-          "value": "gpt-4o",
+          "value": "claude-sonnet-4-6",
           "mode": "list",
-          "cachedResultName": "GPT-4O"
+          "cachedResultName": "claude-sonnet-4-6"
         },
-        "text": "Analyse cette photo d’outil ou machine d’atelier. Réponds UNIQUEMENT en JSON strict selon ce schéma exact: {\"image_role\":\"overview|nameplate|detail|unknown\",\"contains_nameplate\":true,\"detected_object_type\":\"\",\"brand\":\"\",\"model\":\"\",\"serial_number\":null,\"nameplate_text\":\"\",\"technical_specs\":{},\"condition_notes\":[],\"equipment_count_estimate\":1,\"readability\":0.0,\"confidence\":0.0,\"is_primary_equipment_candidate\":false,\"primary_equipment_confidence\":0.0,\"is_accessory_or_consumable\":false,\"accessory_type\":\"\",\"secondary_objects\":[],\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"item_role\":\"primary|accessory|consumable|associated_item|packaging|unknown\",\"packaging_detected\":false,\"is_packaged_item\":false,\"missing_visual_information\":[]}. Pour secondary_objects, utilise une liste d’objets de forme {\"label\":\"\",\"object_type\":\"\",\"item_role\":\"accessory|consumable|associated_item|packaging|unknown\",\"consumable_state\":\"new|used|very_used|unknown\",\"item_condition\":\"\",\"packaging_detected\":false,\"is_packaged_item\":false,\"brand\":\"\",\"model\":\"\",\"confidence\":0.0,\"evidence\":[]}. Règles: 1) image_role=overview pour vue globale de l'équipement, nameplate pour plaque signalétique / étiquette technique, detail pour détail/état/usure, unknown sinon. 2) brand/model/serial/specs prioritairement si lisibles. 3) condition_notes = liste courte de constats visuels factuels. 4) confidence, readability et primary_equipment_confidence entre 0 et 1. 5) Si l’image montre surtout un emballage, un disque, une lame, une boîte, un consommable ou un accessoire isolé, renseigne is_accessory_or_consumable=true, accessory_type si possible, et n’en fais pas l’équipement principal. 6) Si l’image montre clairement la machine / l’outil principal, renseigne is_primary_equipment_candidate=true. 7) Détecte aussi les objets secondaires visibles autour de l’équipement principal: disque, lame, batterie, chargeur, emballage, boîte, lot de consommables, etc. Remplis secondary_objects même si l’objet principal reste la machine. 8) Pour les consommables de coupe (disque/lame), qualifie au mieux consumable_state: new si neuf / emballé / très peu utilisé, used si usure visible modérée, very_used si très forte usure, inconnu sinon. 9) packaging_detected=true si emballage/boîte/sachet visible; is_packaged_item=true si l’objet semble encore dans son emballage ou présenté comme produit emballé. 10) item_role doit refléter la fonction métier de l’objet observé, sans jamais promouvoir un objet secondaire comme équipement principal. 11) Si le modèle d’un disque/accessoire n’est pas lisible, ne l’invente pas. 12) Pas de markdown, pas d’explication, JSON strict seulement.",
-        "inputType": "base64",
+        "text": "={{$json.ocr_context_prompt}}",
+        "inputType": "binary",
         "options": {}
       },
       "id": "analyze_image_inline",
       "name": "Analyze Image OCR Inline",
-      "type": "@n8n/n8n-nodes-langchain.openAi",
-      "typeVersion": 2.1,
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
       "position": [
-        5152,
-        -96
+        5376,
+        -288
       ],
       "credentials": {
-        "openAiApi": {
-          "id": "rILpYjTayqc4jXXZ",
-          "name": "OpenAi account"
+        "anthropicApi": {
+          "id": "99IcBcafnZl2jhHG",
+          "name": "Anthropic account 2"
         }
       },
       "onError": "continueRegularOutput"
@@ -1705,6 +1704,79 @@
         15008,
         0
       ]
+    },
+    {
+      "id": "loop_over_items_compress",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        5152,
+        -96
+      ],
+      "parameters": {
+        "options": {}
+      }
+    },
+    {
+      "id": "extract_to_b64",
+      "name": "Extract from File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        5376,
+        80
+      ],
+      "parameters": {
+        "operation": "binaryToPropery",
+        "destinationKey": "image_b64",
+        "options": {}
+      }
+    },
+    {
+      "id": "compress_image_python",
+      "name": "Code in Python",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5600,
+        80
+      ],
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import base64\nfrom io import BytesIO\nfrom PIL import Image\n\nMAX_BYTES = 4 * 1024 * 1024  # 4 Mo max\n\ntry:\n    RESAMPLE_FILTER = Image.Resampling.LANCZOS\nexcept AttributeError:\n    RESAMPLE_FILTER = Image.LANCZOS\n\nfor item in _items:\n    raw_b64 = item.get(\"json\", {}).get(\"image_b64\", \"\")\n    if not raw_b64:\n        continue\n\n    raw_bytes = base64.b64decode(raw_b64)\n    if len(raw_bytes) <= MAX_BYTES:\n        continue\n\n    img = Image.open(BytesIO(raw_bytes))\n    if img.mode not in (\"RGB\", \"L\"):\n        img = img.convert(\"RGB\")\n\n    w, h = img.size\n    if w > 2500 or h > 2500:\n        ratio = min(2500 / w, 2500 / h)\n        img = img.resize((int(w * ratio), int(h * ratio)), RESAMPLE_FILTER)\n\n    out_buf = BytesIO()\n    quality = 85\n    img.save(out_buf, format=\"JPEG\", quality=quality, optimize=True)\n\n    while out_buf.tell() > MAX_BYTES and quality > 40:\n        quality -= 10\n        out_buf = BytesIO()\n        img.save(out_buf, format=\"JPEG\", quality=quality, optimize=True)\n\n    item[\"json\"][\"image_b64\"] = base64.b64encode(out_buf.getvalue()).decode(\"utf-8\")\n\nreturn _items"
+      }
+    },
+    {
+      "id": "convert_to_binary",
+      "name": "Convert to File",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        5824,
+        80
+      ],
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "image_b64",
+        "options": {
+          "fileName": "image.jpg",
+          "mimeType": "image/jpeg"
+        }
+      }
+    },
+    {
+      "id": "restore_json_after_compress",
+      "name": "Restore JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6048,
+        80
+      ],
+      "parameters": {
+        "jsCode": "// Réinjecte le JSON original (perdu par Convert to File) en gardant le binaire compressé\n// pairedItem:0 garantit la bonne association d'items dans le loop splitInBatches\nconst sourceJson = $('Binary Ready Gate').item.json;\n\n// Construit ocr_context_prompt si absent — requis par Analyze Image OCR Inline\nconst ocr_context_prompt = sourceJson.ocr_context_prompt || (() => {\n  const idx = sourceJson.image_index || 1;\n  const filename = sourceJson.original_filename || ('image_' + idx + '.jpg');\n  const mime = sourceJson.mime_type || 'image/jpeg';\n  return `Tu es un assistant spécialisé en inventaire d'outillage industriel. Analyse cette image (image ${idx}, fichier: ${filename}, type: ${mime}).\\n\\nExtrait les informations suivantes si visibles :\\n- Marque / fabricant\\n- Modèle / référence\\n- Numéro de série\\n- Type d'équipement\\n- État apparent\\n- Accessoires ou consommables visibles\\n\\nRéponds en JSON avec les clés: brand, model, serial_number, equipment_type, condition, accessories, raw_text_visible, confidence_score.`;\n})();\n\nreturn [{\n  json: { ...sourceJson, ocr_context_prompt },\n  binary: $input.item.binary,\n  pairedItem: 0\n}];"
+      }
     }
   ],
   "pinData": {},
@@ -1829,7 +1901,7 @@
             "index": 0
           },
           {
-            "node": "Analyze Image OCR Inline",
+            "node": "Loop Over Items",
             "type": "main",
             "index": 0
           }
@@ -2559,6 +2631,68 @@
     "Completion Message Prepared": {
       "main": [
         []
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Analyze Image OCR Inline",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Code in Python",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in Python": {
+      "main": [
+        [
+          {
+            "node": "Convert to File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert to File": {
+      "main": [
+        [
+          {
+            "node": "Restore JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore JSON": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },
