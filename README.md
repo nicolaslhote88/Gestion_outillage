@@ -14,10 +14,10 @@ Pipeline opérationnel basé sur n8n, WhatsApp, OpenAI Vision, Google Drive et D
 | `docs/google-sheets-schema.md` | Schéma de projection Google Sheets |
 | `docs/appsheet-integration.md` | Détail intégration AppSheet |
 | `docs/live-validation-checklist.md` | Checklist de validation bout-en-bout |
-| `BACKLOG_SIGA.md` | Backlog par épic |
-| `DECISIONS_LOG_SIGA.md` | Journal des décisions projet |
-| `app.py` | Interface admin Streamlit |
-| `requirements.txt` | Dépendances Python |
+| `docs/BACKLOG_SIGA.md` | Backlog par épic |
+| `docs/DECISIONS_LOG_SIGA.md` | Journal des décisions projet |
+| `Site dashboard/app.py` | Interface admin Streamlit |
+| `Site dashboard/requirements.txt` | Dépendances Python |
 
 ## Flux résumé
 
