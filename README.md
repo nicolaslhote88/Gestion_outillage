@@ -1,27 +1,37 @@
-# Gestion_outillage
+# SIGA — Gestion Outillage Atelier
 
-Base de travail GitHub du projet SIGA pour stabiliser le pipeline d'ingestion atelier deja implemente dans n8n.
+Système d'Ingestion et de Gestion d'Atelier (SIGA).
+Pipeline opérationnel basé sur n8n, WhatsApp, OpenAI Vision, Google Drive et DuckDB.
 
-La priorite n'est pas de refondre le produit. L'ordre de travail retenu est:
+## Ce que contient ce dépôt
 
-1. prouver un run reel WhatsApp -> fin de traitement,
-2. corriger ce qui casse encore,
-3. seulement ensuite resserrer la robustesse et la dette d'orchestration n8n.
+| Fichier / Dossier | Contenu |
+|---|---|
+| `SIGA-Ingestion-Atelier-V1.reference.json` | Export n8n de référence (version validée) |
+| `SIGA-workflow-reference-summary.md` | Résumé lisible du workflow n8n |
+| `docs/analyse-fonctionnelle.md` | Analyse fonctionnelle complète du projet |
+| `docs/current-state.md` | État opérationnel du pipeline |
+| `docs/google-sheets-schema.md` | Schéma de projection Google Sheets |
+| `docs/appsheet-integration.md` | Détail intégration AppSheet |
+| `docs/live-validation-checklist.md` | Checklist de validation bout-en-bout |
+| `BACKLOG_SIGA.md` | Backlog par épic |
+| `DECISIONS_LOG_SIGA.md` | Journal des décisions projet |
+| `app.py` | Interface admin Streamlit |
+| `requirements.txt` | Dépendances Python |
 
-## Ce que contient ce depot
+## Flux résumé
 
-- `SIGA-Ingestion-Atelier-V1.drivefix.final.json`: export n8n canonique de reference.
-- `tmp/siga_workflow_live.json`: copie de travail du workflow live actuel.
-- `tmp/siga_workflow_live_summary.md`: synthese lisible du workflow exporte.
-- `docs/current-state.md`: decisions projet et etat reel du pipeline.
-- `docs/live-validation-checklist.md`: checklist pour prouver le fonctionnement de bout en bout.
+```
+WhatsApp → OpenClaw → n8n → OpenAI Vision + Google Drive + DuckDB → WhatsApp
+                       ↓
+               Google Sheets → AppSheet (mobile)
+                       ↓
+                  DuckDB → Streamlit (admin)
+```
 
-## Cadrage actuel
+## Prochaine étape
 
-- Le pipeline live exporte est deja structure autour d'un webhook n8n, d'une orchestration DuckDB, de Google Drive et d'une analyse image OpenAI.
-- Le front mobile ne part plus sur Glide. L'hypothese de travail retenue est AppSheet sur Google Sheet, en surcouche du pipeline n8n.
-- Ce depot sert d'abord a figer l'existant et a produire des preuves de fonctionnement reel avant toute refactorisation.
+Réimporter `SIGA-Ingestion-Atelier-V1.reference.json` dans n8n et exécuter un run réel documenté :
+message WhatsApp `SIGA:` + photos → capturer le run complet → corriger le premier point cassant.
 
-## Prochaine etape
-
-Executer un test reel documente sur le webhook `siga-ingestion-v1`, capturer le resultat de bout en bout et corriger les points de rupture observes.
+Voir `docs/analyse-fonctionnelle.md` pour le détail complet.
