@@ -1749,14 +1749,14 @@
         "messages": {
           "values": [
             {
-              "content": "={{ 'Analyse ces ' + $json.vision_context.images_count + ' photos pour inventorier l\\'équipement.\\n\\nCONTEXTE UTILISATEUR :\\n' + JSON.stringify($json.vision_context, null, 2) + '\\n\\n---\\n\\nÉTAPE 1 — LECTURE DE CHAQUE PHOTO\\nPour chaque image (1 à ' + $json.vision_context.images_count + ') :\\n- Décris l\\'image en 1 phrase\\n- Transcris mot pour mot TOUT le texte visible (plaque, étiquette, marquage, gravure)\\n- Attribue un rôle : overview / nameplate / detail / unknown\\n  → RÈGLE ABSOLUE : toute image avec texte technique lisible = nameplate\\n\\nÉTAPE 2 — EXTRACTION DEPUIS LES PLAQUES\\nDepuis les images classées nameplate :\\n- Marque exacte (telle qu\\'écrite)\\n- Référence modèle exacte (telle qu\\'écrite)\\n- Numéro de série exact\\n- Toutes les spécifications techniques lisibles\\n\\nÉTAPE 3 — JSON FINAL\\nProduis le schéma ci-dessous dans un bloc ```json...``` :\\n{\\n  \"equipment_summary\": {\\n    \"label\": \"nom complet\",\\n    \"category\": \"VALEUR EXACTE\",\\n    \"subtype\": \"sous-type précis en français\",\\n    \"brand\": \"marque exacte lue sur la plaque\",\\n    \"model\": \"référence exacte lue sur la plaque\",\\n    \"serial_number\": \"N° série exact ou null\"\\n  },\\n  \"technical_specs\": { \"Clé FR\": \"valeur lue\" },\\n  \"condition\": \"used|new|very_used\",\\n  \"canonical_subtype\": \"sous-type canonique\",\\n  \"canonical_label\": \"[subtype] [marque] [modèle]\",\\n  \"primary_image_index\": 1,\\n  \"image_roles_normalized\": [\\n    { \"image_index\": 1, \"image_role\": \"overview|nameplate|detail|unknown\" }\\n  ],\\n  \"associated_items_normalized\": [],\\n  \"review_required\": false,\\n  \"review_reasons\": []\\n}' }}"
+              "content": "={{ 'Analyse ces ' + $json.vision_context.images_count + ' photos pour inventorier l\\'équipement.\\n\\nCONTEXTE UTILISATEUR :\\n' + JSON.stringify($json.vision_context, null, 2) + '\\n\\nINSTRUCTION : Utilise l\\'outil \"Analyze image in Anthropic\" pour analyser chaque image une par une (image 1, image 2... jusqu\\'à ' + $json.vision_context.images_count + '). Pour chaque appel, demande une lecture OCR complète de tout le texte visible et le rôle de l\\'image.\\n\\nUne fois toutes les images analysées, produis le JSON final dans un bloc ```json...``` avec ce schéma :\\n{\\n  \"equipment_summary\": {\\n    \"label\": \"nom complet\",\\n    \"category\": \"VALEUR EXACTE\",\\n    \"subtype\": \"sous-type précis en français\",\\n    \"brand\": \"marque exacte lue sur la plaque\",\\n    \"model\": \"référence exacte lue sur la plaque\",\\n    \"serial_number\": \"N° série exact ou null\"\\n  },\\n  \"technical_specs\": { \"Clé FR\": \"valeur lue\" },\\n  \"condition\": \"used|new|very_used\",\\n  \"canonical_subtype\": \"sous-type canonique\",\\n  \"canonical_label\": \"[subtype] [marque] [modèle]\",\\n  \"primary_image_index\": 1,\\n  \"image_roles_normalized\": [\\n    { \"image_index\": 1, \"image_role\": \"overview|nameplate|detail|unknown\" }\\n  ],\\n  \"associated_items_normalized\": [],\\n  \"review_required\": false,\\n  \"review_reasons\": []\\n}' }}"
             }
           ]
         },
         "addAttachments": true,
         "attachmentsInputType": "binary",
         "options": {
-          "system": "Tu es un expert en identification et inventaire d'outillage professionnel (BTP, mécanique, maintenance). Tu analyses des photos d'équipement avec leur contexte textuel.\n\nMÉTHODE OBLIGATOIRE — traite les images dans cet ordre strict :\n1. LECTURE IMAGE PAR IMAGE : Pour chaque image numérotée, transcris mot pour mot TOUT le texte visible (plaques signalétiques, autocollants, marquages, gravures). Ne saute aucun caractère, même partiellement lisible.\n2. CLASSIFICATION des rôles :\n   * overview = vue générale de l'outil complet\n   * nameplate = toute image montrant une étiquette ou plaque avec texte technique — JAMAIS 'detail' si du texte est lisible\n   * detail = gros plan mécanique sans texte exploitable\n   * unknown = contenu indéterminé\n3. EXTRACTION depuis les images 'nameplate' : marque EXACTE, référence modèle EXACTE, N° série EXACT, specs.\n4. CONSOLIDATION : JSON final basé sur ce que tu as lu, pas des suppositions.\n\nCATÉGORIES OFFICIELLES (valeur exacte obligatoire) :\n- Machines & Électroportatif\n- Outillage Manuel\n- Accessoires\n- Consommables\n- EPI\n- Équipement de Chantier & Levage\n\nSOUS-TYPE : libre et précis en français.\nSPÉCIFICATIONS : clés en français (Tension, Puissance, Vitesse à vide, Poids…). N'invente jamais.\nFORMAT : analyse libre par image, puis JSON final dans un bloc ```json...```.",
+          "system": "Tu es un expert en identification et inventaire d'outillage professionnel (BTP, mécanique, maintenance).\n\nTu disposes d'un outil 'Analyze image in Anthropic' pour analyser chaque photo individuellement.\n\nPROCESSUS OBLIGATOIRE :\n1. Appelle l'outil 'Analyze image in Anthropic' pour CHAQUE image (une par une), en lui demandant :\n   - De transcrire mot pour mot TOUT le texte visible (plaque, étiquette, marquage, gravure)\n   - D'identifier le rôle : overview / nameplate / detail / unknown\n   - RÈGLE : toute image avec texte technique lisible = nameplate\n2. Une fois toutes les images analysées, consolide les résultats.\n3. Produis le JSON final dans un bloc ```json...```.\n\nCATÉGORIES OFFICIELLES (valeur exacte obligatoire) :\n- Machines & Électroportatif\n- Outillage Manuel\n- Accessoires\n- Consommables\n- EPI\n- Équipement de Chantier & Levage\n\nSOUS-TYPE : libre et précis en français.\nSPÉCIFICATIONS : clés en français (Tension, Puissance, Vitesse à vide, Poids…). N'invente jamais.\nFORMAT FINAL : bloc ```json...``` avec le schéma complet.",
           "maxTokens": 4096
         }
       },
@@ -2109,6 +2109,33 @@
         184432,
         54416
       ]
+    },
+    {
+      "parameters": {
+        "resource": "image",
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "claude-sonnet-4-6"
+        },
+        "inputType": "binary",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropicTool",
+      "typeVersion": 1,
+      "position": [
+        185184,
+        54624
+      ],
+      "id": "913c6ec2-f67c-4106-aa2d-bc069444400c",
+      "name": "Analyze image in Anthropic",
+      "credentials": {
+        "anthropicApi": {
+          "id": "99IcBcafnZl2jhHG",
+          "name": "Anthropic account 2"
+        }
+      }
     }
   ],
   "pinData": {},
@@ -3192,6 +3219,17 @@
           {
             "node": "Final Consolidation LLM",
             "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze image in Anthropic": {
+      "ai_tool": [
+        [
+          {
+            "node": "Final Consolidation LLM",
+            "type": "ai_tool",
             "index": 0
           }
         ]
