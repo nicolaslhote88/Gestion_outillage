@@ -236,20 +236,60 @@ def run_write(sql: str, params=None, _retries: int = 5) -> bool:
 
 
 def get_current_user() -> str:
-    """Retourne le login de l'utilisateur authentifié via Traefik Basic Auth.
-    Lit l'en-tête HTTP Authorization (Basic <base64(user:pass)>) transmis par
-    le reverse-proxy. Retourne 'anonyme' si non disponible."""
+    """Retourne le login de l'utilisateur authentifié (en minuscules).
+
+    Ordre de priorité :
+    1. Header X-Forwarded-User injecté par Traefik (si headerField configuré)
+    2. Décodage du header Authorization: Basic <base64(user:pass)>
+       (Traefik BasicAuth laisse ce header par défaut, removeHeader=false)
+    Retourne 'visiteur' si aucun header n'est disponible.
+    """
     try:
         import base64
-        auth = st.context.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
+        headers = st.context.headers
+
+        # 1. X-Forwarded-User (Traefik avec headerField configuré)
+        fwd = headers.get("X-Forwarded-User", "").strip()
+        if fwd:
+            return fwd.lower()
+
+        # 2. Authorization: Basic <base64> (fallback universel)
+        auth = headers.get("Authorization", "")
+        if auth.lower().startswith("basic "):
             decoded = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
-            username = decoded.split(":")[0].strip()
+            username = decoded.split(":", 1)[0].strip()
             if username:
-                return username
+                return username.lower()
     except Exception:
         pass
-    return "anonyme"
+    return "visiteur"
+
+
+def is_admin() -> bool:
+    """Retourne True uniquement pour l'utilisateur 'nicolas'."""
+    return get_current_user() == "nicolas"
+
+
+# Pages accessibles selon le rôle
+_ADMIN_PAGES = [
+    "🏭 Parc Matériel",
+    "⚠ Centre de Validation",
+    "📦 Suivi des Mouvements",
+    "🧰 Gestion des Kits",
+    "📊 Dashboard",
+    "🔒 Journal des Accès",
+]
+_USER_PAGES = [
+    "🏭 Parc Matériel",
+    "📦 Suivi des Mouvements",
+    "🧰 Gestion des Kits",
+    "📊 Dashboard",
+]
+
+
+def allowed_pages() -> list[str]:
+    """Retourne la liste des pages accessibles pour l'utilisateur courant."""
+    return _ADMIN_PAGES if is_admin() else _USER_PAGES
 
 
 def db_is_reachable() -> bool:
@@ -635,6 +675,9 @@ def render_dashboard():
 # ─────────────────────────────────────────────────────────────
 
 def render_validation():
+    if not is_admin():
+        st.error("🔒 Accès réservé à l'administrateur.")
+        return
     st.markdown('<p class="section-title">⚠ Centre de Validation</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-subtitle">Équipements détectés par l\'IA nécessitant une vérification humaine</p>', unsafe_allow_html=True)
 
@@ -1421,17 +1464,25 @@ def show_equipment_modal(equipment_id: str):
     )
     st.code(share_text, language="markdown")
 
-    # Lien Drive + bouton édition
+    # Lien Drive + actions selon le rôle
     st.markdown("---")
-    footer_left, footer_right = st.columns([2, 1])
     folder_url = drive_folder_url(row.get("final_drive_folder_id"))
-    if folder_url:
-        footer_left.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
-    if footer_right.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
-        st.session_state["edit_equipment_id"] = equipment_id
-        st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
-        st.session_state["_nav_request"] = "⚠ Centre de Validation"
-        st.rerun()
+
+    if is_admin():
+        # Admin : Drive + Modifier (accès complet à la fiche)
+        footer_drive, footer_edit = st.columns([3, 1])
+        if folder_url:
+            footer_drive.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
+        if footer_edit.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
+            st.session_state["edit_equipment_id"] = equipment_id
+            st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
+            st.session_state["_nav_request"] = "⚠ Centre de Validation"
+            st.rerun()
+    else:
+        # Utilisateur standard : Drive uniquement, lecture seule sur les caractéristiques
+        if folder_url:
+            st.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
+        st.caption("🔒 Caractéristiques en lecture seule — contactez l'administrateur pour modifier.")
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 3 : PARC MATÉRIEL — Galerie & Recherche
@@ -1703,6 +1754,9 @@ def _status_badge(code: int) -> str:
 
 
 def render_access_log():
+    if not is_admin():
+        st.error("🔒 Accès réservé à l'administrateur.")
+        return
     st.markdown('<p class="section-title">🔒 Journal des Accès</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-subtitle">Connexions Traefik · Historique des modifications</p>',
                 unsafe_allow_html=True)
@@ -2340,36 +2394,43 @@ def render_sidebar():
             "</div>",
             unsafe_allow_html=True,
         )
+
+        # ── Indicateur utilisateur connecté ───────────────────
+        current_user = get_current_user()
+        if is_admin():
+            st.sidebar.success(f"👤 Admin : {current_user}")
+        else:
+            st.sidebar.info(f"👤 Connecté : {current_user}")
+
         st.markdown("---")
 
-        # Appliquer une demande de navigation avant que le widget soit instancié
+        # Appliquer une demande de navigation avant que le widget soit instancié.
+        # Si la page demandée n'est pas accessible au rôle actuel, rediriger Dashboard.
         if "_nav_request" in st.session_state:
-            st.session_state["nav_radio"] = st.session_state.pop("_nav_request")
+            requested = st.session_state.pop("_nav_request")
+            if requested in allowed_pages():
+                st.session_state["nav_radio"] = requested
+            else:
+                st.session_state["nav_radio"] = "🏭 Parc Matériel"
 
         page = st.radio(
             "Navigation",
-            options=[
-                "🏭 Parc Matériel",
-                "⚠ Centre de Validation",
-                "📦 Suivi des Mouvements",
-                "🧰 Gestion des Kits",
-                "📊 Dashboard",
-                "🔒 Journal des Accès",
-            ],
+            options=allowed_pages(),
             label_visibility="collapsed",
             key="nav_radio",
         )
 
-        # Badge count validation dans le menu
-        review_count_df = run_query("SELECT COUNT(*) AS n FROM equipment WHERE review_required = true")
-        if not review_count_df.empty:
-            n = int(review_count_df.iloc[0]["n"] or 0)
-            if n > 0:
-                st.markdown(
-                    f'<div style="margin-top:-10px;margin-left:8px">'
-                    f'<span class="badge badge-red">{n} en attente</span></div>',
-                    unsafe_allow_html=True,
-                )
+        # Badge count validation (affiché seulement pour l'admin qui voit la page)
+        if is_admin():
+            review_count_df = run_query("SELECT COUNT(*) AS n FROM equipment WHERE review_required = true")
+            if not review_count_df.empty:
+                n = int(review_count_df.iloc[0]["n"] or 0)
+                if n > 0:
+                    st.markdown(
+                        f'<div style="margin-top:-10px;margin-left:8px">'
+                        f'<span class="badge badge-red">{n} en attente</span></div>',
+                        unsafe_allow_html=True,
+                    )
 
         st.markdown("---")
         st.markdown(
