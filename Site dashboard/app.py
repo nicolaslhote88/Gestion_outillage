@@ -1469,8 +1469,8 @@ def show_equipment_modal(equipment_id: str):
     folder_url = drive_folder_url(row.get("final_drive_folder_id"))
 
     if is_admin():
-        # Admin : Drive + Modifier (accès complet à la fiche)
-        footer_drive, footer_edit = st.columns([3, 1])
+        # Admin : Drive + Modifier + Supprimer
+        footer_drive, footer_edit, footer_del = st.columns([2, 1, 1])
         if folder_url:
             footer_drive.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
         if footer_edit.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
@@ -1478,6 +1478,26 @@ def show_equipment_modal(equipment_id: str):
             st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
             st.session_state["_nav_request"] = "⚠ Centre de Validation"
             st.rerun()
+        # Bouton suppression avec double confirmation
+        del_key = f"confirm_del_modal_{equipment_id}"
+        if not st.session_state.get(del_key):
+            if footer_del.button("🗑 Supprimer", key=f"del_btn_{equipment_id}", use_container_width=True):
+                st.session_state[del_key] = True
+                st.rerun()
+        else:
+            footer_del.warning("Confirmer ?")
+            col_yes, col_no = footer_del.columns(2)
+            if col_yes.button("✓", key=f"del_yes_{equipment_id}", use_container_width=True):
+                folder_id = null_str(row.get("final_drive_folder_id"), "")
+                run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
+                run_write("DELETE FROM equipment WHERE equipment_id = ?", [equipment_id])
+                if folder_id and folder_id != "—":
+                    trash_drive_folder(folder_id)
+                st.session_state.pop(del_key, None)
+                st.rerun()
+            if col_no.button("✗", key=f"del_no_{equipment_id}", use_container_width=True):
+                st.session_state.pop(del_key, None)
+                st.rerun()
     else:
         # Utilisateur standard : Drive uniquement, lecture seule sur les caractéristiques
         if folder_url:
