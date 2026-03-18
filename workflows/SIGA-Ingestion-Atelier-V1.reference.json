@@ -1881,32 +1881,28 @@
     },
     {
       "parameters": {
-        "method": "POST",
-        "url": "https://api.anthropic.com/v1/messages",
-        "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "anthropicApi",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "claude-sonnet-4-6"
+        },
+        "messages": {
+          "values": [
             {
-              "name": "anthropic-version",
-              "value": "2023-06-01"
-            },
-            {
-              "name": "content-type",
-              "value": "application/json"
+              "content": "={{ 'Consolide la fiche finale à partir de ce JSON d\\'entrée.\\n\\nEntrée:\\n' + JSON.stringify($json.llm_consolidation_input, null, 2) + \"\\n\\nSch\\u00e9ma de sortie strict:\\n{\\n  \\\"equipment_summary\\\": {\\n    \\\"label\\\": \\\"\\\",\\n    \\\"category\\\": \\\"VALEUR EXACTE DE LA CATEGORIE\\\",\\n    \\\"subtype\\\": \\\"nom pr\\u00e9cis en fran\\u00e7ais de l'outil (libre)\\\",\\n    \\\"brand\\\": \\\"\\\",\\n    \\\"model\\\": \\\"\\\",\\n    \\\"serial_number\\\": null\\n  },\\n  \\\"canonical_subtype\\\": \\\"\\\",\\n  \\\"canonical_label\\\": \\\"\\\",\\n  \\\"primary_image_index\\\": 0,\\n  \\\"image_roles_normalized\\\": [\\n    { \\\"image_index\\\": 1, \\\"image_role\\\": \\\"overview\\\" }\\n  ],\\n  \\\"associated_items_normalized\\\": [\\n    {\\n      \\\"image_index\\\": 1,\\n      \\\"item_role\\\": \\\"packaging|accessory|consumable|associated_item\\\",\\n      \\\"subtype\\\": \\\"\\\",\\n      \\\"brand\\\": \\\"\\\",\\n      \\\"model\\\": \\\"\\\",\\n      \\\"label\\\": \\\"\\\",\\n      \\\"condition_notes\\\": [],\\n      \\\"item_condition\\\": \\\"\\\",\\n      \\\"consumable_state\\\": \\\"new|used|very_used|unknown\\\"\\n    }\\n  ],\\n  \\\"review_required\\\": true,\\n  \\\"review_reasons\\\": []\\n}\\n\\nRappels :\\n- Tout en fran\\u00e7ais.\\n- category DOIT \\u00eatre une valeur exacte parmi les cat\\u00e9gories officielles (voir prompt syst\\u00e8me).\\n- subtype : nom pr\\u00e9cis en fran\\u00e7ais de l'outil \\u2014 PAS une liste ferm\\u00e9e, sois le plus pr\\u00e9cis possible.\\n- GC 22 = consommable (Cartouche de gaz). X-120 NPH = accessoire. mallette/coffret = packaging (Accessoires).\\n- Ne jamais dupliquer les libell\\u00e9s.\\n- L'absence de num\\u00e9ro de s\\u00e9rie ou de plaque signal\\u00e9tique ne doit pas, \\u00e0 elle seule, d\\u00e9clencher review_required=true.\\n- canonical_label = [subtype] [marque] [mod\\u00e8le] en fran\\u00e7ais \\u2014 jamais vide, jamais g\\u00e9n\\u00e9rique.\\n- Identifier pr\\u00e9cis\\u00e9ment le type d'outil (une scie n'est pas un marteau).\\n- Si doute sur un champ, conserver la valeur d\\u00e9j\\u00e0 fournie ou laisser vide/null.\" }}"
             }
           ]
         },
-        "sendBody": true,
-        "specifyBody": "string",
-        "rawBody": "={{\nJSON.stringify({\n  model: \"claude-sonnet-4-6\",\n  max_tokens: 1600,\n  system: `Tu es un consolidateur final de fiches d'inventaire d'outillage professionnel BTP/Mécanique/Maintenance. Tu harmonises strictement en français, tu dédupliques, et tu n'inventes jamais une information absente. L'absence de numéro de série, de plaque signalétique ou de spécifications techniques ne doit jamais, à elle seule, imposer review_required=true. Réponds uniquement avec un JSON valide, sans markdown. Ne modifie jamais les ids techniques ni les chemins Drive.\n\nCATEGORIES OFFICIELLES (valeur exacte obligatoire pour le champ \"category\") :\n• Machines & Électroportatif\n• Outillage Manuel\n• Accessoires\n• Consommables\n• EPI\n• Équipement de Chantier & Levage\n\nSOUS-TYPE (champ \"subtype\") : libre et précis en français. Ce n'est PAS une liste fermée. Écris le nom exact de l'outil identifié (ex : \"Scie à métaux\", \"Perceuse percussion\", \"Cintreuse hydraulique\", \"Pince étrier\"…). Sois le plus précis possible, sans te limiter à des exemples.`,\n  messages: [{\n    role: \"user\",\n    content: `Consolide la fiche finale à partir de ce JSON d'entrée.\n\nEntrée:\n` + JSON.stringify($json.llm_consolidation_input, null, 2) + `\n\nSchéma de sortie strict:\n{\n  \"equipment_summary\": {\n    \"label\": \"\",\n    \"category\": \"VALEUR EXACTE DE LA CATEGORIE\",\n    \"subtype\": \"nom précis en français de l'outil (libre)\",\n    \"brand\": \"\",\n    \"model\": \"\",\n    \"serial_number\": null\n  },\n  \"canonical_subtype\": \"\",\n  \"canonical_label\": \"\",\n  \"primary_image_index\": 0,\n  \"image_roles_normalized\": [\n    { \"image_index\": 1, \"image_role\": \"overview\" }\n  ],\n  \"associated_items_normalized\": [\n    {\n      \"image_index\": 1,\n      \"item_role\": \"packaging|accessory|consumable|associated_item\",\n      \"subtype\": \"\",\n      \"brand\": \"\",\n      \"model\": \"\",\n      \"label\": \"\",\n      \"condition_notes\": [],\n      \"item_condition\": \"\",\n      \"consumable_state\": \"new|used|very_used|unknown\"\n    }\n  ],\n  \"review_required\": true,\n  \"review_reasons\": []\n}\n\nRappels :\n- Tout en français.\n- category DOIT être une valeur exacte parmi les catégories officielles (voir prompt système).\n- subtype : nom précis en français de l'outil — PAS une liste fermée, sois le plus précis possible.\n- GC 22 = consommable (Cartouche de gaz). X-120 NPH = accessoire. mallette/coffret = packaging (Accessoires).\n- Ne jamais dupliquer les libellés.\n- L'absence de numéro de série ou de plaque signalétique ne doit pas, à elle seule, déclencher review_required=true.\n- canonical_label = [subtype] [marque] [modèle] en français — jamais vide, jamais générique ('Outil inconnu', 'Equipement'…).\n- Identifier précisément le type d'outil : ne pas confondre les catégories (une scie n'est pas un marteau).\n- Si doute sur un champ, conserver la valeur déjà fournie ou laisser vide/null.`\n  }]\n})\n}}",
-        "options": {}
+        "options": {
+          "system": "Tu es un consolidateur final de fiches d'inventaire d'outillage professionnel BTP/Mécanique/Maintenance. Tu harmonises strictement en français, tu dédupliques, et tu n'inventes jamais une information absente. L'absence de numéro de série, de plaque signalétique ou de spécifications techniques ne doit jamais, à elle seule, imposer review_required=true. Réponds uniquement avec un JSON valide, sans markdown. Ne modifie jamais les ids techniques ni les chemins Drive.\n\nCATEGORIES OFFICIELLES (valeur exacte obligatoire pour le champ \"category\") :\n• Machines & Électroportatif\n• Outillage Manuel\n• Accessoires\n• Consommables\n• EPI\n• Équipement de Chantier & Levage\n\nSOUS-TYPE (champ \"subtype\") : libre et précis en français. Ce n'est PAS une liste fermée. Écris le nom exact de l'outil identifié (ex : \"Scie à métaux\", \"Perceuse percussion\", \"Cintreuse hydraulique\", \"Pince étrier\"…). Sois le plus précis possible, sans te limiter à des exemples.",
+          "maxTokens": 1600
+        }
       },
       "id": "28e11667-bc65-4407-b7cf-292825d62061",
       "name": "Final Consolidation LLM",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
       "position": [
         185104,
         54416
