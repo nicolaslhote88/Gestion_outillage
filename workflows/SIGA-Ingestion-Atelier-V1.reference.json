@@ -2120,7 +2120,8 @@
           "cachedResultName": "claude-sonnet-4-6"
         },
         "inputType": "binary",
-        "options": {}
+        "options": {},
+        "text": "Tu analyses UNE SEULE image d'inventaire d'outillage d'atelier.\nObjectif : extraire les indices visuels utiles pour identifier l'objet principal, sa plaque signalétique, son état, ses accessoires et consommables éventuels.\nRéponds UNIQUEMENT avec un JSON valide. Aucune phrase hors JSON. Aucun markdown.\n\nChamps attendus :\n{\n  \"image_role\": \"overview|nameplate|detail|unknown\",\n  \"contains_nameplate\": true,\n  \"detected_object_type\": \"\",\n  \"brand\": \"\",\n  \"model\": \"\",\n  \"serial_number\": null,\n  \"nameplate_text\": \"transcription mot pour mot de TOUT le texte visible sur la plaque\",\n  \"technical_specs\": {},\n  \"condition_notes\": [],\n  \"readability\": 0.0,\n  \"confidence\": 0.0,\n  \"secondary_objects\": []\n}\n\nRègles :\n- Si une information n'est pas visible, laisse chaîne vide, tableau vide, objet vide ou null.\n- N'invente jamais une marque, un modèle ou un numéro de série.\n- nameplate_text : transcris EXACTEMENT chaque caractère visible (marque, modèle, N° série, tension, vitesse, code…).\n- technical_specs : uniquement des paires clé/valeur explicitement lisibles sur la plaque (clés en français).\n- image_role='nameplate' si l'image montre une étiquette ou plaque avec du texte technique.\n- image_role='overview' si l'image montre une vue d'ensemble de l'outil.\n- image_role='detail' si gros plan mécanique sans texte exploitable.\n- secondary_objects : liste les objets secondaires visibles (accessoires, consommables, emballages)."
       },
       "type": "@n8n/n8n-nodes-langchain.anthropicTool",
       "typeVersion": 1,
