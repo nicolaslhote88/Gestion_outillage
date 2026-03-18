@@ -6,18 +6,26 @@ Architecture : single-file app.py modulaire avec fonctions par section.
 Connexion DuckDB en read_only=True (compatible avec n8n qui écrit en parallèle).
 """
 
+import io
 import json
 import os
 import re
 import subprocess
+import time
+import uuid
+import requests
 import streamlit as st
 import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from contextlib import contextmanager
+from datetime import date, datetime
 from pathlib import Path
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as _build_gdrive
+from fpdf import FPDF, XPos, YPos
+from PIL import Image
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIGURATION GLOBALE
@@ -179,32 +187,6 @@ header    { visibility: hidden; }
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-#  RBAC — Gestion des rôles et droits d'accès
-# ─────────────────────────────────────────────────────────────
-
-def get_current_user() -> str:
-    """Lit l'utilisateur connecté depuis le header Traefik X-Forwarded-User.
-    Insensible à la casse. Retourne 'visiteur' si absent."""
-    user = st.context.headers.get("X-Forwarded-User", "visiteur")
-    return user.lower().strip()
-
-
-def is_admin() -> bool:
-    """Retourne True si l'utilisateur connecté est l'administrateur (nicolas)."""
-    return get_current_user() == "nicolas"
-
-
-# Pages accessibles selon le rôle
-_ADMIN_PAGES = ["📊 Dashboard", "🏭 Parc Matériel", "⚠ Centre de Validation", "🔒 Journal des Accès"]
-_USER_PAGES  = ["📊 Dashboard", "🏭 Parc Matériel"]
-
-
-def allowed_pages() -> list[str]:
-    """Retourne la liste des pages visibles pour l'utilisateur courant."""
-    return _ADMIN_PAGES if is_admin() else _USER_PAGES
-
-
-# ─────────────────────────────────────────────────────────────
 #  UTILITAIRES BASE DE DONNÉES
 # ─────────────────────────────────────────────────────────────
 
@@ -226,22 +208,48 @@ def run_query(sql: str, params=None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def run_write(sql: str, params=None) -> bool:
-    """Exécute une requête SQL en écriture (UPDATE/INSERT).
+def run_write(sql: str, params=None, _retries: int = 5) -> bool:
+    """Exécute une requête SQL en écriture (INSERT/UPDATE/CREATE).
+    Réessaie jusqu'à _retries fois avec backoff exponentiel si la base
+    est verrouillée par n8n (erreur 'database is locked').
     Retourne True si succès, False sinon."""
+    delay = 2
+    last_err = None
+    for attempt in range(_retries):
+        try:
+            with duckdb.connect(DB_PATH, read_only=False) as conn:
+                if params:
+                    conn.execute(sql, params)
+                else:
+                    conn.execute(sql)
+            return True
+        except duckdb.IOException as e:
+            last_err = e
+            if attempt < _retries - 1:
+                time.sleep(delay)
+                delay *= 2
+        except Exception as e:
+            st.error(f"Erreur SQL écriture : {e}")
+            return False
+    st.error(f"❌ Base de données inaccessible après {_retries} tentatives (verrou n8n ?) : {last_err}")
+    return False
+
+
+def get_current_user() -> str:
+    """Retourne le login de l'utilisateur authentifié via Traefik Basic Auth.
+    Lit l'en-tête HTTP Authorization (Basic <base64(user:pass)>) transmis par
+    le reverse-proxy. Retourne 'anonyme' si non disponible."""
     try:
-        with duckdb.connect(DB_PATH, read_only=False) as conn:
-            if params:
-                conn.execute(sql, params)
-            else:
-                conn.execute(sql)
-        return True
-    except duckdb.IOException as e:
-        st.error(f"❌ Base de données inaccessible (verrou en cours ?) : {e}")
-        return False
-    except Exception as e:
-        st.error(f"Erreur SQL écriture : {e}")
-        return False
+        import base64
+        auth = st.context.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            decoded = base64.b64decode(auth[6:]).decode("utf-8", errors="replace")
+            username = decoded.split(":")[0].strip()
+            if username:
+                return username
+    except Exception:
+        pass
+    return "anonyme"
 
 
 def db_is_reachable() -> bool:
@@ -252,6 +260,53 @@ def db_is_reachable() -> bool:
         return True
     except Exception:
         return False
+
+
+def init_db_tables() -> None:
+    """Crée (ou migre) toutes les tables applicatives SIGA."""
+
+    # ── Mouvements individuels ─────────────────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS equipment_movements (
+            movement_id           VARCHAR PRIMARY KEY,
+            equipment_id          VARCHAR,
+            movement_type         VARCHAR,
+            borrower_name         VARCHAR,
+            borrower_contact      VARCHAR,
+            out_date              TIMESTAMP,
+            expected_return_date  TIMESTAMP,
+            actual_return_date    TIMESTAMP,
+            notes                 VARCHAR,
+            batch_id              VARCHAR,
+            kit_id                VARCHAR,
+            created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # Migration : colonnes ajoutées après v1
+    run_write("ALTER TABLE equipment_movements ADD COLUMN IF NOT EXISTS batch_id VARCHAR")
+    run_write("ALTER TABLE equipment_movements ADD COLUMN IF NOT EXISTS kit_id   VARCHAR")
+
+    # ── Kits (caisses à outils) ───────────────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS kits (
+            kit_id      VARCHAR PRIMARY KEY,
+            name        VARCHAR,
+            description VARCHAR,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ── Audit trail modifications fiches ──────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS equipment_audit (
+            audit_id      VARCHAR PRIMARY KEY,
+            equipment_id  VARCHAR,
+            action        VARCHAR,
+            changed_fields VARCHAR,
+            operator      VARCHAR,
+            changed_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
 
 def safe_json(value, default=None):
@@ -340,6 +395,28 @@ def drive_img_src(file_id: str, size: int = 400):
     Permet d'afficher les images sans que l'utilisateur ait accès au Drive."""
     data = get_drive_image_bytes(file_id)
     return data if data is not None else drive_thumbnail_url(file_id, size)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_drive_thumb(file_id: str, max_px: int = 160) -> bytes | None:
+    """Miniature compressée pour la galerie : télécharge via SA puis redimensionne
+    à max_px (côté long) et encode en JPEG q=55 pour un chargement rapide."""
+    raw = get_drive_image_bytes(file_id)
+    if not raw:
+        return None
+    try:
+        img   = Image.open(io.BytesIO(raw))
+        ratio = max_px / max(img.width, img.height)
+        if ratio < 1:
+            img = img.resize(
+                (int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS
+            )
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=55)
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -558,9 +635,6 @@ def render_dashboard():
 # ─────────────────────────────────────────────────────────────
 
 def render_validation():
-    if not is_admin():
-        st.error("🔒 Accès réservé à l'administrateur.")
-        return
     st.markdown('<p class="section-title">⚠ Centre de Validation</p>', unsafe_allow_html=True)
     st.markdown('<p class="section-subtitle">Équipements détectés par l\'IA nécessitant une vérification humaine</p>', unsafe_allow_html=True)
 
@@ -651,8 +725,11 @@ def render_validation():
                     file_id    = main_media.get("final_drive_file_id")
                     img_src    = drive_img_src(file_id, 600) if file_id else None
                     if img_src:
-                        st.image(img_src, use_container_width=True,
-                                 caption=f"Photo 1 · {null_str(main_media.get('image_role'))}")
+                        try:
+                            st.image(img_src, use_container_width=True,
+                                     caption=f"Photo 1 · {null_str(main_media.get('image_role'))}")
+                        except Exception:
+                            st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{file_id}`)")
                     else:
                         st.info("📷 Aucune image disponible")
 
@@ -665,11 +742,14 @@ def render_validation():
                             fid = m.get("final_drive_file_id")
                             if fid:
                                 photo_num = chunk_start + j + 2  # 2-based (1 = main)
-                                tcols[j].image(
-                                    drive_img_src(fid, 200),
-                                    use_container_width=True,
-                                    caption=f"Photo {photo_num} · {null_str(m.get('image_role'))}",
-                                )
+                                try:
+                                    tcols[j].image(
+                                        drive_img_src(fid, 200),
+                                        use_container_width=True,
+                                        caption=f"Photo {photo_num} · {null_str(m.get('image_role'))}",
+                                    )
+                                except Exception:
+                                    tcols[j].warning(f"⚠️ Image corrompue (`{fid}`)")
                 else:
                     st.info("📷 Aucune image disponible")
 
@@ -781,6 +861,25 @@ def render_validation():
                             WHERE equipment_id = ?
                         """, [f_main_photo_fid, eq_id])
                     if ok:
+                        # ── Audit trail ──────────────────────────
+                        _changed = ", ".join(filter(None, [
+                            "label"          if f_label    != null_str(row.get("label"),          "") else "",
+                            "brand"          if f_brand    != null_str(row.get("brand"),          "") else "",
+                            "model"          if f_model    != null_str(row.get("model"),          "") else "",
+                            "serial_number"  if f_serial   != null_str(row.get("serial_number"),  "") else "",
+                            "subtype"        if f_subtype  != null_str(row.get("subtype"),         "") else "",
+                            "condition"      if f_condition!= null_str(row.get("condition_label"), "") else "",
+                            "location"       if f_location != null_str(row.get("location_hint"),  "") else "",
+                            "notes"          if f_notes    != null_str(row.get("notes"),          "") else "",
+                        ])) or "aucun changement détecté"
+                        run_write("""
+                            INSERT INTO equipment_audit
+                                (audit_id, equipment_id, action, changed_fields, operator)
+                            VALUES (?, ?, 'UPDATE', ?, ?)
+                        """, [
+                            str(uuid.uuid4()), eq_id, _changed,
+                            get_current_user(),
+                        ])
                         st.success("✅ Équipement validé et mis à jour.")
                         st.cache_data.clear()
                         _finish_edit()
@@ -833,6 +932,215 @@ def render_validation():
                     st.markdown(f"[📁 Ouvrir le dossier Drive]({folder_url})")
 
 # ─────────────────────────────────────────────────────────────
+#  PARTAGE — Texte brut & PDF
+# ─────────────────────────────────────────────────────────────
+
+def generate_share_text(equipment_row, business_context_dict: dict) -> str:
+    """Génère un texte brut partageable (WhatsApp / Mail).
+    Champs exclus : purchase_price, purchase_currency, usage_notes, source_message_text.
+    Aucun lien Drive dans le texte généré.
+    """
+    r = equipment_row
+    biz = business_context_dict or {}
+
+    def v(key, fallback="—"):
+        val = r.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return fallback
+        return str(val).strip() or fallback
+
+    lines = []
+    lines.append(f"🔧 Fiche Équipement : {v('brand')} {v('model')}")
+    lines.append(f"🏷️ Type : {v('category')} - {v('subtype')}")
+    lines.append(f"🔢 N° de série : {v('serial_number')}")
+    lines.append(f"⚙️ État : {v('condition_label')}")
+
+    # Constats visuels (condition_notes dans business_context ou notes directes)
+    condition_notes = biz.get("condition_notes") or biz.get("constats") or []
+    if isinstance(condition_notes, str) and condition_notes:
+        condition_notes = [condition_notes]
+    if condition_notes:
+        lines.append("")
+        lines.append("📝 Constats visuels :")
+        for note in condition_notes:
+            lines.append(f"  - {note}")
+
+    # Éléments associés (accessoires, consommables, associated_items)
+    accessories = biz.get("accessories") or biz.get("accessoires") or []
+    consumables = biz.get("consumables") or biz.get("consommables") or []
+    associated  = biz.get("associated_items") or biz.get("elements_associes") or []
+    all_items   = list(accessories) + list(consumables) + list(associated)
+
+    if all_items:
+        lines.append("")
+        lines.append("📦 Éléments associés (Accessoires/Consommables) :")
+        for item in all_items:
+            if isinstance(item, dict):
+                label = (
+                    item.get("label") or item.get("raw_label")
+                    or item.get("detected_object_type") or "?"
+                )
+                brand = item.get("brand", "")
+                model = item.get("model", "")
+                parts = [label]
+                if brand:
+                    parts.append(brand)
+                if model:
+                    parts.append(model)
+                lines.append(f"  - {' · '.join(parts)}")
+            else:
+                lines.append(f"  - {item}")
+
+    return "\n".join(lines)
+
+
+def generate_equipment_pdf(equipment_row, media_dataframe: pd.DataFrame, business_context_dict: dict) -> bytes:
+    """Génère un PDF léger avec infos et photos embarquées.
+    Champs exclus : purchase_price, purchase_currency, usage_notes, source_message_text.
+    Liens Drive exclus du texte ; images téléchargées directement pour embed.
+    """
+    r = equipment_row
+    biz = business_context_dict or {}
+
+    # Remplace les caractères Unicode hors Latin-1 par des équivalents ASCII.
+    # Helvetica (fpdf2 core font) ne supporte que Latin-1 ; les tirets cadratins,
+    # guillemets typographiques, ellipses, etc. lèvent FPDFUnicodeEncodingException.
+    _UNICODE_MAP = str.maketrans({
+        "\u2014": "-",    # em dash —
+        "\u2013": "-",    # en dash –
+        "\u2018": "'",    # guillemet '
+        "\u2019": "'",    # guillemet '
+        "\u201c": '"',    # guillemet "
+        "\u201d": '"',    # guillemet "
+        "\u2026": "...",  # ellipsis …
+        "\u2022": "-",    # puce •
+        "\u00b7": "-",    # middle dot ·
+        "\u00a0": " ",    # espace insécable
+    })
+
+    def _s(text: str) -> str:
+        """Assainit une chaîne pour Helvetica (Latin-1 strict)."""
+        text = text.translate(_UNICODE_MAP)
+        return text.encode("latin-1", errors="replace").decode("latin-1")
+
+    def v(key, fallback="-"):
+        val = r.get(key)
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return fallback
+        return _s(str(val).strip()) or fallback
+
+    _NL = {"new_x": XPos.LMARGIN, "new_y": YPos.NEXT}
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_margins(15, 15, 15)
+
+    # ── En-tête ────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"Fiche Equipement : {v('brand')} {v('model')}", **_NL)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 6, f"Type : {v('category')} - {v('subtype')}", **_NL)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    # ── Identification ─────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 8, "Identification", **_NL)
+    pdf.set_font("Helvetica", "", 10)
+    fields = [
+        ("N de serie", v("serial_number")),
+        ("Etat",       v("condition_label")),
+        ("Emplacement", v("location_hint")),
+        ("Mode acquisition", v("ownership_mode")),
+    ]
+    for field_label, field_val in fields:
+        pdf.cell(55, 6, f"{field_label} :", new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(0, 6, field_val, **_NL)
+    pdf.ln(4)
+
+    # ── Constats visuels ───────────────────────────────────────
+    condition_notes = biz.get("condition_notes") or biz.get("constats") or []
+    if isinstance(condition_notes, str) and condition_notes:
+        condition_notes = [condition_notes]
+    if condition_notes:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Constats visuels", **_NL)
+        pdf.set_font("Helvetica", "", 10)
+        for note in condition_notes:
+            pdf.multi_cell(0, 6, _s(f"- {note}"), **_NL)
+        pdf.ln(2)
+
+    # ── Éléments associés ──────────────────────────────────────
+    accessories = biz.get("accessories") or biz.get("accessoires") or []
+    consumables = biz.get("consumables") or biz.get("consommables") or []
+    associated  = biz.get("associated_items") or biz.get("elements_associes") or []
+    all_items   = list(accessories) + list(consumables) + list(associated)
+
+    if all_items:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Elements associes (Accessoires/Consommables)", **_NL)
+        pdf.set_font("Helvetica", "", 10)
+        for item in all_items:
+            if isinstance(item, dict):
+                item_label = (
+                    item.get("label") or item.get("raw_label")
+                    or item.get("detected_object_type") or "?"
+                )
+                item_brand = item.get("brand", "")
+                item_model = item.get("model", "")
+                parts = [item_label]
+                if item_brand:
+                    parts.append(item_brand)
+                if item_model:
+                    parts.append(item_model)
+                line = " - ".join(parts)
+            else:
+                line = str(item)
+            pdf.multi_cell(0, 6, _s(f"- {line}"), **_NL)
+        pdf.ln(2)
+
+    # ── Photos ─────────────────────────────────────────────────
+    if not media_dataframe.empty:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(0, 8, "Photos", **_NL)
+        pdf.ln(2)
+
+        for _, m in media_dataframe.iterrows():
+            file_id = m.get("final_drive_file_id") or m.get("temp_drive_file_id")
+            if not file_id or str(file_id) in ("nan", "None", ""):
+                continue
+            try:
+                raw = get_drive_image_bytes(str(file_id))
+                if not raw:
+                    continue
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                # Redimensionnement : largeur max 600px
+                max_w = 600
+                if img.width > max_w:
+                    ratio = max_w / img.width
+                    img = img.resize((max_w, int(img.height * ratio)), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=80)
+                buf.seek(0)
+                # Calcul dimensions PDF (page 180mm de large utile)
+                page_w = 180
+                img_w  = page_w
+                img_h  = img_w * img.height / img.width
+                if pdf.get_y() + img_h > pdf.h - 20:
+                    pdf.add_page()
+                pdf.image(buf, x=15, w=img_w)
+                pdf.ln(4)
+            except Exception as exc:
+                import sys
+                print(f"[PDF_IMG] file_id={file_id} → {type(exc).__name__}: {exc}", file=sys.stderr)
+                continue  # On continue sans l'image si le téléchargement échoue
+
+    return bytes(pdf.output())
+
+
+# ─────────────────────────────────────────────────────────────
 #  MODALE DÉTAIL ÉQUIPEMENT  (st.dialog — Streamlit ≥ 1.32)
 # ─────────────────────────────────────────────────────────────
 
@@ -852,7 +1160,7 @@ def show_equipment_modal(equipment_id: str):
     row = detail_df.iloc[0]
 
     media_df = run_query("""
-        SELECT final_drive_file_id, image_role, image_index
+        SELECT final_drive_file_id, temp_drive_file_id, image_role, image_index
         FROM equipment_media
         WHERE equipment_id = ?
         ORDER BY image_index
@@ -882,7 +1190,10 @@ def show_equipment_modal(equipment_id: str):
             main = media_df.iloc[0]
             fid  = main.get("final_drive_file_id")
             if fid:
-                st.image(drive_img_src(fid, 700), use_container_width=True)
+                try:
+                    st.image(drive_img_src(fid, 700), use_container_width=True)
+                except Exception:
+                    st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
             # Galerie toutes les photos restantes (3 par ligne)
             remaining = media_df.iloc[1:]
             for chunk_start in range(0, len(remaining), 3):
@@ -891,11 +1202,14 @@ def show_equipment_modal(equipment_id: str):
                 for j, (_, m) in enumerate(chunk.iterrows()):
                     fid2 = m.get("final_drive_file_id")
                     if fid2:
-                        cols[j].image(
-                            drive_img_src(fid2, 250),
-                            use_container_width=True,
-                            caption=null_str(m.get("image_role")),
-                        )
+                        try:
+                            cols[j].image(
+                                drive_img_src(fid2, 250),
+                                use_container_width=True,
+                                caption=null_str(m.get("image_role")),
+                            )
+                        except Exception:
+                            cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
             st.info("Aucune image disponible.")
 
@@ -975,46 +1289,149 @@ def show_equipment_modal(equipment_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
-    # Lien Drive + actions selon le rôle
+    # ── Disponibilité & Suivi ──────────────────────────────────
     st.markdown("---")
-    folder_url = drive_folder_url(row.get("final_drive_folder_id"))
+    st.subheader("Disponibilité & Suivi")
 
-    if is_admin():
-        # Admin : Drive + Modifier + Supprimer
-        footer_drive, footer_edit, footer_del = st.columns([2, 1, 1])
-        if folder_url:
-            footer_drive.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
-        if footer_edit.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
-            st.session_state["edit_equipment_id"] = equipment_id
-            st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
-            st.session_state["_nav_request"] = "⚠ Centre de Validation"
-            st.rerun()
-        # Bouton suppression avec double confirmation
-        del_key = f"confirm_del_modal_{equipment_id}"
-        if not st.session_state.get(del_key):
-            if footer_del.button("🗑 Supprimer", key=f"del_btn_{equipment_id}", use_container_width=True):
-                st.session_state[del_key] = True
-                st.rerun()
-        else:
-            footer_del.warning("Confirmer ?")
-            col_yes, col_no = footer_del.columns(2)
-            if col_yes.button("✓ Oui", key=f"del_yes_{equipment_id}", use_container_width=True):
-                folder_id = null_str(row.get("final_drive_folder_id"), "")
-                run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
-                run_write("DELETE FROM equipment WHERE equipment_id = ?", [equipment_id])
-                if folder_id and folder_id != "—":
-                    trash_drive_folder(folder_id)
-                st.session_state.pop(del_key, None)
-                st.success("Équipement supprimé.")
-                st.rerun()
-            if col_no.button("✗ Non", key=f"del_no_{equipment_id}", use_container_width=True):
-                st.session_state.pop(del_key, None)
-                st.rerun()
+    active_mv_df = run_query("""
+        SELECT movement_id, movement_type, borrower_name, borrower_contact,
+               out_date, expected_return_date, notes
+        FROM equipment_movements
+        WHERE equipment_id = ? AND actual_return_date IS NULL
+        ORDER BY out_date DESC
+        LIMIT 1
+    """, [equipment_id])
+
+    if active_mv_df.empty:
+        # ── Matériel disponible ──────────────────────────────
+        st.markdown(
+            '<span style="background:#166534;color:#bbf7d0;padding:4px 12px;'
+            'border-radius:20px;font-size:0.85rem;font-weight:600">'
+            '🟢 Disponible</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+        with st.form(key=f"checkout_form_{equipment_id}", clear_on_submit=True):
+            st.markdown("**Sortir le matériel**")
+            mv_type = st.selectbox(
+                "Type de sortie",
+                options=["LOAN", "RENTAL", "MAINTENANCE"],
+                format_func=lambda x: {"LOAN": "🤝 Prêt", "RENTAL": "💶 Location", "MAINTENANCE": "🔧 Maintenance"}[x],
+            )
+            borrower = st.text_input("Nom de l'emprunteur / destinataire *")
+            contact  = st.text_input("Téléphone / Email (optionnel)")
+            ret_date = st.date_input("Date de retour prévue", value=None)
+            notes_out = st.text_area("Notes", height=80)
+            submitted = st.form_submit_button("📤 Confirmer la sortie", use_container_width=True)
+
+        if submitted:
+            if not borrower.strip():
+                st.error("Le nom de l'emprunteur est obligatoire.")
+            else:
+                ok = run_write("""
+                    INSERT INTO equipment_movements
+                        (movement_id, equipment_id, movement_type, borrower_name,
+                         borrower_contact, out_date, expected_return_date, notes)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                """, [
+                    str(uuid.uuid4()),
+                    equipment_id,
+                    mv_type,
+                    borrower.strip(),
+                    contact.strip() or None,
+                    datetime.combine(ret_date, datetime.min.time()) if ret_date else None,
+                    notes_out.strip() or None,
+                ])
+                if ok:
+                    st.success(f"✅ Sortie enregistrée pour {borrower.strip()}.")
+                    st.rerun()
     else:
-        # Utilisateur standard : Drive uniquement (lecture seule sur les caractéristiques)
-        if folder_url:
-            st.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
-        st.caption("🔒 Lecture seule — contactez l'administrateur pour modifier cet équipement.")
+        # ── Matériel sorti ───────────────────────────────────
+        mv = active_mv_df.iloc[0]
+        mv_type_label = {"LOAN": "En prêt", "RENTAL": "En location", "MAINTENANCE": "En maintenance"}.get(
+            str(mv.get("movement_type", "")), "Sorti"
+        )
+        borrower_disp = mv.get("borrower_name") or "?"
+        st.markdown(
+            f'<span style="background:#7f1d1d;color:#fecaca;padding:4px 12px;'
+            f'border-radius:20px;font-size:0.85rem;font-weight:600">'
+            f'🔴 {mv_type_label} chez {borrower_disp}</span>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
+        exp_ret = mv.get("expected_return_date")
+        if exp_ret is not None and not (isinstance(exp_ret, float) and pd.isna(exp_ret)):
+            try:
+                exp_dt = pd.Timestamp(exp_ret)
+                if exp_dt < pd.Timestamp.now():
+                    st.warning(f"⚠️ Retour prévu le **{exp_dt.strftime('%d/%m/%Y')}** — en retard !")
+                else:
+                    st.info(f"📅 Retour prévu le **{exp_dt.strftime('%d/%m/%Y')}**")
+            except Exception:
+                pass
+
+        mv_id = mv.get("movement_id")
+        if st.button("🔙 Déclarer le retour", key=f"checkin_btn_{equipment_id}", use_container_width=True):
+            ok = run_write("""
+                UPDATE equipment_movements
+                SET actual_return_date = CURRENT_TIMESTAMP
+                WHERE movement_id = ?
+            """, [mv_id])
+            if ok:
+                st.success("✅ Retour enregistré.")
+                st.rerun()
+
+    # ── Historique des 5 derniers mouvements ─────────────────
+    hist_df = run_query("""
+        SELECT
+            movement_type     AS "Type",
+            borrower_name     AS "Emprunteur",
+            strftime(out_date, '%d/%m/%Y')              AS "Sorti le",
+            strftime(actual_return_date, '%d/%m/%Y')    AS "Rendu le",
+            notes             AS "Notes"
+        FROM equipment_movements
+        WHERE equipment_id = ? AND actual_return_date IS NOT NULL
+        ORDER BY actual_return_date DESC
+        LIMIT 5
+    """, [equipment_id])
+
+    if not hist_df.empty:
+        st.markdown("**Historique des derniers mouvements**")
+        hist_df["Type"] = hist_df["Type"].map(
+            {"LOAN": "🤝 Prêt", "RENTAL": "💶 Location", "MAINTENANCE": "🔧 Maintenance"}
+        ).fillna(hist_df["Type"])
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
+
+    # ── Partager la fiche ──────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Partager la fiche")
+
+    biz_share = safe_json(row.get("business_context_json"), {})
+    share_text = generate_share_text(row, biz_share)
+    pdf_bytes  = generate_equipment_pdf(row, media_df, biz_share)
+
+    st.download_button(
+        label="📥 Télécharger la Fiche (PDF pour WhatsApp/Mail)",
+        data=pdf_bytes,
+        file_name=f"fiche_{null_str(row.get('brand'), 'equipement')}_{null_str(row.get('model'), equipment_id)}.pdf".replace(" ", "_"),
+        mime="application/pdf",
+        use_container_width=True,
+    )
+    st.code(share_text, language="markdown")
+
+    # Lien Drive + bouton édition
+    st.markdown("---")
+    footer_left, footer_right = st.columns([2, 1])
+    folder_url = drive_folder_url(row.get("final_drive_folder_id"))
+    if folder_url:
+        footer_left.markdown(f"[📁 Ouvrir le dossier Drive complet]({folder_url})")
+    if footer_right.button("✏️ Modifier", key=f"edit_btn_{equipment_id}", use_container_width=True):
+        st.session_state["edit_equipment_id"] = equipment_id
+        st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
+        st.session_state["_nav_request"] = "⚠ Centre de Validation"
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 3 : PARC MATÉRIEL — Galerie & Recherche
@@ -1120,30 +1537,36 @@ def render_parc_materiel():
         st.info("Aucun équipement ne correspond à votre recherche.")
         return
 
-    # ── Affichage en grille 3 colonnes ─────────────────────────
-    COLS = 3
+    # ── Affichage en grille 5 colonnes ─────────────────────────
+    COLS = 5
     rows = [results_df.iloc[i:i+COLS] for i in range(0, len(results_df), COLS)]
 
     for chunk in rows:
         cols = st.columns(COLS)
         for col_idx, (_, item) in enumerate(chunk.iterrows()):
             with cols[col_idx]:
-                # Photo miniature
+                # Photo miniature compressée (160px, JPEG q=55)
                 file_id = item.get("main_file_id")
                 if file_id and str(file_id) not in ("nan", "None", ""):
-                    st.image(
-                        drive_img_src(file_id, 400),
-                        use_container_width=True,
-                    )
+                    thumb = get_drive_thumb(file_id, max_px=160)
+                    if thumb:
+                        st.image(thumb, use_container_width=True)
+                    else:
+                        st.markdown(
+                            '<div style="background:#1e293b;border-radius:6px;height:90px;'
+                            'display:flex;align-items:center;justify-content:center;'
+                            'color:#475569;font-size:1.4rem;">📷</div>',
+                            unsafe_allow_html=True,
+                        )
                 else:
                     st.markdown(
-                        '<div style="background:#1e293b;border-radius:8px;height:180px;'
+                        '<div style="background:#1e293b;border-radius:6px;height:90px;'
                         'display:flex;align-items:center;justify-content:center;'
-                        'color:#475569;font-size:2rem;">📷</div>',
+                        'color:#475569;font-size:1.4rem;">📷</div>',
                         unsafe_allow_html=True,
                     )
 
-                # Infos carte
+                # Infos carte (taille réduite)
                 brand = null_str(item.get("brand"))
                 model = null_str(item.get("model"))
                 label = null_str(item.get("label"), "Équipement sans nom")
@@ -1159,9 +1582,47 @@ def render_parc_materiel():
                     unsafe_allow_html=True,
                 )
 
-                # Bouton détail → ouvre la modale
-                if st.button("Voir les détails", key=f"detail_{item['equipment_id']}"):
-                    show_equipment_modal(item["equipment_id"])
+                # Boutons action : Détails | 🧺 Kit | 📤 Sortie
+                eid = item["equipment_id"]
+                in_kit  = eid in st.session_state.get("kit_basket",  {})
+                in_loan = eid in st.session_state.get("loan_basket", {})
+
+                def _display_name(it):
+                    return (
+                        null_str(it.get("label"), "")
+                        or " ".join(filter(None, [
+                            null_str(it.get("brand"), ""),
+                            null_str(it.get("model"), ""),
+                        ]))
+                        or it["equipment_id"]
+                    )
+
+                btn_col, kit_col, loan_col = st.columns([3, 1, 1])
+                with btn_col:
+                    if st.button("Voir", key=f"detail_{eid}", use_container_width=True):
+                        show_equipment_modal(eid)
+                with kit_col:
+                    if st.button(
+                        "✓" if in_kit else "🧺",
+                        key=f"basket_{eid}", use_container_width=True,
+                        help="Retirer du panier Kit" if in_kit else "Ajouter au panier Kit",
+                    ):
+                        if in_kit:
+                            del st.session_state["kit_basket"][eid]
+                        else:
+                            st.session_state["kit_basket"][eid] = _display_name(item)
+                        st.rerun()
+                with loan_col:
+                    if st.button(
+                        "✓" if in_loan else "📤",
+                        key=f"loan_{eid}", use_container_width=True,
+                        help="Retirer de la sortie groupée" if in_loan else "Ajouter à la sortie groupée",
+                    ):
+                        if in_loan:
+                            del st.session_state["loan_basket"][eid]
+                        else:
+                            st.session_state["loan_basket"][eid] = _display_name(item)
+                        st.rerun()
 
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
 
@@ -1242,120 +1703,627 @@ def _status_badge(code: int) -> str:
 
 
 def render_access_log():
-    if not is_admin():
-        st.error("🔒 Accès réservé à l'administrateur.")
-        return
     st.markdown('<p class="section-title">🔒 Journal des Accès</p>', unsafe_allow_html=True)
-    st.markdown('<p class="section-subtitle">Connexions enregistrées par Traefik</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-subtitle">Connexions Traefik · Historique des modifications</p>',
+                unsafe_allow_html=True)
 
-    # ── Options ───────────────────────────────────────────────
-    col_a, col_b, col_c, col_d, col_e = st.columns([2, 2, 2, 2, 1])
-    with col_a:
-        nb_lines = st.select_slider(
-            "Dernières lignes", options=[50, 100, 200, 500, 1000], value=200,
-        )
-    with col_b:
-        only_logins = st.checkbox("Connexions uniquement", value=True)
-    with col_c:
-        only_401 = st.checkbox("Seulement les refus (401)")
-    with col_d:
-        search_ip = st.text_input("Filtrer par IP", placeholder="176.152…")
-    with col_e:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Actualiser"):
-            st.rerun()
+    tab_traefik, tab_audit = st.tabs(["🌐 Accès réseau (Traefik)", "📝 Audit fiches équipement"])
 
-    # ── Lecture ───────────────────────────────────────────────
-    raw = _read_traefik_logs(nb_lines)
+    with tab_audit:
+        audit_df = run_query("""
+            SELECT
+                strftime(a.changed_at, '%d/%m/%Y %H:%M') AS "Horodatage",
+                a.operator                                AS "Opérateur",
+                a.action                                  AS "Action",
+                COALESCE(NULLIF(e.label,''),
+                         e.brand || ' ' || e.model,
+                         a.equipment_id)                  AS "Équipement",
+                a.changed_fields                          AS "Champs modifiés",
+                e.condition_label                         AS "État"
+            FROM equipment_audit a
+            LEFT JOIN equipment e ON e.equipment_id = a.equipment_id
+            ORDER BY a.changed_at DESC
+            LIMIT 500
+        """)
+        if audit_df.empty:
+            st.info("Aucune modification enregistrée pour l'instant.")
+        else:
+            st.caption(f"{len(audit_df)} entrée(s) — 500 dernières")
+            st.dataframe(audit_df, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Horodatage": st.column_config.TextColumn(width="small"),
+                             "Opérateur":  st.column_config.TextColumn(width="small"),
+                             "Action":     st.column_config.TextColumn(width="small"),
+                         })
 
-    # ── Infos fichier (diagnostic) ────────────────────────────
-    log_path = Path(TRAEFIK_LOG_FILE)
-    if log_path.exists():
-        import os, datetime as _dt
-        import zoneinfo as _zi
-        mtime = _dt.datetime.fromtimestamp(os.path.getmtime(log_path), tz=_zi.ZoneInfo("Europe/Paris"))
-        size_kb = os.path.getsize(log_path) / 1024
-        st.caption(
-            f"Fichier : `{TRAEFIK_LOG_FILE}` — "
-            f"{size_kb:.1f} Ko — "
-            f"dernière écriture : **{mtime.strftime('%d/%m/%Y %H:%M:%S')}**"
-        )
+    with tab_traefik:
+        # ── Options ───────────────────────────────────────────────
+        col_a, col_b, col_c, col_d, col_e = st.columns([2, 2, 2, 2, 1])
+        with col_a:
+            nb_lines = st.select_slider(
+                "Dernières lignes", options=[50, 100, 200, 500, 1000], value=200,
+            )
+        with col_b:
+            only_logins = st.checkbox("Connexions uniquement", value=True)
+        with col_c:
+            only_401 = st.checkbox("Seulement les refus (401)")
+        with col_d:
+            search_ip = st.text_input("Filtrer par IP", placeholder="176.152…")
+        with col_e:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🔄 Actualiser"):
+                st.rerun()
 
-    if raw is None:
-        st.error(
-            "Impossible de lire les logs Traefik. "
-            "Deux options :\n\n"
-            "**Option A — Docker socket** : montez `/var/run/docker.sock` "
-            "dans le conteneur Streamlit.\n\n"
-            "**Option B — Fichier log** : ajoutez dans votre `docker-compose.yml` Traefik :\n"
-            "```yaml\n"
-            "command:\n"
-            "  - --accesslog=true\n"
-            "  - --accesslog.filepath=/var/log/traefik/access.log\n"
-            "volumes:\n"
-            "  - traefik_logs:/var/log/traefik\n"
-            "```\n"
-            f"et montez le même volume dans le conteneur SIGA à `{TRAEFIK_LOG_FILE}`."
-        )
-        return
+        # ── Lecture ───────────────────────────────────────────────
+        raw = _read_traefik_logs(nb_lines)
 
-    entries = _parse_access_log(raw)
+        # ── Infos fichier (diagnostic) ────────────────────────────
+        log_path = Path(TRAEFIK_LOG_FILE)
+        if log_path.exists():
+            import os, datetime as _dt
+            import zoneinfo as _zi
+            mtime = _dt.datetime.fromtimestamp(os.path.getmtime(log_path), tz=_zi.ZoneInfo("Europe/Paris"))
+            size_kb = os.path.getsize(log_path) / 1024
+            st.caption(
+                f"Fichier : `{TRAEFIK_LOG_FILE}` — "
+                f"{size_kb:.1f} Ko — "
+                f"dernière écriture : **{mtime.strftime('%d/%m/%Y %H:%M:%S')}**"
+            )
 
-    # ── Filtres ───────────────────────────────────────────────
-    if only_logins:
-        entries = [e for e in entries if e["Utilisateur"] != "-" or e["Statut"] == 401]
-    if only_401:
-        entries = [e for e in entries if e["Statut"] == 401]
-    if search_ip.strip():
-        entries = [e for e in entries if search_ip.strip() in e["IP"]]
+        if raw is None:
+            st.error(
+                "Impossible de lire les logs Traefik. "
+                "Deux options :\n\n"
+                "**Option A — Docker socket** : montez `/var/run/docker.sock` "
+                "dans le conteneur Streamlit.\n\n"
+                "**Option B — Fichier log** : ajoutez dans votre `docker-compose.yml` Traefik :\n"
+                "```yaml\n"
+                "command:\n"
+                "  - --accesslog=true\n"
+                "  - --accesslog.filepath=/var/log/traefik/access.log\n"
+                "volumes:\n"
+                "  - traefik_logs:/var/log/traefik\n"
+                "```\n"
+                f"et montez le même volume dans le conteneur SIGA à `{TRAEFIK_LOG_FILE}`."
+            )
+            return  # early-return inside tab only shows nothing, acceptable
 
-    if not entries:
-        st.info("Aucune entrée correspondant aux filtres.")
-        return
+        entries = _parse_access_log(raw)
 
-    # ── KPIs ──────────────────────────────────────────────────
-    nb_401   = sum(1 for e in entries if e["Statut"] == 401)
-    nb_ok    = sum(1 for e in entries if 200 <= e["Statut"] < 300)
-    unique_ip = len({e["IP"] for e in entries})
-    users     = {e["Utilisateur"] for e in entries if e["Utilisateur"] != "-"}
+        # ── Filtres ───────────────────────────────────────────────
+        if only_logins:
+            entries = [e for e in entries if e["Utilisateur"] != "-" or e["Statut"] == 401]
+        if only_401:
+            entries = [e for e in entries if e["Statut"] == 401]
+        if search_ip.strip():
+            entries = [e for e in entries if search_ip.strip() in e["IP"]]
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Connexions affichées" if only_logins else "Requêtes affichées", len(entries))
-    k2.metric("Connexions réussies" if only_logins else "Accès autorisés (2xx)", nb_ok)
-    k3.metric("Refus 401", nb_401)
-    k4.metric("IPs uniques", unique_ip)
+        if not entries:
+            st.info("Aucune entrée correspondant aux filtres.")
+        else:
+            # ── KPIs ──────────────────────────────────────────────────
+            nb_401    = sum(1 for e in entries if e["Statut"] == 401)
+            nb_ok     = sum(1 for e in entries if 200 <= e["Statut"] < 300)
+            unique_ip = len({e["IP"] for e in entries})
+            users     = {e["Utilisateur"] for e in entries if e["Utilisateur"] != "-"}
 
-    if users:
-        st.caption(f"Utilisateurs identifiés : {', '.join(sorted(users))}")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Connexions affichées" if only_logins else "Requêtes affichées", len(entries))
+            k2.metric("Connexions réussies" if only_logins else "Accès autorisés (2xx)", nb_ok)
+            k3.metric("Refus 401", nb_401)
+            k4.metric("IPs uniques", unique_ip)
+
+            if users:
+                st.caption(f"Utilisateurs identifiés : {', '.join(sorted(users))}")
+
+            st.markdown("---")
+
+            # ── Tableau ───────────────────────────────────────────────
+            rows_html = ""
+            for e in reversed(entries):   # plus récent en haut
+                badge = _status_badge(e["Statut"])
+                user  = e["Utilisateur"] if e["Utilisateur"] != "-" else '<span style="color:#94a3b8">—</span>'
+                rows_html += (
+                    f"<tr>"
+                    f"<td style='color:#94a3b8;font-size:.82rem'>{e['Heure']}</td>"
+                    f"<td><code style='font-size:.82rem'>{e['IP']}</code></td>"
+                    f"<td>{user}</td>"
+                    f"<td><code style='font-size:.82rem'>{e['Chemin']}</code></td>"
+                    f"<td>{badge}</td>"
+                    f"</tr>"
+                )
+
+            st.markdown(
+                "<table style='width:100%;border-collapse:collapse'>"
+                "<thead><tr style='border-bottom:1px solid #334155;color:#94a3b8;font-size:.8rem'>"
+                "<th align='left'>Heure</th><th align='left'>IP</th>"
+                "<th align='left'>Utilisateur</th><th align='left'>Chemin</th>"
+                "<th align='left'>Statut</th>"
+                "</tr></thead>"
+                f"<tbody>{rows_html}</tbody>"
+                "</table>",
+                unsafe_allow_html=True,
+            )
+
+
+# ─────────────────────────────────────────────────────────────
+#  VUE : SUIVI DES MOUVEMENTS
+# ─────────────────────────────────────────────────────────────
+
+def render_suivi_mouvements():
+    st.markdown('<p class="section-title">📦 Suivi des Mouvements</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-subtitle">Prêts, locations et envois en maintenance</p>',
+                unsafe_allow_html=True)
+
+    # ── Trigger dialog check-in kit (doit être en haut du render) ──
+    if "pending_checkin_batch_id" in st.session_state:
+        bid   = st.session_state.pop("pending_checkin_batch_id")
+        bname = st.session_state.pop("pending_checkin_borrower", "?")
+        checkin_kit_dialog(bid, bname)
+
+    # ── KPIs ───────────────────────────────────────────────
+    kpi_df = run_query("""
+        SELECT
+            COUNT(*)                                                        AS total_out,
+            COUNT(CASE WHEN expected_return_date < CURRENT_TIMESTAMP THEN 1 END) AS total_late
+        FROM equipment_movements
+        WHERE actual_return_date IS NULL
+    """)
+    total_out  = int(kpi_df.iloc[0]["total_out"])  if not kpi_df.empty else 0
+    total_late = int(kpi_df.iloc[0]["total_late"]) if not kpi_df.empty else 0
+
+    k1, k2 = st.columns(2)
+    k1.metric("📤 Matériels actuellement sortis", total_out)
+    k2.metric("⚠️ Retards", total_late,
+              delta=f"-{total_late}" if total_late else None,
+              delta_color="inverse" if total_late else "off")
 
     st.markdown("---")
 
-    # ── Tableau ───────────────────────────────────────────────
-    rows_html = ""
-    for e in reversed(entries):   # plus récent en haut
-        badge = _status_badge(e["Statut"])
-        user  = e["Utilisateur"] if e["Utilisateur"] != "-" else '<span style="color:#94a3b8">—</span>'
-        rows_html += (
-            f"<tr>"
-            f"<td style='color:#94a3b8;font-size:.82rem'>{e['Heure']}</td>"
-            f"<td><code style='font-size:.82rem'>{e['IP']}</code></td>"
-            f"<td>{user}</td>"
-            f"<td><code style='font-size:.82rem'>{e['Chemin']}</code></td>"
-            f"<td>{badge}</td>"
-            f"</tr>"
+    # ── Sortir un Kit (formulaire checkout groupé) ─────────
+    with st.expander("🧰 Sortir un Kit entier", expanded=False):
+        kits_df = run_query("SELECT kit_id, name FROM kits ORDER BY created_at DESC")
+        if kits_df.empty:
+            st.info("Aucun kit disponible. Créez-en un dans la page 🧰 Gestion des Kits.")
+        else:
+            kit_labels = kits_df["name"].tolist()
+            kit_ids    = kits_df["kit_id"].tolist()
+            with st.form("kit_checkout_form", clear_on_submit=True):
+                sel_kit_idx  = st.selectbox("Kit à sortir", range(len(kit_labels)),
+                                            format_func=lambda i: kit_labels[i])
+                borrower_kit = st.text_input("Nom de l'emprunteur *")
+                contact_kit  = st.text_input("Téléphone / Email (optionnel)")
+                ret_date_kit = st.date_input("Date de retour prévue", value=None)
+                notes_kit    = st.text_area("Notes", height=60)
+                mv_type_kit  = st.selectbox(
+                    "Type",
+                    ["LOAN", "RENTAL", "MAINTENANCE"],
+                    format_func=lambda x: {"LOAN": "🤝 Prêt", "RENTAL": "💶 Location",
+                                           "MAINTENANCE": "🔧 Maintenance"}[x],
+                )
+                submitted_kit = st.form_submit_button("📤 Sortir le Kit", use_container_width=True)
+
+            if submitted_kit:
+                if not borrower_kit.strip():
+                    st.error("Le nom de l'emprunteur est obligatoire.")
+                else:
+                    sel_kit_id = kit_ids[sel_kit_idx]
+                    items_df = run_query(
+                        "SELECT equipment_id FROM kit_items WHERE kit_id = ?", [sel_kit_id]
+                    )
+                    if items_df.empty:
+                        st.warning("Ce kit ne contient aucun outil. Composez-le d'abord.")
+                    else:
+                        batch_id = str(uuid.uuid4())
+                        exp_dt   = (datetime.combine(ret_date_kit, datetime.min.time())
+                                    if ret_date_kit else None)
+                        errors = 0
+                        for eid in items_df["equipment_id"].tolist():
+                            ok = run_write("""
+                                INSERT INTO equipment_movements
+                                    (movement_id, equipment_id, movement_type,
+                                     borrower_name, borrower_contact,
+                                     out_date, expected_return_date, notes,
+                                     batch_id, kit_id)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                            """, [str(uuid.uuid4()), eid, mv_type_kit,
+                                  borrower_kit.strip(), contact_kit.strip() or None,
+                                  exp_dt, notes_kit.strip() or None,
+                                  batch_id, sel_kit_id])
+                            if not ok:
+                                errors += 1
+                        if errors == 0:
+                            st.success(
+                                f"✅ {len(items_df)} outil(s) du kit **{kit_labels[sel_kit_idx]}** "
+                                f"sortis pour **{borrower_kit.strip()}**."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(f"{errors} insertion(s) échouée(s).")
+
+    st.markdown("---")
+
+    # ── Requête enrichie des mouvements actifs ─────────────
+    out_df = run_query("""
+        SELECT
+            m.movement_id,
+            m.equipment_id,
+            m.batch_id,
+            m.kit_id,
+            k.name                                               AS kit_name,
+            COALESCE(NULLIF(e.label,''),
+                     e.brand || ' ' || e.model,
+                     m.equipment_id)                             AS eq_label,
+            e.brand                                              AS eq_brand,
+            e.model                                              AS eq_model,
+            e.subtype                                            AS eq_subtype,
+            e.condition_label                                    AS eq_condition,
+            pm.file_id                                           AS photo_id,
+            m.movement_type,
+            m.borrower_name,
+            m.borrower_contact,
+            m.out_date,
+            m.expected_return_date,
+            m.notes
+        FROM equipment_movements m
+        JOIN equipment e ON e.equipment_id = m.equipment_id
+        LEFT JOIN kits k ON k.kit_id = m.kit_id
+        LEFT JOIN (
+            SELECT equipment_id,
+                   first(final_drive_file_id ORDER BY image_index) AS file_id
+            FROM equipment_media GROUP BY equipment_id
+        ) pm ON pm.equipment_id = m.equipment_id
+        WHERE m.actual_return_date IS NULL
+        ORDER BY m.batch_id NULLS LAST, m.out_date DESC
+    """)
+
+    if out_df.empty:
+        st.success("✅ Aucun matériel actuellement sorti.")
+        return
+
+    TYPE_LABELS = {"LOAN": "🤝 Prêt", "RENTAL": "💶 Location", "MAINTENANCE": "🔧 Maintenance"}
+    now = pd.Timestamp.now()
+
+    def _exp_info(ts):
+        if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+            return False, "-"
+        try:
+            dt = pd.Timestamp(ts)
+            return dt < now, dt.strftime("%d/%m/%Y")
+        except Exception:
+            return False, "-"
+
+    def _out_str(ts):
+        if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+            return "-"
+        try:
+            return pd.Timestamp(ts).strftime("%d/%m/%Y")
+        except Exception:
+            return "-"
+
+    def _render_photo(fid):
+        if fid and str(fid) not in ("nan", "None", ""):
+            img = drive_img_src(str(fid), 120)
+            if img:
+                st.image(img, use_container_width=True)
+                return
+        st.markdown(
+            '<div style="background:#0f172a;border-radius:6px;'
+            'text-align:center;padding:18px;font-size:1.6rem">📷</div>',
+            unsafe_allow_html=True,
         )
 
-    st.markdown(
-        "<table style='width:100%;border-collapse:collapse'>"
-        "<thead><tr style='border-bottom:1px solid #334155;color:#94a3b8;font-size:.8rem'>"
-        "<th align='left'>Heure</th><th align='left'>IP</th>"
-        "<th align='left'>Utilisateur</th><th align='left'>Chemin</th>"
-        "<th align='left'>Statut</th>"
-        "</tr></thead>"
-        f"<tbody>{rows_html}</tbody>"
-        "</table>",
-        unsafe_allow_html=True,
-    )
+    # ── Sépare mouvements individuels / kits ───────────────
+    individual = out_df[out_df["batch_id"].isna() | (out_df["batch_id"] == "")]
+    kit_groups = out_df[out_df["batch_id"].notna() & (out_df["batch_id"] != "")]
+
+    # ── Cartes mouvements individuels ──────────────────────
+    for _, row in individual.iterrows():
+        is_late, exp_str = _exp_info(row.get("expected_return_date"))
+        border = "#dc2626" if is_late else "#334155"
+        st.markdown(
+            f'<div style="border:1px solid {border};border-radius:10px;'
+            f'padding:12px 16px;margin-bottom:10px;background:#1e293b">',
+            unsafe_allow_html=True,
+        )
+        col_photo, col_info, col_move = st.columns([1, 3, 2])
+        with col_photo:
+            _render_photo(row.get("photo_id"))
+        with col_info:
+            label      = row.get("eq_label") or "-"
+            brand_mod  = " ".join(filter(None, [row.get("eq_brand",""), row.get("eq_model","")])) or "-"
+            sub        = row.get("eq_subtype") or ""
+            cond       = row.get("eq_condition") or ""
+            st.markdown(
+                f"**{label}**  \n"
+                f"<span style='color:#94a3b8;font-size:0.82rem'>{brand_mod}"
+                f"{'  ·  '+sub if sub else ''}{'  ·  '+cond if cond else ''}</span>",
+                unsafe_allow_html=True,
+            )
+        with col_move:
+            mv_type     = TYPE_LABELS.get(str(row.get("movement_type","")), "")
+            borrower    = row.get("borrower_name") or "-"
+            contact     = row.get("borrower_contact") or ""
+            notes       = row.get("notes") or ""
+            late_badge  = (' <span style="background:#7f1d1d;color:#fecaca;padding:1px 7px;'
+                           'border-radius:10px;font-size:0.75rem">⚠️ Retard</span>'
+                           if is_late else "")
+            contact_nl  = ("  \n📞 " + contact) if contact else ""
+            notes_nl    = ("  \n📝 " + notes)   if notes   else ""
+            st.markdown(
+                f"{mv_type} · **{borrower}**{contact_nl}  \n"
+                f"<span style='color:#94a3b8;font-size:0.8rem'>"
+                f"Sorti le {_out_str(row.get('out_date'))} · Retour prévu {exp_str}"
+                f"</span>{late_badge}{notes_nl}",
+                unsafe_allow_html=True,
+            )
+            mv_id = row.get("movement_id")
+            if st.button("🔙 Retour", key=f"ret_{mv_id}", use_container_width=True):
+                ok = run_write("""
+                    UPDATE equipment_movements
+                    SET actual_return_date = CURRENT_TIMESTAMP
+                    WHERE movement_id = ?
+                """, [mv_id])
+                if ok:
+                    st.success(f"✅ Retour enregistré pour {borrower}.")
+                    st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Cartes kit (groupées par batch_id) ─────────────────
+    if not kit_groups.empty:
+        for batch_id, batch in kit_groups.groupby("batch_id", sort=False):
+            first_row = batch.iloc[0]
+            is_late_any = any(
+                _exp_info(r.get("expected_return_date"))[0]
+                for _, r in batch.iterrows()
+            )
+            border    = "#dc2626" if is_late_any else "#7c3aed"
+            kit_name  = first_row.get("kit_name") or "Kit"
+            borrower  = first_row.get("borrower_name") or "-"
+            contact   = first_row.get("borrower_contact") or ""
+            mv_type   = TYPE_LABELS.get(str(first_row.get("movement_type","")), "")
+            _, exp_str = _exp_info(first_row.get("expected_return_date"))
+            n_items   = len(batch)
+
+            st.markdown(
+                f'<div style="border:1px solid {border};border-radius:10px;'
+                f'padding:12px 16px;margin-bottom:10px;background:#1e293b">',
+                unsafe_allow_html=True,
+            )
+            header_c, action_c = st.columns([4, 1])
+            with header_c:
+                late_badge = (' <span style="background:#7f1d1d;color:#fecaca;padding:1px 7px;'
+                              'border-radius:10px;font-size:0.75rem">⚠️ Retard</span>'
+                              if is_late_any else "")
+                kit_contact_part = ("  ·  📞 " + contact) if contact else ""
+                st.markdown(
+                    f'<span style="background:#4c1d95;color:#ddd6fe;padding:2px 9px;'
+                    f'border-radius:12px;font-size:0.78rem">🧰 Kit</span> '
+                    f"**{kit_name}** — {n_items} outil(s)  \n"
+                    f"{mv_type} · **{borrower}**{kit_contact_part}  \n"
+                    f"<span style='color:#94a3b8;font-size:0.8rem'>"
+                    f"Sorti le {_out_str(first_row.get('out_date'))} · "
+                    f"Retour prévu {exp_str}</span>{late_badge}",
+                    unsafe_allow_html=True,
+                )
+            with action_c:
+                if st.button("🔙 Retour Kit", key=f"kit_ret_{batch_id}",
+                             use_container_width=True):
+                    st.session_state["pending_checkin_batch_id"]  = batch_id
+                    st.session_state["pending_checkin_borrower"]  = borrower
+                    st.rerun()
+
+            # Miniatures des outils du kit
+            COLS = 4
+            photos = batch.to_dict("records")
+            for i in range(0, len(photos), COLS):
+                chunk = photos[i:i + COLS]
+                cols  = st.columns(len(chunk))
+                for j, item in enumerate(chunk):
+                    with cols[j]:
+                        fid = item.get("photo_id")
+                        if fid and str(fid) not in ("nan", "None", ""):
+                            img = drive_img_src(str(fid), 100)
+                            if img:
+                                st.image(img, use_container_width=True)
+                        st.caption(item.get("eq_label") or "?")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────
+#  DIALOG : RETOUR DE KIT (CHECKLIST)
+# ─────────────────────────────────────────────────────────────
+
+@st.dialog("Retour de Kit — Checklist", width="large")
+def checkin_kit_dialog(batch_id: str, borrower_name: str) -> None:
+    """Modale de retour groupé : cocher les outils rendus, décocher ceux manquants."""
+    mv_df = run_query("""
+        SELECT
+            m.movement_id,
+            COALESCE(e.label, e.brand || ' ' || e.model, m.equipment_id) AS eq_name,
+            e.condition_label,
+            pm.file_id AS photo_id
+        FROM equipment_movements m
+        JOIN equipment e ON e.equipment_id = m.equipment_id
+        LEFT JOIN (
+            SELECT equipment_id,
+                   first(final_drive_file_id ORDER BY image_index) AS file_id
+            FROM equipment_media GROUP BY equipment_id
+        ) pm ON pm.equipment_id = m.equipment_id
+        WHERE m.batch_id = ? AND m.actual_return_date IS NULL
+        ORDER BY eq_name
+    """, [batch_id])
+
+    if mv_df.empty:
+        st.info("Tous les outils de ce lot ont déjà été retournés.")
+        return
+
+    st.markdown(f"**Emprunteur :** {borrower_name}  \n"
+                f"Cochez les outils rendus, décochez les manquants :")
+    st.markdown("---")
+
+    checked: dict[str, bool] = {}
+    for _, mv in mv_df.iterrows():
+        col_img, col_chk = st.columns([1, 5])
+        with col_img:
+            fid = mv.get("photo_id")
+            if fid and str(fid) not in ("nan", "None", ""):
+                img = drive_img_src(str(fid), 80)
+                if img:
+                    st.image(img, use_container_width=True)
+                else:
+                    st.markdown("📷")
+            else:
+                st.markdown("📷")
+        with col_chk:
+            name  = mv.get("eq_name") or "?"
+            cond  = mv.get("condition_label") or ""
+            label = f"{name}" + (f" · *{cond}*" if cond else "")
+            checked[mv["movement_id"]] = st.checkbox(
+                label, value=True, key=f"chk_{mv['movement_id']}"
+            )
+
+    st.markdown("---")
+    if st.button("✅ Valider le retour", type="primary", use_container_width=True):
+        returned = [mid for mid, c in checked.items() if c]
+        missing  = len(checked) - len(returned)
+        for mid in returned:
+            run_write("""
+                UPDATE equipment_movements
+                SET actual_return_date = CURRENT_TIMESTAMP
+                WHERE movement_id = ?
+            """, [mid])
+        if missing:
+            st.warning(f"✅ {len(returned)} outil(s) retourné(s). "
+                       f"⚠️ {missing} outil(s) manquant(s) restent en cours.")
+        else:
+            st.success(f"✅ {len(returned)} outil(s) retourné(s). Kit soldé.")
+        st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────
+#  VUE : GESTION DES KITS
+# ─────────────────────────────────────────────────────────────
+
+def render_gestion_kits() -> None:
+    st.markdown('<p class="section-title">🧰 Gestion des Kits</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-subtitle">Créez et composez vos caisses à outils</p>',
+                unsafe_allow_html=True)
+
+    tab_create, tab_compose = st.tabs(["➕ Créer un Kit", "🔧 Composer / Modifier"])
+
+    # ── Créer un kit ─────────────────────────────────────────
+    with tab_create:
+        with st.form("create_kit_form", clear_on_submit=True):
+            kit_name = st.text_input("Nom du Kit *  (ex : Caisse Plomberie 1)")
+            kit_desc = st.text_area("Description", height=80)
+            submitted = st.form_submit_button("➕ Créer le Kit", use_container_width=True)
+        if submitted:
+            if not kit_name.strip():
+                st.error("Le nom est obligatoire.")
+            else:
+                ok = run_write(
+                    "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
+                    [str(uuid.uuid4()), kit_name.strip(), kit_desc.strip() or None],
+                )
+                if ok:
+                    st.success(f"✅ Kit **{kit_name.strip()}** créé.")
+                    st.rerun()
+
+    # ── Composer un kit ──────────────────────────────────────
+    with tab_compose:
+        kits_df = run_query("SELECT kit_id, name, description FROM kits ORDER BY created_at DESC")
+        if kits_df.empty:
+            st.info("Aucun kit existant. Créez-en un dans l'onglet ➕.")
+            return
+
+        kit_labels = kits_df["name"].tolist()
+        kit_ids    = kits_df["kit_id"].tolist()
+        sel_idx    = st.selectbox("Sélectionner un Kit", range(len(kit_labels)),
+                                  format_func=lambda i: kit_labels[i], key="kit_compose_sel")
+        sel_kit_id = kit_ids[sel_idx]
+
+        kit_desc_val = kits_df.iloc[sel_idx]["description"] or ""
+        if kit_desc_val:
+            st.caption(kit_desc_val)
+
+        # Équipements disponibles
+        all_eq_df = run_query("""
+            SELECT equipment_id,
+                   COALESCE(NULLIF(label,''), brand || ' ' || model, equipment_id) AS dname
+            FROM equipment
+            ORDER BY dname
+        """)
+
+        # Contenu actuel du kit
+        current_df = run_query(
+            "SELECT equipment_id FROM kit_items WHERE kit_id = ?", [sel_kit_id]
+        )
+        current_ids = set(current_df["equipment_id"].tolist()) if not current_df.empty else set()
+
+        eq_by_name  = dict(zip(all_eq_df["dname"], all_eq_df["equipment_id"]))
+        default_sel = [n for n, eid in eq_by_name.items() if eid in current_ids]
+
+        sel_names = st.multiselect(
+            "Équipements composant ce kit",
+            options=list(eq_by_name.keys()),
+            default=default_sel,
+        )
+
+        col_save, col_del = st.columns([3, 1])
+        with col_save:
+            if st.button("💾 Mettre à jour le contenu", use_container_width=True):
+                sel_ids = [eq_by_name[n] for n in sel_names]
+                ok = run_write("DELETE FROM kit_items WHERE kit_id = ?", [sel_kit_id])
+                for eid in sel_ids:
+                    ok = ok and run_write(
+                        "INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)",
+                        [sel_kit_id, eid],
+                    )
+                if ok:
+                    st.success(f"✅ Kit mis à jour ({len(sel_ids)} outil(s)).")
+                    st.rerun()
+        with col_del:
+            if st.button("🗑 Supprimer ce kit", use_container_width=True):
+                run_write("DELETE FROM kit_items WHERE kit_id = ?", [sel_kit_id])
+                run_write("DELETE FROM kits WHERE kit_id = ?", [sel_kit_id])
+                st.success("Kit supprimé.")
+                st.rerun()
+
+        # ── Aperçu visuel ─────────────────────────────────
+        if current_ids:
+            st.markdown("---")
+            st.markdown(f"**Contenu du Kit — {len(current_ids)} outil(s)**")
+            preview_df = run_query("""
+                SELECT e.label, e.brand, e.model, e.subtype, e.condition_label,
+                       pm.file_id AS photo_id
+                FROM kit_items ki
+                JOIN equipment e ON e.equipment_id = ki.equipment_id
+                LEFT JOIN (
+                    SELECT equipment_id,
+                           first(final_drive_file_id ORDER BY image_index) AS file_id
+                    FROM equipment_media GROUP BY equipment_id
+                ) pm ON pm.equipment_id = e.equipment_id
+                WHERE ki.kit_id = ?
+                ORDER BY COALESCE(NULLIF(e.label,''), e.brand, e.equipment_id)
+            """, [sel_kit_id])
+
+            COLS = 3
+            for i in range(0, len(preview_df), COLS):
+                chunk = preview_df.iloc[i:i + COLS]
+                cols  = st.columns(COLS)
+                for j, (_, item) in enumerate(chunk.iterrows()):
+                    with cols[j]:
+                        fid = item.get("photo_id")
+                        if fid and str(fid) not in ("nan", "None", ""):
+                            img = drive_img_src(str(fid), 200)
+                            if img:
+                                st.image(img, use_container_width=True)
+                        label = (item.get("label")
+                                 or " ".join(filter(None, [item.get("brand"), item.get("model")]))
+                                 or "?")
+                        sub   = " · ".join(filter(None, [item.get("subtype"), item.get("condition_label")]))
+                        st.caption(f"**{label}**" + (f"  \n{sub}" if sub else ""))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1372,43 +2340,36 @@ def render_sidebar():
             "</div>",
             unsafe_allow_html=True,
         )
-
-        # ── Indicateur utilisateur connecté ───────────────────
-        current_user = get_current_user()
-        if is_admin():
-            st.sidebar.success(f"👤 Admin : {current_user}")
-        else:
-            st.sidebar.info(f"👤 Connecté : {current_user}")
-
         st.markdown("---")
 
-        # Appliquer une demande de navigation avant que le widget soit instancié.
-        # Si la page demandée n'est pas accessible, on redirige vers le Dashboard.
+        # Appliquer une demande de navigation avant que le widget soit instancié
         if "_nav_request" in st.session_state:
-            requested = st.session_state.pop("_nav_request")
-            if requested in allowed_pages():
-                st.session_state["nav_radio"] = requested
-            else:
-                st.session_state["nav_radio"] = "📊 Dashboard"
+            st.session_state["nav_radio"] = st.session_state.pop("_nav_request")
 
         page = st.radio(
             "Navigation",
-            options=allowed_pages(),
+            options=[
+                "🏭 Parc Matériel",
+                "⚠ Centre de Validation",
+                "📦 Suivi des Mouvements",
+                "🧰 Gestion des Kits",
+                "📊 Dashboard",
+                "🔒 Journal des Accès",
+            ],
             label_visibility="collapsed",
             key="nav_radio",
         )
 
-        # Badge count validation (visible uniquement si admin car seul l'admin voit la page)
-        if is_admin():
-            review_count_df = run_query("SELECT COUNT(*) AS n FROM equipment WHERE review_required = true")
-            if not review_count_df.empty:
-                n = int(review_count_df.iloc[0]["n"] or 0)
-                if n > 0:
-                    st.markdown(
-                        f'<div style="margin-top:-10px;margin-left:8px">'
-                        f'<span class="badge badge-red">{n} en attente</span></div>',
-                        unsafe_allow_html=True,
-                    )
+        # Badge count validation dans le menu
+        review_count_df = run_query("SELECT COUNT(*) AS n FROM equipment WHERE review_required = true")
+        if not review_count_df.empty:
+            n = int(review_count_df.iloc[0]["n"] or 0)
+            if n > 0:
+                st.markdown(
+                    f'<div style="margin-top:-10px;margin-left:8px">'
+                    f'<span class="badge badge-red">{n} en attente</span></div>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("---")
         st.markdown(
@@ -1429,6 +2390,158 @@ def render_sidebar():
                 unsafe_allow_html=True,
             )
 
+        # ── Panier Kit ────────────────────────────────────
+        basket: dict = st.session_state.get("kit_basket", {})
+        st.markdown("---")
+        n_basket = len(basket)
+        basket_title = (
+            f"🧺 Panier Kit &nbsp;<span style='background:#1d4ed8;color:#bfdbfe;"
+            f"padding:1px 8px;border-radius:10px;font-size:0.75rem'>{n_basket}</span>"
+            if n_basket else "🧺 Panier Kit"
+        )
+        st.markdown(
+            f"<div style='font-weight:600;font-size:0.9rem;color:#e2e8f0;"
+            f"margin-bottom:6px'>{basket_title}</div>",
+            unsafe_allow_html=True,
+        )
+
+        if basket:
+            for eid, ename in list(basket.items()):
+                c_name, c_rm = st.columns([5, 1])
+                c_name.markdown(
+                    f"<span style='font-size:0.78rem;color:#cbd5e1'>{ename}</span>",
+                    unsafe_allow_html=True,
+                )
+                if c_rm.button("✕", key=f"basket_rm_{eid}"):
+                    del st.session_state["kit_basket"][eid]
+                    st.rerun()
+
+            kit_name_input = st.text_input(
+                "Nom du kit *", key="basket_kit_name",
+                placeholder="ex: Caisse Chantier A"
+            )
+            kit_desc_input = st.text_area(
+                "Description", key="basket_kit_desc", height=56
+            )
+            col_create, col_clear = st.columns([3, 1])
+            with col_create:
+                if st.button("✅ Créer le Kit", use_container_width=True, type="primary"):
+                    if not kit_name_input.strip():
+                        st.error("Nom obligatoire.")
+                    else:
+                        kid = str(uuid.uuid4())
+                        ok  = run_write(
+                            "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
+                            [kid, kit_name_input.strip(), kit_desc_input.strip() or None],
+                        )
+                        for eid in list(basket.keys()):
+                            ok = ok and run_write(
+                                "INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)",
+                                [kid, eid],
+                            )
+                        if ok:
+                            st.success(f"✅ Kit **{kit_name_input.strip()}** créé ({n_basket} outil(s)).")
+                            st.session_state["kit_basket"] = {}
+                            st.rerun()
+            with col_clear:
+                if st.button("🗑", key="basket_clear", help="Vider le panier"):
+                    st.session_state["kit_basket"] = {}
+                    st.rerun()
+        else:
+            st.markdown(
+                "<div style='font-size:0.76rem;color:#475569;line-height:1.5'>"
+                "Ajoutez des outils depuis<br>🏭 <b>Parc Matériel</b> avec le bouton 🧺"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # ── Sortie groupée ────────────────────────────────
+        loan: dict = st.session_state.get("loan_basket", {})
+        st.markdown("---")
+        n_loan = len(loan)
+        loan_title = (
+            f"📤 Sortie groupée &nbsp;<span style='background:#b45309;color:#fef3c7;"
+            f"padding:1px 8px;border-radius:10px;font-size:0.75rem'>{n_loan}</span>"
+            if n_loan else "📤 Sortie groupée"
+        )
+        st.markdown(
+            f"<div style='font-weight:600;font-size:0.9rem;color:#e2e8f0;"
+            f"margin-bottom:6px'>{loan_title}</div>",
+            unsafe_allow_html=True,
+        )
+
+        if loan:
+            for eid, ename in list(loan.items()):
+                lc_name, lc_rm = st.columns([5, 1])
+                lc_name.markdown(
+                    f"<span style='font-size:0.78rem;color:#cbd5e1'>{ename}</span>",
+                    unsafe_allow_html=True,
+                )
+                if lc_rm.button("✕", key=f"loan_rm_{eid}"):
+                    del st.session_state["loan_basket"][eid]
+                    st.rerun()
+
+            loan_type = st.selectbox(
+                "Type",
+                ["LOAN", "RENTAL", "MAINTENANCE"],
+                format_func=lambda x: {"LOAN": "🤝 Prêt", "RENTAL": "💶 Location",
+                                       "MAINTENANCE": "🔧 Maintenance"}[x],
+                key="loan_type",
+            )
+            loan_borrower = st.text_input(
+                "Emprunteur *", key="loan_borrower",
+                placeholder="Nom ou service"
+            )
+            loan_contact = st.text_input(
+                "Téléphone / Email", key="loan_contact"
+            )
+            loan_ret = st.date_input("Retour prévu", key="loan_ret_date", value=None)
+            loan_notes = st.text_area("Notes", key="loan_notes", height=52)
+
+            col_out, col_clr = st.columns([3, 1])
+            with col_out:
+                if st.button("📤 Sortir le matériel", use_container_width=True, type="primary",
+                             key="loan_submit"):
+                    if not loan_borrower.strip():
+                        st.error("Emprunteur obligatoire.")
+                    else:
+                        batch_id = str(uuid.uuid4())
+                        exp_dt   = (datetime.combine(loan_ret, datetime.min.time())
+                                    if loan_ret else None)
+                        errors = 0
+                        for eid in list(loan.keys()):
+                            ok = run_write("""
+                                INSERT INTO equipment_movements
+                                    (movement_id, equipment_id, movement_type,
+                                     borrower_name, borrower_contact,
+                                     out_date, expected_return_date, notes, batch_id)
+                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+                            """, [str(uuid.uuid4()), eid, loan_type,
+                                  loan_borrower.strip(), loan_contact.strip() or None,
+                                  exp_dt, loan_notes.strip() or None, batch_id])
+                            if not ok:
+                                errors += 1
+                        if errors == 0:
+                            st.success(
+                                f"✅ {n_loan} outil(s) sortis pour "
+                                f"**{loan_borrower.strip()}**."
+                            )
+                            st.session_state["loan_basket"] = {}
+                            st.rerun()
+                        else:
+                            st.error(f"{errors} insertion(s) échouée(s).")
+            with col_clr:
+                if st.button("🗑", key="loan_clear", help="Vider la liste"):
+                    st.session_state["loan_basket"] = {}
+                    st.rerun()
+        else:
+            st.markdown(
+                "<div style='font-size:0.76rem;color:#475569;line-height:1.5'>"
+                "Sélectionnez des outils depuis<br>🏭 <b>Parc Matériel</b> avec le bouton 📤"
+                "</div>",
+                unsafe_allow_html=True,
+            )
+
     return page
 
 # ─────────────────────────────────────────────────────────────
@@ -1436,14 +2549,23 @@ def render_sidebar():
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    if "kit_basket" not in st.session_state:
+        st.session_state["kit_basket"] = {}
+    if "loan_basket" not in st.session_state:
+        st.session_state["loan_basket"] = {}
+    init_db_tables()
     page = render_sidebar()
 
-    if page == "📊 Dashboard":
-        render_dashboard()
-    elif page == "🏭 Parc Matériel":
+    if page == "🏭 Parc Matériel":
         render_parc_materiel()
     elif page == "⚠ Centre de Validation":
         render_validation()
+    elif page == "📦 Suivi des Mouvements":
+        render_suivi_mouvements()
+    elif page == "🧰 Gestion des Kits":
+        render_gestion_kits()
+    elif page == "📊 Dashboard":
+        render_dashboard()
     elif page == "🔒 Journal des Accès":
         render_access_log()
 
