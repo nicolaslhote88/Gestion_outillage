@@ -1749,17 +1749,15 @@
         "messages": {
           "values": [
             {
-              "content": "={{ 'Analyse ces ' + $json.vision_context.images_count + ' photos pour inventorier l\\'équipement. Toutes les images sont directement attachées à ce message.\\n\\nCONTEXTE UTILISATEUR :\\n' + JSON.stringify($json.vision_context, null, 2) + '\\n\\nINSTRUCTION : Analyse chaque image attachée une par une (image 1, image 2... jusqu\\'à ' + $json.vision_context.images_count + '). Pour chaque image, effectue une lecture OCR complète de tout le texte visible et identifie le rôle de l\\'image.\\n\\nUne fois toutes les images analysées, produis le JSON final dans un bloc ```json...``` avec ce schéma :\\n{\\n  \"equipment_summary\": {\\n    \"label\": \"nom complet\",\\n    \"category\": \"VALEUR EXACTE\",\\n    \"subtype\": \"sous-type précis en français\",\\n    \"brand\": \"marque exacte lue sur la plaque\",\\n    \"model\": \"référence exacte lue sur la plaque\",\\n    \"serial_number\": \"N° série exact ou null\"\\n  },\\n  \"technical_specs\": { \"Clé FR\": \"valeur lue\" },\\n  \"condition\": \"used|new|very_used\",\\n  \"canonical_subtype\": \"sous-type canonique\",\\n  \"canonical_label\": \"[subtype] [marque] [modèle]\",\\n  \"primary_image_index\": 1,\\n  \"image_roles_normalized\": [\\n    { \"image_index\": 1, \"image_role\": \"overview|nameplate|detail|unknown\" }\\n  ],\\n  \"associated_items_normalized\": [],\\n  \"review_required\": false,\\n  \"review_reasons\": []\\n}' }}"
+              "content": "={{ 'Voici le brouillon d\\'analyse OCR de l\\'équipement :\\n\\n' + JSON.stringify($json.equipment_draft_v2, null, 2) + '\\n\\nCONSIGNE : Consolide ces données et produis le JSON final dans un bloc ```json...``` avec ce schéma exact :\\n{\\n  \\\"equipment_summary\\\": {\\n    \\\"label\\\": \\\"libellé complet en français\\\",\\n    \\\"category\\\": \\\"VALEUR EXACTE de la liste officielle\\\",\\n    \\\"subtype\\\": \\\"sous-type précis en français\\\",\\n    \\\"brand\\\": \\\"marque exacte (telle que sur la plaque ou déduite des données OCR)\\\",\\n    \\\"model\\\": \\\"référence exacte\\\",\\n    \\\"serial_number\\\": \\\"N° série exact ou null\\\"\\n  },\\n  \\\"technical_specs\\\": { \\\"Clé FR\\\": \\\"valeur lue\\\" },\\n  \\\"condition\\\": \\\"used|new|very_used\\\",\\n  \\\"canonical_subtype\\\": \\\"sous-type canonique en français\\\",\\n  \\\"canonical_label\\\": \\\"[sous-type] [Marque] [Modèle]\\\",\\n  \\\"primary_image_index\\\": 1,\\n  \\\"image_roles_normalized\\\": [\\n    { \\\"image_index\\\": 1, \\\"image_role\\\": \\\"overview|nameplate|detail|unknown\\\" }\\n  ],\\n  \\\"associated_items_normalized\\\": [],\\n  \\\"review_required\\\": false,\\n  \\\"review_reasons\\\": []\\n}' }}"
             }
           ]
         },
-        "addAttachments": true,
-        "attachmentsInputType": "binary",
+        "addAttachments": false,
         "options": {
-          "system": "Tu es un expert en identification et inventaire d'outillage professionnel (BTP, mécanique, maintenance).\n\nTu reçois plusieurs photos d'un équipement directement dans ce message.\n\nPROCESSUS OBLIGATOIRE :\n1. Analyse CHAQUE image jointe (image 1, image 2, image 3… dans l'ordre) :\n   - Transcris mot pour mot TOUT le texte visible (plaque, étiquette, marquage, gravure)\n   - Identifie le rôle : overview / nameplate / detail / unknown\n   - RÈGLE : toute image avec texte technique lisible = nameplate\n2. Consolide les résultats de toutes les images.\n3. Produis le JSON final dans un bloc ```json...```.\n\nCATÉGORIES OFFICIELLES (valeur exacte obligatoire) :\n- Machines & Électroportatif\n- Outillage Manuel\n- Accessoires\n- Consommables\n- EPI\n- Équipement de Chantier & Levage\n\nSOUS-TYPE : libre et précis en français.\nSPÉCIFICATIONS : clés en français (Tension, Puissance, Vitesse à vide, Poids…). N'invente jamais.\nFORMAT FINAL : bloc ```json...``` avec le schéma complet.",
+          "system": "Tu es un expert en identification et inventaire d'outillage professionnel (BTP, mécanique, maintenance industrielle).\n\nTu reçois un brouillon de fiche d'équipement déjà analysé par OCR et vision IA. Ton rôle est de CONSOLIDER et AMÉLIORER ce brouillon pour produire une fiche finale parfaite en français.\n\nCONSIGNES OBLIGATOIRES :\n1. Corrige et normalise la catégorie (valeur EXACTE obligatoire parmi la liste officielle).\n2. Précise le sous-type en français (libre mais précis).\n3. Confirme ou corrige la marque, le modèle, le numéro de série (tels que lus sur la plaque — n'invente jamais).\n4. Traduis et normalise les spécifications techniques en français (clés en français).\n5. Déduis la condition générale (new / used / very_used) depuis les observations OCR.\n6. Produis un label canonique propre : \"[sous-type] [Marque] [Modèle]\".\n7. Ne modifie pas les éléments déjà corrects. Ne réinvente pas d'informations absentes des données.\n\nCATÉGORIES OFFICIELLES (valeur exacte obligatoire) :\n- Machines & Électroportatif\n- Outillage Manuel\n- Accessoires\n- Consommables\n- EPI\n- Équipement de Chantier & Levage\n\nFORMAT : Réponds UNIQUEMENT avec un bloc ```json...``` contenant le schéma demandé. Aucun texte hors du bloc JSON.",
           "maxTokens": 4096
-        },
-        "attachmentsBinaryPropertyName": "={{ Array.from({length: $json.images_count || 1}, (_, i) => i === 0 ? 'data' : 'data' + i).join(',') }}"
+        }
       },
       "id": "28e11667-bc65-4407-b7cf-292825d62061",
       "name": "Final Consolidation LLM",
@@ -3130,7 +3128,13 @@
     },
     "Final Consolidation LLM": {
       "main": [
-        []
+        [
+          {
+            "node": "Apply Final Consolidation",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Apply Final Consolidation": {
@@ -3458,7 +3462,7 @@
       "main": [
         [
           {
-            "node": "Apply Final Consolidation",
+            "node": "Final Consolidation LLM",
             "type": "main",
             "index": 0
           }
