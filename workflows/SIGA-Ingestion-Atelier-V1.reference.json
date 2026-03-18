@@ -2241,7 +2241,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// Réinjecte le JSON issu de la branche de compression en gardant le binaire compressé.\n// On se rattache au nœud Python juste avant pour conserver le bon item-linked context.\nconst linked = $('Code in Python').item;\nreturn [{\n  json: linked.json,\n  binary: $input.item.binary,\n  pairedItem: 0\n}];"
+        "jsCode": "// Passe le json + le binaire compressé tels quels.\n// Convert to File ne modifie pas le json → $input.item suffit, pas besoin de $('Code in Python').item\nreturn [{\n  json: $input.item.json,\n  binary: $input.item.binary,\n  pairedItem: 0\n}];"
       },
       "id": "ad43fd79-5dd4-4532-9faf-8e7200167a84",
       "name": "Restore JSON",
