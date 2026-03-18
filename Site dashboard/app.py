@@ -1479,11 +1479,12 @@ def show_equipment_modal(equipment_id: str):
             st.session_state["_nav_request"] = "⚠ Centre de Validation"
             st.rerun()
         # Bouton suppression avec double confirmation
+        # Note : pas de st.rerun() sur les états intermédiaires — dans un st.dialog,
+        # st.rerun() ferme la modale. Le re-render se fait automatiquement au clic.
         del_key = f"confirm_del_modal_{equipment_id}"
         if not st.session_state.get(del_key):
             if footer_del.button("🗑 Supprimer", key=f"del_btn_{equipment_id}", use_container_width=True):
                 st.session_state[del_key] = True
-                st.rerun()
         else:
             footer_del.warning("Confirmer ?")
             col_yes, col_no = footer_del.columns(2)
@@ -1494,10 +1495,9 @@ def show_equipment_modal(equipment_id: str):
                 if folder_id and folder_id != "—":
                     trash_drive_folder(folder_id)
                 st.session_state.pop(del_key, None)
-                st.rerun()
+                st.rerun()  # Ferme la modale + rafraîchit le parc après suppression
             if col_no.button("✗", key=f"del_no_{equipment_id}", use_container_width=True):
                 st.session_state.pop(del_key, None)
-                st.rerun()
     else:
         # Utilisateur standard : Drive uniquement, lecture seule sur les caractéristiques
         if folder_url:
