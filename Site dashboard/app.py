@@ -496,9 +496,9 @@ def drive_img_src(file_id: str, size: int = 400):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_drive_thumb(file_id: str, max_px: int = 160) -> bytes | None:
+def get_drive_thumb(file_id: str, max_px: int = 160, quality: int = 55) -> bytes | None:
     """Miniature compressée pour la galerie : télécharge via SA puis redimensionne
-    à max_px (côté long) et encode en JPEG q=55 pour un chargement rapide."""
+    à max_px (côté long) et encode en JPEG à la qualité indiquée."""
     raw = get_drive_image_bytes(file_id)
     if not raw:
         return None
@@ -510,7 +510,7 @@ def get_drive_thumb(file_id: str, max_px: int = 160) -> bytes | None:
                 (int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS
             )
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=55)
+        img.convert("RGB").save(buf, format="JPEG", quality=quality)
         buf.seek(0)
         return buf.read()
     except Exception:
@@ -1867,10 +1867,11 @@ def render_parc_materiel():
         cols = st.columns(COLS)
         for col_idx, (_, item) in enumerate(chunk.iterrows()):
             with cols[col_idx]:
-                # Photo miniature compressée (160px, JPEG q=55)
+                # Photo miniature (800px, JPEG q=80) : affichage petit en carte,
+                # qualité suffisante pour le mode Fullscreen natif Streamlit
                 file_id = item.get("main_file_id")
                 if file_id and str(file_id) not in ("nan", "None", ""):
-                    thumb = get_drive_thumb(file_id, max_px=160)
+                    thumb = get_drive_thumb(file_id, max_px=800, quality=80)
                     if thumb:
                         st.image(thumb, use_container_width=True)
                     else:
