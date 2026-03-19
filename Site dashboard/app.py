@@ -878,7 +878,6 @@ def render_validation():
                             VALUES (?, ?, 'VALIDATE', 'review_required', ?)
                         """, [str(uuid.uuid4()), eq_id, get_current_user()])
                         st.success("✅ Fiche validée.")
-                        st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
 
@@ -977,7 +976,6 @@ def render_validation():
                         run_write("UPDATE equipment SET technical_specs_json = '{}' WHERE equipment_id = ?",
                                   [eq_id])
                         st.session_state.pop(_del_specs_key, None)
-                        st.cache_data.clear()
                         st.rerun()
 
                 # ── Édition contexte métier (accessoires, consommables, éléments) ──
@@ -1026,7 +1024,6 @@ def render_validation():
                                 "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
                                 [json.dumps(_new_biz, ensure_ascii=False), eq_id])
                             st.session_state.pop(_del_biz_key, None)
-                            st.cache_data.clear()
                             st.rerun()
 
                 _edit_biz_list("accessories",    "✦", "Accessoires livrés")
@@ -1149,7 +1146,6 @@ def render_validation():
                             VALUES (?, ?, 'UPDATE', ?, ?)
                         """, [str(uuid.uuid4()), eq_id, _changed, get_current_user()])
                         st.success("✅ Équipement validé et mis à jour.")
-                        st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
 
@@ -1182,7 +1178,6 @@ def render_validation():
                             else:
                                 st.warning("⚠️ Suppression DB OK mais le dossier Drive n'a pas pu être mis à la corbeille.")
                         st.session_state.pop(confirm_key, None)
-                        st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
                     if c2.button("↩ Annuler", key=f"del_no_{eq_id}"):
@@ -1964,7 +1959,6 @@ def render_parc_materiel():
                                     (audit_id, equipment_id, action, changed_fields, operator)
                                 VALUES (?, ?, 'VALIDATE', 'review_required', ?)
                             """, [str(uuid.uuid4()), eid, get_current_user()])
-                            st.cache_data.clear()
                             st.rerun()
 
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)

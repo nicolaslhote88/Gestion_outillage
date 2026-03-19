@@ -17,46 +17,48 @@
     },
     {
       "parameters": {
-        "jsCode": "// ── Auth + validation payload ───────────────────────────────\n// Si auth KO ou payload invalide → throw → output erreur → Respond Error\n// Si tout OK → return payload → Trash Drive Folder\n\nconst SHARED_SECRET = 'TON_SECRET_ICI'; // à remplacer en prod\n\nconst body    = $input.first().json.body || $input.first().json;\nconst headers = $input.first().json.headers || {};\n\nconst provided =\n  headers['x-siga-shared-secret'] ||\n  (headers['authorization'] || '').replace(/^Bearer\\s+/i, '');\n\nif (provided !== SHARED_SECRET) {\n  throw new Error(JSON.stringify({ ok: false, error: 'Unauthorized', code: 401 }));\n}\n\nconst folder_id    = body.folder_id    || null;\nconst equipment_id = body.equipment_id || null;\nconst label        = body.label        || 'Équipement inconnu';\n\nif (!folder_id) {\n  throw new Error(JSON.stringify({ ok: false, error: 'folder_id manquant dans le payload', code: 400 }));\n}\n\nreturn [{ json: { ok: true, folder_id, equipment_id, label } }];"
+        "jsCode": "// ── Auth + validation payload ───────────────────────────────\n// Si auth KO ou payload invalide → throw → output erreur (index 1) → Build Error Response\n// Si tout OK → return payload → Trash Drive Folder\n\nconst SHARED_SECRET = 'TON_SECRET_ICI'; // à remplacer en prod\n\nconst body    = $input.first().json.body || $input.first().json;\nconst headers = $input.first().json.headers || {};\n\nconst provided =\n  headers['x-siga-shared-secret'] ||\n  (headers['authorization'] || '').replace(/^Bearer\\s+/i, '');\n\nif (provided !== SHARED_SECRET) {\n  throw new Error(JSON.stringify({ ok: false, error: 'Unauthorized', code: 401 }));\n}\n\nconst folder_id    = body.folder_id    || null;\nconst equipment_id = body.equipment_id || null;\nconst label        = body.label        || 'Équipement inconnu';\n\nif (!folder_id) {\n  throw new Error(JSON.stringify({ ok: false, error: 'folder_id manquant dans le payload', code: 400 }));\n}\n\nreturn [{ json: { ok: true, folder_id, equipment_id, label } }];"
       },
       "id": "validate-payload",
       "name": "Validate Payload",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [460, 300]
+      "position": [460, 300],
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
-        "operation": "update",
-        "fileId": {
-          "mode": "expression",
+        "resource": "folder",
+        "operation": "deleteFolder",
+        "folderNoRootId": {
+          "__rl": true,
+          "mode": "id",
           "value": "={{ $json.folder_id }}"
         },
-        "updateFields": {
-          "trashed": true
-        }
+        "options": {}
       },
       "id": "trash-drive-folder",
       "name": "Trash Drive Folder",
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
-      "position": [680, 180],
+      "position": [700, 180],
+      "onError": "continueErrorOutput",
       "credentials": {
         "googleDriveOAuth2Api": {
-          "id": "google-drive-account",
+          "id": "pfuF6ArTiTPmlpHG",
           "name": "Google Drive account"
         }
       }
     },
     {
       "parameters": {
-        "jsCode": "const payload = $('Validate Payload').item.json;\nconst now = new Date().toISOString();\nconsole.log(`[SIGA_DELETE] ${now} — folder_id=${payload.folder_id} equipment_id=${payload.equipment_id} label=\"${payload.label}\" → Drive folder trashed`);\nreturn [{\n  json: {\n    ok: true,\n    action: 'folder_trashed',\n    folder_id: payload.folder_id,\n    equipment_id: payload.equipment_id,\n    label: payload.label,\n    trashed_at: now\n  }\n}];"
+        "jsCode": "const payload = $('Validate Payload').item.json;\nconst now = new Date().toISOString();\nconsole.log(`[SIGA_DELETE] ${now} — folder_id=${payload.folder_id} equipment_id=${payload.equipment_id} label=\"${payload.label}\" → Drive folder deleted`);\nreturn [{\n  json: {\n    ok: true,\n    action: 'folder_deleted',\n    folder_id: payload.folder_id,\n    equipment_id: payload.equipment_id,\n    label: payload.label,\n    deleted_at: now\n  }\n}];"
       },
       "id": "build-success-response",
       "name": "Build Success Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [900, 180]
+      "position": [940, 180]
     },
     {
       "parameters": {
@@ -70,17 +72,17 @@
       "name": "Respond Success",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [1120, 180]
+      "position": [1160, 180]
     },
     {
       "parameters": {
-        "jsCode": "// Parse l'erreur lancée par Validate Payload ou Trash Drive Folder\nlet body = { ok: false, error: 'Erreur inconnue', code: 500 };\ntry {\n  const msg = $input.first().json.message || $input.first().json.error?.message || '';\n  const parsed = JSON.parse(msg);\n  if (parsed && parsed.error) body = parsed;\n} catch (e) {\n  body.error = $input.first().json.message || 'Erreur interne';\n}\nreturn [{ json: body }];"
+        "jsCode": "// Parse l'erreur lancée par Validate Payload ou Trash Drive Folder\n// En mode continueErrorOutput, l'item d'erreur peut avoir différents formats\nlet body = { ok: false, error: 'Erreur inconnue', code: 500 };\ntry {\n  const item = $input.first();\n  // Format 1 : throw new Error(JSON.stringify({...})) depuis Code node\n  const errMsg = (item.json && item.json.error)\n    || (item.error && (item.error.message || item.error.description))\n    || '';\n  try {\n    const parsed = JSON.parse(errMsg);\n    if (parsed && (parsed.error || parsed.ok === false)) {\n      body = parsed;\n    } else {\n      body.error = errMsg || 'Erreur interne';\n    }\n  } catch (_) {\n    body.error = errMsg || 'Erreur interne';\n  }\n} catch (e) {\n  body.error = 'Erreur interne';\n}\nreturn [{ json: body }];"
       },
       "id": "build-error-response",
       "name": "Build Error Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [680, 420]
+      "position": [700, 440]
     },
     {
       "parameters": {
@@ -94,7 +96,7 @@
       "name": "Respond Error",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [900, 420]
+      "position": [940, 440]
     }
   ],
   "connections": {
@@ -117,9 +119,7 @@
             "type": "main",
             "index": 0
           }
-        ]
-      ],
-      "error": [
+        ],
         [
           {
             "node": "Build Error Response",
@@ -137,9 +137,7 @@
             "type": "main",
             "index": 0
           }
-        ]
-      ],
-      "error": [
+        ],
         [
           {
             "node": "Build Error Response",
@@ -183,5 +181,5 @@
   "tags": ["SIGA", "Drive", "Delete", "Webhook"],
   "triggerCount": 0,
   "updatedAt": "2026-03-19T00:00:00.000Z",
-  "versionId": "2"
+  "versionId": "3"
 }
