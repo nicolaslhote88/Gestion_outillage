@@ -882,51 +882,147 @@ def render_validation():
                             role = null_str(m.get("image_role"), "autre")
                             photo_options[f"Photo {idx + 1} ({role})"] = fid
 
-                with st.form(key=f"form_{eq_id}"):
-                    if photo_options:
-                        current_main_fid = media_df.iloc[0].get("final_drive_file_id") if not media_df.empty else None
-                        # Trouver l'option qui correspond à la vignette actuelle
-                        option_keys = list(photo_options.keys())
-                        default_idx = 0
-                        for i, (k, v) in enumerate(photo_options.items()):
-                            if v == current_main_fid:
-                                default_idx = i
-                                break
-                        f_main_photo_label = st.selectbox(
-                            "🖼 Vignette principale (Parc Matériel)",
-                            options=option_keys,
-                            index=default_idx,
-                            key=f"main_photo_{eq_id}",
-                        )
-                        f_main_photo_fid = photo_options[f_main_photo_label]
+                # ── Champs de base (sans st.form pour permettre les suppressions
+                #    dans les sections ci-dessous sans perdre la saisie) ─────────
+                if photo_options:
+                    current_main_fid = media_df.iloc[0].get("final_drive_file_id") if not media_df.empty else None
+                    option_keys = list(photo_options.keys())
+                    default_idx = 0
+                    for i, (k, v) in enumerate(photo_options.items()):
+                        if v == current_main_fid:
+                            default_idx = i
+                            break
+                    f_main_photo_label = st.selectbox(
+                        "🖼 Vignette principale (Parc Matériel)",
+                        options=option_keys,
+                        index=default_idx,
+                        key=f"main_photo_{eq_id}",
+                    )
+                    f_main_photo_fid = photo_options[f_main_photo_label]
+                else:
+                    f_main_photo_fid = None
+
+                f_label    = st.text_input(_label("label",          "Nom / Désignation"),
+                                           value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
+                f_brand    = st.text_input(_label("brand",          "Marque"),
+                                           value=null_str(row.get("brand"), ""),         key=f"brand_{eq_id}")
+                f_model    = st.text_input(_label("model",          "Modèle"),
+                                           value=null_str(row.get("model"), ""),         key=f"model_{eq_id}")
+                f_serial   = st.text_input(_label("serial_number",  "N° de série"),
+                                           value=null_str(row.get("serial_number"), ""), key=f"serial_{eq_id}")
+                f_subtype  = st.text_input(_label("subtype",        "Type d'outil"),
+                                           value=null_str(row.get("subtype"), ""),       key=f"subtype_{eq_id}")
+
+                cur_cond = null_str(row.get("condition_label"), "inconnu").lower()
+                cond_idx = CONDITION_OPTIONS.index(cur_cond) if cur_cond in CONDITION_OPTIONS else len(CONDITION_OPTIONS) - 1
+                f_condition = st.selectbox(_label("condition_label", "État"),
+                                           options=CONDITION_OPTIONS, index=cond_idx,    key=f"cond_{eq_id}")
+
+                f_location = st.text_input(_label("location_hint",  "Emplacement"),
+                                           value=null_str(row.get("location_hint"), ""), key=f"loc_{eq_id}")
+                f_notes    = st.text_area("📝 Notes",
+                                          value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
+                                          height=80)
+
+                # ── Édition spécifications techniques ──────────────
+                st.markdown("---")
+                specs = safe_json(row.get("technical_specs_json"), {})
+                _del_specs_key = f"del_specs_{eq_id}"
+                if _del_specs_key not in st.session_state:
+                    st.session_state[_del_specs_key] = set()
+                active_specs = {k: v for k, v in specs.items()
+                                if k not in st.session_state[_del_specs_key]}
+
+                with st.expander(f"⚙ Spécifications techniques ({len(active_specs)} entrée(s))", expanded=True):
+                    if active_specs:
+                        for _sk, _sv in list(active_specs.items()):
+                            _c1, _c2, _c3 = st.columns([3, 4, 1])
+                            _c1.text_input("Clé", value=_sk,
+                                           key=f"sk_{eq_id}_{_sk}", label_visibility="collapsed")
+                            _c2.text_input("Valeur", value=str(_sv),
+                                           key=f"sv_{eq_id}_{_sk}", label_visibility="collapsed")
+                            if _c3.button("🗑", key=f"sdel_{eq_id}_{_sk}", help="Marquer pour suppression"):
+                                st.session_state[_del_specs_key].add(_sk)
                     else:
-                        f_main_photo_fid = None
+                        st.caption("Aucune spécification technique.")
+                    if st.button("🗑 Tout effacer les specs", key=f"clear_specs_{eq_id}"):
+                        run_write("UPDATE equipment SET technical_specs_json = '{}' WHERE equipment_id = ?",
+                                  [eq_id])
+                        st.session_state.pop(_del_specs_key, None)
+                        st.cache_data.clear()
+                        st.rerun()
 
-                    f_label    = st.text_input(_label("label",          "Nom / Désignation"),
-                                               value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
-                    f_brand    = st.text_input(_label("brand",          "Marque"),
-                                               value=null_str(row.get("brand"), ""),         key=f"brand_{eq_id}")
-                    f_model    = st.text_input(_label("model",          "Modèle"),
-                                               value=null_str(row.get("model"), ""),         key=f"model_{eq_id}")
-                    f_serial   = st.text_input(_label("serial_number",  "N° de série"),
-                                               value=null_str(row.get("serial_number"), ""), key=f"serial_{eq_id}")
-                    f_subtype  = st.text_input(_label("subtype",        "Type d'outil"),
-                                               value=null_str(row.get("subtype"), ""),       key=f"subtype_{eq_id}")
+                # ── Édition contexte métier (accessoires, consommables, éléments) ──
+                biz = safe_json(row.get("business_context_json"), {})
 
-                    cur_cond = null_str(row.get("condition_label"), "inconnu").lower()
-                    cond_idx = CONDITION_OPTIONS.index(cur_cond) if cur_cond in CONDITION_OPTIONS else len(CONDITION_OPTIONS) - 1
-                    f_condition = st.selectbox(_label("condition_label", "État"),
-                                               options=CONDITION_OPTIONS, index=cond_idx,    key=f"cond_{eq_id}")
+                def _edit_biz_list(section_key: str, icon: str, title: str):
+                    """Affiche une section de liste éditable du business_context."""
+                    _alt_keys = {"accessories": "accessoires",
+                                 "consumables": "consommables",
+                                 "associated_items": "elements_associes",
+                                 "condition_notes": "constats"}
+                    items = biz.get(section_key) or biz.get(_alt_keys.get(section_key, ""), [])
+                    if isinstance(items, str):
+                        items = [items] if items else []
+                    if not isinstance(items, list):
+                        items = []
 
-                    f_location = st.text_input(_label("location_hint",  "Emplacement"),
-                                               value=null_str(row.get("location_hint"), ""), key=f"loc_{eq_id}")
-                    f_notes    = st.text_area("📝 Notes",
-                                              value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
-                                              height=80)
+                    _del_biz_key = f"del_biz_{eq_id}_{section_key}"
+                    if _del_biz_key not in st.session_state:
+                        st.session_state[_del_biz_key] = set()
 
-                    submitted = st.form_submit_button("✅ Valider et enregistrer", type="primary", use_container_width=True)
+                    active_count = sum(1 for i in range(len(items))
+                                       if i not in st.session_state[_del_biz_key])
 
-                if submitted:
+                    with st.expander(f"{icon} {title} ({active_count} entrée(s))", expanded=True):
+                        for _orig_idx, _item in enumerate(items):
+                            if _orig_idx in st.session_state[_del_biz_key]:
+                                continue
+                            _raw = _item if isinstance(_item, str) else json.dumps(_item, ensure_ascii=False)
+                            _bc1, _bc2 = st.columns([5, 1])
+                            _bc1.text_area("", value=_raw,
+                                           key=f"biz_{eq_id}_{section_key}_{_orig_idx}",
+                                           height=60, label_visibility="collapsed")
+                            if _bc2.button("🗑", key=f"bizdel_{eq_id}_{section_key}_{_orig_idx}",
+                                           help="Marquer pour suppression"):
+                                st.session_state[_del_biz_key].add(_orig_idx)
+
+                        if active_count == 0:
+                            st.caption("Aucun élément.")
+
+                        if st.button(f"🗑 Tout vider", key=f"clear_biz_{eq_id}_{section_key}"):
+                            _new_biz = dict(biz)
+                            _new_biz[section_key] = []
+                            run_write(
+                                "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
+                                [json.dumps(_new_biz, ensure_ascii=False), eq_id])
+                            st.session_state.pop(_del_biz_key, None)
+                            st.cache_data.clear()
+                            st.rerun()
+
+                _edit_biz_list("accessories",    "✦", "Accessoires livrés")
+                _edit_biz_list("consumables",    "⚙", "Consommables associés")
+                _edit_biz_list("associated_items", "🔗", "Éléments associés")
+                _edit_biz_list("condition_notes", "📝", "Constats visuels")
+
+                # ── Bouton unique "Valider et enregistrer tout" ─────
+                st.markdown("---")
+                if st.button("💾 Valider et enregistrer tout", key=f"save_all_{eq_id}",
+                             type="primary", use_container_width=True):
+                    # Lecture des valeurs saisies (session_state via clés widget)
+                    sv_label    = st.session_state.get(f"label_{eq_id}",  f_label)
+                    sv_brand    = st.session_state.get(f"brand_{eq_id}",  f_brand)
+                    sv_model    = st.session_state.get(f"model_{eq_id}",  f_model)
+                    sv_serial   = st.session_state.get(f"serial_{eq_id}", f_serial)
+                    sv_subtype  = st.session_state.get(f"subtype_{eq_id}", f_subtype)
+                    sv_cond     = st.session_state.get(f"cond_{eq_id}",   f_condition)
+                    sv_loc      = st.session_state.get(f"loc_{eq_id}",    f_location)
+                    sv_notes    = st.session_state.get(f"notes_{eq_id}",  f_notes)
+                    sv_photo    = photo_options.get(
+                        st.session_state.get(f"main_photo_{eq_id}", ""), f_main_photo_fid
+                    ) if photo_options else f_main_photo_fid
+
+                    # Sauvegarde champs de base
                     ok = run_write("""
                         UPDATE equipment SET
                             label           = ?,
@@ -940,12 +1036,13 @@ def render_validation():
                             review_required = false
                         WHERE equipment_id = ?
                     """, [
-                        f_label or None, f_brand or None, f_model or None,
-                        f_serial or None, f_subtype or None, f_condition,
-                        f_location or None, f_notes or None, eq_id,
+                        sv_label or None, sv_brand or None, sv_model or None,
+                        sv_serial or None, sv_subtype or None, sv_cond,
+                        sv_loc or None, sv_notes or None, eq_id,
                     ])
-                    # Mise à jour vignette principale
-                    if ok and f_main_photo_fid:
+
+                    # Sauvegarde vignette principale
+                    if ok and sv_photo:
                         run_write("""
                             UPDATE equipment_media
                             SET image_role = CASE
@@ -954,33 +1051,81 @@ def render_validation():
                                 ELSE image_role
                             END
                             WHERE equipment_id = ?
-                        """, [f_main_photo_fid, eq_id])
+                        """, [sv_photo, eq_id])
+
+                    # Sauvegarde spécifications techniques
                     if ok:
-                        # ── Audit trail ──────────────────────────
+                        _del_s = st.session_state.get(_del_specs_key, set())
+                        _new_specs = {}
+                        for _orig_k, _orig_v in specs.items():
+                            if _orig_k in _del_s:
+                                continue
+                            _nk = st.session_state.get(f"sk_{eq_id}_{_orig_k}", _orig_k)
+                            _nv = st.session_state.get(f"sv_{eq_id}_{_orig_k}", str(_orig_v))
+                            if _nk.strip():
+                                _new_specs[_nk.strip()] = _nv
+                        run_write("UPDATE equipment SET technical_specs_json = ? WHERE equipment_id = ?",
+                                  [json.dumps(_new_specs, ensure_ascii=False), eq_id])
+                        st.session_state.pop(_del_specs_key, None)
+
+                    # Sauvegarde contexte métier
+                    if ok:
+                        _new_biz = dict(biz)
+                        for _sk_biz in ("accessories", "consumables", "associated_items", "condition_notes"):
+                            _del_biz_key = f"del_biz_{eq_id}_{_sk_biz}"
+                            _del_b = st.session_state.get(_del_biz_key, set())
+                            _alt_keys2 = {"accessories": "accessoires",
+                                          "consumables": "consommables",
+                                          "associated_items": "elements_associes",
+                                          "condition_notes": "constats"}
+                            _items_b = biz.get(_sk_biz) or biz.get(_alt_keys2.get(_sk_biz, ""), [])
+                            if isinstance(_items_b, str):
+                                _items_b = [_items_b] if _items_b else []
+                            if not isinstance(_items_b, list):
+                                _items_b = []
+                            _new_list = []
+                            for _i_b in range(len(_items_b)):
+                                if _i_b in _del_b:
+                                    continue
+                                _raw_val = st.session_state.get(
+                                    f"biz_{eq_id}_{_sk_biz}_{_i_b}",
+                                    _items_b[_i_b] if isinstance(_items_b[_i_b], str)
+                                    else json.dumps(_items_b[_i_b], ensure_ascii=False)
+                                ).strip()
+                                if _raw_val:
+                                    try:
+                                        _new_list.append(json.loads(_raw_val))
+                                    except Exception:
+                                        _new_list.append(_raw_val)
+                            _new_biz[_sk_biz] = _new_list
+                            st.session_state.pop(_del_biz_key, None)
+                        run_write("UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
+                                  [json.dumps(_new_biz, ensure_ascii=False), eq_id])
+
+                    if ok:
                         _changed = ", ".join(filter(None, [
-                            "label"          if f_label    != null_str(row.get("label"),          "") else "",
-                            "brand"          if f_brand    != null_str(row.get("brand"),          "") else "",
-                            "model"          if f_model    != null_str(row.get("model"),          "") else "",
-                            "serial_number"  if f_serial   != null_str(row.get("serial_number"),  "") else "",
-                            "subtype"        if f_subtype  != null_str(row.get("subtype"),         "") else "",
-                            "condition"      if f_condition!= null_str(row.get("condition_label"), "") else "",
-                            "location"       if f_location != null_str(row.get("location_hint"),  "") else "",
-                            "notes"          if f_notes    != null_str(row.get("notes"),          "") else "",
+                            "label"         if sv_label    != null_str(row.get("label"),          "") else "",
+                            "brand"         if sv_brand    != null_str(row.get("brand"),          "") else "",
+                            "model"         if sv_model    != null_str(row.get("model"),          "") else "",
+                            "serial_number" if sv_serial   != null_str(row.get("serial_number"),  "") else "",
+                            "subtype"       if sv_subtype  != null_str(row.get("subtype"),         "") else "",
+                            "condition"     if sv_cond     != null_str(row.get("condition_label"), "") else "",
+                            "location"      if sv_loc      != null_str(row.get("location_hint"),  "") else "",
+                            "notes"         if sv_notes    != null_str(row.get("notes"),          "") else "",
+                            "specs/biz",
                         ])) or "aucun changement détecté"
                         run_write("""
                             INSERT INTO equipment_audit
                                 (audit_id, equipment_id, action, changed_fields, operator)
                             VALUES (?, ?, 'UPDATE', ?, ?)
-                        """, [
-                            str(uuid.uuid4()), eq_id, _changed,
-                            get_current_user(),
-                        ])
+                        """, [str(uuid.uuid4()), eq_id, _changed, get_current_user()])
                         st.success("✅ Équipement validé et mis à jour.")
                         st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
 
                 # ── Bouton Supprimer avec confirmation ─────────────
+                st.markdown("---")
                 folder_id_for_del = null_str(row.get("final_drive_folder_id"), "")
                 confirm_key = f"confirm_del_{eq_id}"
 
@@ -1015,126 +1160,6 @@ def render_validation():
                         st.session_state.pop(confirm_key, None)
                         _finish_edit()
                         st.rerun()
-
-                # ── Édition spécifications techniques ──────────────
-                st.markdown("---")
-                specs = safe_json(row.get("technical_specs_json"), {})
-                _del_specs_key = f"del_specs_{eq_id}"
-                if _del_specs_key not in st.session_state:
-                    st.session_state[_del_specs_key] = set()
-                active_specs = {k: v for k, v in specs.items()
-                                if k not in st.session_state[_del_specs_key]}
-
-                with st.expander(f"⚙ Spécifications techniques ({len(active_specs)} entrée(s))", expanded=False):
-                    if active_specs:
-                        for _sk, _sv in list(active_specs.items()):
-                            _c1, _c2, _c3 = st.columns([3, 4, 1])
-                            _c1.text_input("Clé", value=_sk,
-                                           key=f"sk_{eq_id}_{_sk}", label_visibility="collapsed")
-                            _c2.text_input("Valeur", value=str(_sv),
-                                           key=f"sv_{eq_id}_{_sk}", label_visibility="collapsed")
-                            if _c3.button("🗑", key=f"sdel_{eq_id}_{_sk}", help="Supprimer cette spec"):
-                                st.session_state[_del_specs_key].add(_sk)
-                                st.rerun()
-                    else:
-                        st.caption("Aucune spécification technique.")
-
-                    _sc1, _sc2 = st.columns(2)
-                    if _sc1.button("💾 Enregistrer specs", key=f"save_specs_{eq_id}", use_container_width=True):
-                        _new_specs = {}
-                        for _orig_k in active_specs:
-                            _nk = st.session_state.get(f"sk_{eq_id}_{_orig_k}", _orig_k).strip()
-                            _nv = st.session_state.get(f"sv_{eq_id}_{_orig_k}", "")
-                            if _nk:
-                                _new_specs[_nk] = _nv
-                        run_write("UPDATE equipment SET technical_specs_json = ? WHERE equipment_id = ?",
-                                  [json.dumps(_new_specs, ensure_ascii=False), eq_id])
-                        st.session_state.pop(_del_specs_key, None)
-                        st.cache_data.clear()
-                        st.success("✅ Specs enregistrées.")
-                        st.rerun()
-                    if _sc2.button("🗑 Tout supprimer", key=f"clear_specs_{eq_id}", use_container_width=True):
-                        run_write("UPDATE equipment SET technical_specs_json = '{}' WHERE equipment_id = ?",
-                                  [eq_id])
-                        st.session_state.pop(_del_specs_key, None)
-                        st.cache_data.clear()
-                        st.rerun()
-
-                # ── Édition contexte métier (accessoires, consommables, éléments) ──
-                biz = safe_json(row.get("business_context_json"), {})
-
-                def _edit_biz_list(section_key: str, icon: str, title: str):
-                    """Affiche une section de liste éditable du business_context."""
-                    _alt_keys = {"accessories": "accessoires",
-                                 "consumables": "consommables",
-                                 "associated_items": "elements_associes",
-                                 "condition_notes": "constats"}
-                    items = biz.get(section_key) or biz.get(_alt_keys.get(section_key, ""), [])
-                    if isinstance(items, str):
-                        items = [items] if items else []
-                    if not isinstance(items, list):
-                        items = []
-
-                    _del_biz_key = f"del_biz_{eq_id}_{section_key}"
-                    if _del_biz_key not in st.session_state:
-                        st.session_state[_del_biz_key] = set()
-
-                    active_count = sum(1 for i in range(len(items))
-                                       if i not in st.session_state[_del_biz_key])
-
-                    with st.expander(f"{icon} {title} ({active_count} entrée(s))", expanded=False):
-                        for _orig_idx, _item in enumerate(items):
-                            if _orig_idx in st.session_state[_del_biz_key]:
-                                continue
-                            _raw = _item if isinstance(_item, str) else json.dumps(_item, ensure_ascii=False)
-                            _bc1, _bc2 = st.columns([5, 1])
-                            _bc1.text_area("", value=_raw,
-                                           key=f"biz_{eq_id}_{section_key}_{_orig_idx}",
-                                           height=60, label_visibility="collapsed")
-                            if _bc2.button("🗑", key=f"bizdel_{eq_id}_{section_key}_{_orig_idx}",
-                                           help="Supprimer cet élément"):
-                                st.session_state[_del_biz_key].add(_orig_idx)
-                                st.rerun()
-
-                        if active_count == 0:
-                            st.caption("Aucun élément.")
-
-                        _bbc1, _bbc2 = st.columns(2)
-                        if _bbc1.button("💾 Enregistrer", key=f"save_biz_{eq_id}_{section_key}", use_container_width=True):
-                            _new_list = []
-                            for _orig_i in range(len(items)):
-                                if _orig_i in st.session_state[_del_biz_key]:
-                                    continue
-                                _raw_val = st.session_state.get(
-                                    f"biz_{eq_id}_{section_key}_{_orig_i}", "").strip()
-                                if _raw_val:
-                                    try:
-                                        _new_list.append(json.loads(_raw_val))
-                                    except Exception:
-                                        _new_list.append(_raw_val)
-                            _new_biz = dict(biz)
-                            _new_biz[section_key] = _new_list
-                            run_write(
-                                "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
-                                [json.dumps(_new_biz, ensure_ascii=False), eq_id])
-                            st.session_state.pop(_del_biz_key, None)
-                            st.cache_data.clear()
-                            st.success("✅ Enregistré.")
-                            st.rerun()
-                        if _bbc2.button("🗑 Tout vider", key=f"clear_biz_{eq_id}_{section_key}", use_container_width=True):
-                            _new_biz = dict(biz)
-                            _new_biz[section_key] = []
-                            run_write(
-                                "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
-                                [json.dumps(_new_biz, ensure_ascii=False), eq_id])
-                            st.session_state.pop(_del_biz_key, None)
-                            st.cache_data.clear()
-                            st.rerun()
-
-                _edit_biz_list("accessories",    "✦", "Accessoires livrés")
-                _edit_biz_list("consumables",    "⚙", "Consommables associés")
-                _edit_biz_list("associated_items", "🔗", "Éléments associés")
-                _edit_biz_list("condition_notes", "📝", "Constats visuels")
 
                 # Lien Drive
                 folder_url = drive_folder_url(row.get("final_drive_folder_id"))
@@ -1407,7 +1432,8 @@ def show_equipment_modal(equipment_id: str):
                     st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
                 if st.button("✖ Fermer l'agrandissement", key=f"zoom_close_{equipment_id}", use_container_width=True):
                     st.session_state.pop(zoom_key, None)
-                    st.rerun()
+                    # pas de st.rerun() — le clic de bouton dans un @st.dialog déclenche
+                    # automatiquement un re-render partiel sans fermer la modale
             else:
                 # ── Vue galerie normale ───────────────────────
                 main = media_df.iloc[0]
@@ -1419,7 +1445,6 @@ def show_equipment_modal(equipment_id: str):
                         st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
                     if st.button("🔍 Agrandir", key=f"zoom_main_{equipment_id}", use_container_width=True):
                         st.session_state[zoom_key] = fid
-                        st.rerun()
 
                 # Galerie toutes les photos restantes (3 par ligne)
                 remaining = media_df.iloc[1:]
@@ -1437,7 +1462,6 @@ def show_equipment_modal(equipment_id: str):
                                 )
                                 if cols[j].button("🔍", key=f"zoom_{equipment_id}_{fid2}", use_container_width=True):
                                     st.session_state[zoom_key] = fid2
-                                    st.rerun()
                             except Exception:
                                 cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
@@ -1884,6 +1908,22 @@ def render_parc_materiel():
                         else:
                             st.session_state["loan_basket"][eid] = _display_name(item)
                         st.rerun()
+
+                # Bouton validation rapide (visible uniquement si review_required)
+                if is_admin() and item.get("review_required"):
+                    if st.button("⚡ Valider", key=f"qval_{eid}", use_container_width=True,
+                                 help="Valider cette fiche directement sans la modifier"):
+                        ok = run_write(
+                            "UPDATE equipment SET review_required = false WHERE equipment_id = ?", [eid]
+                        )
+                        if ok:
+                            run_write("""
+                                INSERT INTO equipment_audit
+                                    (audit_id, equipment_id, action, changed_fields, operator)
+                                VALUES (?, ?, 'VALIDATE', 'review_required', ?)
+                            """, [str(uuid.uuid4()), eid, get_current_user()])
+                            st.cache_data.clear()
+                            st.rerun()
 
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
 
