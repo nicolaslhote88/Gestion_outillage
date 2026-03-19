@@ -368,21 +368,50 @@ def drive_thumbnail_url(file_id: str, size: int = 400) -> str:
     return f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size}"
 
 
+@st.cache_resource
+def _drive_service_ro():
+    """Service Google Drive lecture seule, mis en cache pour toute la session Streamlit.
+    Évite de reconstruire la connexion (Credentials + HTTP discovery) à chaque image."""
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        return _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_SVC_RO] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+@st.cache_resource
+def _drive_service_rw():
+    """Service Google Drive lecture/écriture, mis en cache pour toute la session."""
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_SVC_RW] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 def trash_drive_folder(folder_id: str) -> bool:
     """Déplace un dossier Drive à la corbeille via service account.
     Retourne True si succès, False sinon."""
     if not folder_id or str(folder_id) in ("nan", "None", ""):
         return False
-    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
-    if not Path(sa_path).exists():
+    svc = _drive_service_rw()
+    if svc is None:
         return False
     try:
-        import sys
-        creds = service_account.Credentials.from_service_account_file(
-            sa_path,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
         svc.files().update(
             fileId=folder_id,
             body={"trashed": True},
@@ -390,8 +419,41 @@ def trash_drive_folder(folder_id: str) -> bool:
         ).execute()
         return True
     except Exception as e:
+        import sys
         print(f"[DRIVE_TRASH] folder_id={folder_id} → {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return False
+
+
+_DELETE_WEBHOOK_URL    = "https://n8n.srv961978.hstgr.cloud/webhook/siga-delete-equipment-folder"
+_DELETE_WEBHOOK_SECRET = "TON_SECRET_ICI"  # secret partagé — à changer en prod
+
+
+def call_delete_equipment_webhook(folder_id: str, equipment_id: str = "", label: str = "") -> bool:
+    """Appelle le webhook n8n de suppression du dossier Drive d'un équipement.
+    Fallback automatique sur trash_drive_folder() si l'URL n'est pas configurée."""
+    webhook_url = _DELETE_WEBHOOK_URL.strip()
+    if not webhook_url:
+        return trash_drive_folder(folder_id)
+
+    payload = {
+        "folder_id": folder_id,
+        "equipment_id": equipment_id,
+        "label": label,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-SIGA-Shared-Secret": _DELETE_WEBHOOK_SECRET,
+    }
+
+    try:
+        resp = requests.post(webhook_url, json=payload, headers=headers, timeout=15)
+        data = resp.json() if resp.content else {}
+        return bool(data.get("ok", False))
+    except Exception as e:
+        import sys
+        print(f"[DELETE_WEBHOOK] folder_id={folder_id} → {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        # Fallback sur suppression directe
+        return trash_drive_folder(folder_id)
 
 
 def drive_direct_url(file_id: str) -> str:
@@ -408,21 +470,17 @@ def drive_folder_url(folder_id: str) -> str:
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def get_drive_image_bytes(file_id: str) -> bytes | None:
-    """Télécharge une image Drive côté serveur via service account.
-    Retourne None si le service account n'est pas configuré (fallback URL)."""
+    """Télécharge une image Drive côté serveur via service account mis en cache.
+    Retourne None si le service account n'est pas configuré (fallback URL).
+    TTL 2h — le service Drive est mis en cache via _drive_service_ro()."""
     if not file_id or str(file_id) in ("nan", "None", ""):
         return None
-    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
-    if not Path(sa_path).exists():
+    svc = _drive_service_ro()
+    if svc is None:
         return None
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            sa_path,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
-        )
-        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
         return svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
     except Exception as e:
         import sys
@@ -438,9 +496,9 @@ def drive_img_src(file_id: str, size: int = 400):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_drive_thumb(file_id: str, max_px: int = 160) -> bytes | None:
+def get_drive_thumb(file_id: str, max_px: int = 160, quality: int = 55) -> bytes | None:
     """Miniature compressée pour la galerie : télécharge via SA puis redimensionne
-    à max_px (côté long) et encode en JPEG q=55 pour un chargement rapide."""
+    à max_px (côté long) et encode en JPEG à la qualité indiquée."""
     raw = get_drive_image_bytes(file_id)
     if not raw:
         return None
@@ -452,7 +510,7 @@ def get_drive_thumb(file_id: str, max_px: int = 160) -> bytes | None:
                 (int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS
             )
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=55)
+        img.convert("RGB").save(buf, format="JPEG", quality=quality)
         buf.seek(0)
         return buf.read()
     except Exception:
@@ -805,6 +863,26 @@ def render_validation():
 
                 eq_id = row["equipment_id"]
 
+                # ── Bouton valider rapide ───────────────────────
+                quick_validate_key = f"quick_validate_{eq_id}"
+                if st.button("✅ Valider directement (sans modification)",
+                             key=quick_validate_key, use_container_width=True):
+                    ok = run_write("""
+                        UPDATE equipment SET review_required = false
+                        WHERE equipment_id = ?
+                    """, [eq_id])
+                    if ok:
+                        run_write("""
+                            INSERT INTO equipment_audit
+                                (audit_id, equipment_id, action, changed_fields, operator)
+                            VALUES (?, ?, 'VALIDATE', 'review_required', ?)
+                        """, [str(uuid.uuid4()), eq_id, get_current_user()])
+                        st.success("✅ Fiche validée.")
+                        _finish_edit()
+                        st.rerun()
+
+                st.markdown("---")
+
                 # Raisons de révision (lecture seule)
                 if reasons:
                     st.markdown("**Raisons de la révision**")
@@ -830,51 +908,147 @@ def render_validation():
                             role = null_str(m.get("image_role"), "autre")
                             photo_options[f"Photo {idx + 1} ({role})"] = fid
 
-                with st.form(key=f"form_{eq_id}"):
-                    if photo_options:
-                        current_main_fid = media_df.iloc[0].get("final_drive_file_id") if not media_df.empty else None
-                        # Trouver l'option qui correspond à la vignette actuelle
-                        option_keys = list(photo_options.keys())
-                        default_idx = 0
-                        for i, (k, v) in enumerate(photo_options.items()):
-                            if v == current_main_fid:
-                                default_idx = i
-                                break
-                        f_main_photo_label = st.selectbox(
-                            "🖼 Vignette principale (Parc Matériel)",
-                            options=option_keys,
-                            index=default_idx,
-                            key=f"main_photo_{eq_id}",
-                        )
-                        f_main_photo_fid = photo_options[f_main_photo_label]
+                # ── Champs de base (sans st.form pour permettre les suppressions
+                #    dans les sections ci-dessous sans perdre la saisie) ─────────
+                if photo_options:
+                    current_main_fid = media_df.iloc[0].get("final_drive_file_id") if not media_df.empty else None
+                    option_keys = list(photo_options.keys())
+                    default_idx = 0
+                    for i, (k, v) in enumerate(photo_options.items()):
+                        if v == current_main_fid:
+                            default_idx = i
+                            break
+                    f_main_photo_label = st.selectbox(
+                        "🖼 Vignette principale (Parc Matériel)",
+                        options=option_keys,
+                        index=default_idx,
+                        key=f"main_photo_{eq_id}",
+                    )
+                    f_main_photo_fid = photo_options[f_main_photo_label]
+                else:
+                    f_main_photo_fid = None
+
+                f_label    = st.text_input(_label("label",          "Nom / Désignation"),
+                                           value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
+                f_brand    = st.text_input(_label("brand",          "Marque"),
+                                           value=null_str(row.get("brand"), ""),         key=f"brand_{eq_id}")
+                f_model    = st.text_input(_label("model",          "Modèle"),
+                                           value=null_str(row.get("model"), ""),         key=f"model_{eq_id}")
+                f_serial   = st.text_input(_label("serial_number",  "N° de série"),
+                                           value=null_str(row.get("serial_number"), ""), key=f"serial_{eq_id}")
+                f_subtype  = st.text_input(_label("subtype",        "Type d'outil"),
+                                           value=null_str(row.get("subtype"), ""),       key=f"subtype_{eq_id}")
+
+                cur_cond = null_str(row.get("condition_label"), "inconnu").lower()
+                cond_idx = CONDITION_OPTIONS.index(cur_cond) if cur_cond in CONDITION_OPTIONS else len(CONDITION_OPTIONS) - 1
+                f_condition = st.selectbox(_label("condition_label", "État"),
+                                           options=CONDITION_OPTIONS, index=cond_idx,    key=f"cond_{eq_id}")
+
+                f_location = st.text_input(_label("location_hint",  "Emplacement"),
+                                           value=null_str(row.get("location_hint"), ""), key=f"loc_{eq_id}")
+                f_notes    = st.text_area("📝 Notes",
+                                          value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
+                                          height=80)
+
+                # ── Édition spécifications techniques ──────────────
+                st.markdown("---")
+                specs = safe_json(row.get("technical_specs_json"), {})
+                _del_specs_key = f"del_specs_{eq_id}"
+                if _del_specs_key not in st.session_state:
+                    st.session_state[_del_specs_key] = set()
+                active_specs = {k: v for k, v in specs.items()
+                                if k not in st.session_state[_del_specs_key]}
+
+                with st.expander(f"⚙ Spécifications techniques ({len(active_specs)} entrée(s))", expanded=True):
+                    if active_specs:
+                        for _sk, _sv in list(active_specs.items()):
+                            _c1, _c2, _c3 = st.columns([3, 4, 1])
+                            _c1.text_input("Clé", value=_sk,
+                                           key=f"sk_{eq_id}_{_sk}", label_visibility="collapsed")
+                            _c2.text_input("Valeur", value=str(_sv),
+                                           key=f"sv_{eq_id}_{_sk}", label_visibility="collapsed")
+                            if _c3.button("🗑", key=f"sdel_{eq_id}_{_sk}", help="Supprimer cette spec"):
+                                st.session_state[_del_specs_key].add(_sk)
+                                st.rerun()  # force re-render pour masquer la ligne immédiatement
                     else:
-                        f_main_photo_fid = None
+                        st.caption("Aucune spécification technique.")
+                    if st.button("🗑 Tout effacer les specs", key=f"clear_specs_{eq_id}"):
+                        run_write("UPDATE equipment SET technical_specs_json = '{}' WHERE equipment_id = ?",
+                                  [eq_id])
+                        st.session_state.pop(_del_specs_key, None)
+                        st.rerun()
 
-                    f_label    = st.text_input(_label("label",          "Nom / Désignation"),
-                                               value=null_str(row.get("label"), ""),         key=f"label_{eq_id}")
-                    f_brand    = st.text_input(_label("brand",          "Marque"),
-                                               value=null_str(row.get("brand"), ""),         key=f"brand_{eq_id}")
-                    f_model    = st.text_input(_label("model",          "Modèle"),
-                                               value=null_str(row.get("model"), ""),         key=f"model_{eq_id}")
-                    f_serial   = st.text_input(_label("serial_number",  "N° de série"),
-                                               value=null_str(row.get("serial_number"), ""), key=f"serial_{eq_id}")
-                    f_subtype  = st.text_input(_label("subtype",        "Type d'outil"),
-                                               value=null_str(row.get("subtype"), ""),       key=f"subtype_{eq_id}")
+                # ── Édition contexte métier (accessoires, consommables, éléments) ──
+                biz = safe_json(row.get("business_context_json"), {})
 
-                    cur_cond = null_str(row.get("condition_label"), "inconnu").lower()
-                    cond_idx = CONDITION_OPTIONS.index(cur_cond) if cur_cond in CONDITION_OPTIONS else len(CONDITION_OPTIONS) - 1
-                    f_condition = st.selectbox(_label("condition_label", "État"),
-                                               options=CONDITION_OPTIONS, index=cond_idx,    key=f"cond_{eq_id}")
+                def _edit_biz_list(section_key: str, icon: str, title: str):
+                    """Affiche une section de liste éditable du business_context."""
+                    _alt_keys = {"accessories": "accessoires",
+                                 "consumables": "consommables",
+                                 "associated_items": "elements_associes",
+                                 "condition_notes": "constats"}
+                    items = biz.get(section_key) or biz.get(_alt_keys.get(section_key, ""), [])
+                    if isinstance(items, str):
+                        items = [items] if items else []
+                    if not isinstance(items, list):
+                        items = []
 
-                    f_location = st.text_input(_label("location_hint",  "Emplacement"),
-                                               value=null_str(row.get("location_hint"), ""), key=f"loc_{eq_id}")
-                    f_notes    = st.text_area("📝 Notes",
-                                              value=null_str(row.get("notes"), ""),          key=f"notes_{eq_id}",
-                                              height=80)
+                    _del_biz_key = f"del_biz_{eq_id}_{section_key}"
+                    if _del_biz_key not in st.session_state:
+                        st.session_state[_del_biz_key] = set()
 
-                    submitted = st.form_submit_button("✅ Valider et enregistrer", type="primary", use_container_width=True)
+                    active_count = sum(1 for i in range(len(items))
+                                       if i not in st.session_state[_del_biz_key])
 
-                if submitted:
+                    with st.expander(f"{icon} {title} ({active_count} entrée(s))", expanded=True):
+                        for _orig_idx, _item in enumerate(items):
+                            if _orig_idx in st.session_state[_del_biz_key]:
+                                continue
+                            _raw = _item if isinstance(_item, str) else json.dumps(_item, ensure_ascii=False)
+                            _bc1, _bc2 = st.columns([5, 1])
+                            _bc1.text_area("", value=_raw,
+                                           key=f"biz_{eq_id}_{section_key}_{_orig_idx}",
+                                           height=60, label_visibility="collapsed")
+                            if _bc2.button("🗑", key=f"bizdel_{eq_id}_{section_key}_{_orig_idx}",
+                                           help="Supprimer cet élément"):
+                                st.session_state[_del_biz_key].add(_orig_idx)
+                                st.rerun()  # force re-render pour masquer l'item immédiatement
+
+                        if active_count == 0:
+                            st.caption("Aucun élément.")
+
+                        if st.button(f"🗑 Tout vider", key=f"clear_biz_{eq_id}_{section_key}"):
+                            _new_biz = dict(biz)
+                            _new_biz[section_key] = []
+                            run_write(
+                                "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
+                                [json.dumps(_new_biz, ensure_ascii=False), eq_id])
+                            st.session_state.pop(_del_biz_key, None)
+                            st.rerun()
+
+                _edit_biz_list("accessories",    "✦", "Accessoires livrés")
+                _edit_biz_list("consumables",    "⚙", "Consommables associés")
+                _edit_biz_list("associated_items", "🔗", "Éléments associés")
+                _edit_biz_list("condition_notes", "📝", "Constats visuels")
+
+                # ── Bouton unique "Valider et enregistrer tout" ─────
+                st.markdown("---")
+                if st.button("💾 Valider et enregistrer tout", key=f"save_all_{eq_id}",
+                             type="primary", use_container_width=True):
+                    # Lecture des valeurs saisies (session_state via clés widget)
+                    sv_label    = st.session_state.get(f"label_{eq_id}",  f_label)
+                    sv_brand    = st.session_state.get(f"brand_{eq_id}",  f_brand)
+                    sv_model    = st.session_state.get(f"model_{eq_id}",  f_model)
+                    sv_serial   = st.session_state.get(f"serial_{eq_id}", f_serial)
+                    sv_subtype  = st.session_state.get(f"subtype_{eq_id}", f_subtype)
+                    sv_cond     = st.session_state.get(f"cond_{eq_id}",   f_condition)
+                    sv_loc      = st.session_state.get(f"loc_{eq_id}",    f_location)
+                    sv_notes    = st.session_state.get(f"notes_{eq_id}",  f_notes)
+                    sv_photo    = photo_options.get(
+                        st.session_state.get(f"main_photo_{eq_id}", ""), f_main_photo_fid
+                    ) if photo_options else f_main_photo_fid
+
+                    # Sauvegarde champs de base
                     ok = run_write("""
                         UPDATE equipment SET
                             label           = ?,
@@ -888,12 +1062,13 @@ def render_validation():
                             review_required = false
                         WHERE equipment_id = ?
                     """, [
-                        f_label or None, f_brand or None, f_model or None,
-                        f_serial or None, f_subtype or None, f_condition,
-                        f_location or None, f_notes or None, eq_id,
+                        sv_label or None, sv_brand or None, sv_model or None,
+                        sv_serial or None, sv_subtype or None, sv_cond,
+                        sv_loc or None, sv_notes or None, eq_id,
                     ])
-                    # Mise à jour vignette principale
-                    if ok and f_main_photo_fid:
+
+                    # Sauvegarde vignette principale
+                    if ok and sv_photo:
                         run_write("""
                             UPDATE equipment_media
                             SET image_role = CASE
@@ -902,33 +1077,80 @@ def render_validation():
                                 ELSE image_role
                             END
                             WHERE equipment_id = ?
-                        """, [f_main_photo_fid, eq_id])
+                        """, [sv_photo, eq_id])
+
+                    # Sauvegarde spécifications techniques
                     if ok:
-                        # ── Audit trail ──────────────────────────
+                        _del_s = st.session_state.get(_del_specs_key, set())
+                        _new_specs = {}
+                        for _orig_k, _orig_v in specs.items():
+                            if _orig_k in _del_s:
+                                continue
+                            _nk = st.session_state.get(f"sk_{eq_id}_{_orig_k}", _orig_k)
+                            _nv = st.session_state.get(f"sv_{eq_id}_{_orig_k}", str(_orig_v))
+                            if _nk.strip():
+                                _new_specs[_nk.strip()] = _nv
+                        run_write("UPDATE equipment SET technical_specs_json = ? WHERE equipment_id = ?",
+                                  [json.dumps(_new_specs, ensure_ascii=False), eq_id])
+                        st.session_state.pop(_del_specs_key, None)
+
+                    # Sauvegarde contexte métier
+                    if ok:
+                        _new_biz = dict(biz)
+                        for _sk_biz in ("accessories", "consumables", "associated_items", "condition_notes"):
+                            _del_biz_key = f"del_biz_{eq_id}_{_sk_biz}"
+                            _del_b = st.session_state.get(_del_biz_key, set())
+                            _alt_keys2 = {"accessories": "accessoires",
+                                          "consumables": "consommables",
+                                          "associated_items": "elements_associes",
+                                          "condition_notes": "constats"}
+                            _items_b = biz.get(_sk_biz) or biz.get(_alt_keys2.get(_sk_biz, ""), [])
+                            if isinstance(_items_b, str):
+                                _items_b = [_items_b] if _items_b else []
+                            if not isinstance(_items_b, list):
+                                _items_b = []
+                            _new_list = []
+                            for _i_b in range(len(_items_b)):
+                                if _i_b in _del_b:
+                                    continue
+                                _raw_val = st.session_state.get(
+                                    f"biz_{eq_id}_{_sk_biz}_{_i_b}",
+                                    _items_b[_i_b] if isinstance(_items_b[_i_b], str)
+                                    else json.dumps(_items_b[_i_b], ensure_ascii=False)
+                                ).strip()
+                                if _raw_val:
+                                    try:
+                                        _new_list.append(json.loads(_raw_val))
+                                    except Exception:
+                                        _new_list.append(_raw_val)
+                            _new_biz[_sk_biz] = _new_list
+                            st.session_state.pop(_del_biz_key, None)
+                        run_write("UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
+                                  [json.dumps(_new_biz, ensure_ascii=False), eq_id])
+
+                    if ok:
                         _changed = ", ".join(filter(None, [
-                            "label"          if f_label    != null_str(row.get("label"),          "") else "",
-                            "brand"          if f_brand    != null_str(row.get("brand"),          "") else "",
-                            "model"          if f_model    != null_str(row.get("model"),          "") else "",
-                            "serial_number"  if f_serial   != null_str(row.get("serial_number"),  "") else "",
-                            "subtype"        if f_subtype  != null_str(row.get("subtype"),         "") else "",
-                            "condition"      if f_condition!= null_str(row.get("condition_label"), "") else "",
-                            "location"       if f_location != null_str(row.get("location_hint"),  "") else "",
-                            "notes"          if f_notes    != null_str(row.get("notes"),          "") else "",
+                            "label"         if sv_label    != null_str(row.get("label"),          "") else "",
+                            "brand"         if sv_brand    != null_str(row.get("brand"),          "") else "",
+                            "model"         if sv_model    != null_str(row.get("model"),          "") else "",
+                            "serial_number" if sv_serial   != null_str(row.get("serial_number"),  "") else "",
+                            "subtype"       if sv_subtype  != null_str(row.get("subtype"),         "") else "",
+                            "condition"     if sv_cond     != null_str(row.get("condition_label"), "") else "",
+                            "location"      if sv_loc      != null_str(row.get("location_hint"),  "") else "",
+                            "notes"         if sv_notes    != null_str(row.get("notes"),          "") else "",
+                            "specs/biz",
                         ])) or "aucun changement détecté"
                         run_write("""
                             INSERT INTO equipment_audit
                                 (audit_id, equipment_id, action, changed_fields, operator)
                             VALUES (?, ?, 'UPDATE', ?, ?)
-                        """, [
-                            str(uuid.uuid4()), eq_id, _changed,
-                            get_current_user(),
-                        ])
+                        """, [str(uuid.uuid4()), eq_id, _changed, get_current_user()])
                         st.success("✅ Équipement validé et mis à jour.")
-                        st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
 
                 # ── Bouton Supprimer avec confirmation ─────────────
+                st.markdown("---")
                 folder_id_for_del = null_str(row.get("final_drive_folder_id"), "")
                 confirm_key = f"confirm_del_{eq_id}"
 
@@ -947,27 +1169,21 @@ def render_validation():
                         run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [eq_id])
                         run_write("DELETE FROM equipment WHERE equipment_id = ?", [eq_id])
                         if folder_id_for_del:
-                            drive_ok = trash_drive_folder(folder_id_for_del)
+                            drive_ok = call_delete_equipment_webhook(
+                                folder_id_for_del, eq_id,
+                                null_str(row.get("label"), "Équipement"),
+                            )
                             if drive_ok:
                                 st.info("📁 Dossier Drive déplacé à la corbeille.")
                             else:
                                 st.warning("⚠️ Suppression DB OK mais le dossier Drive n'a pas pu être mis à la corbeille.")
                         st.session_state.pop(confirm_key, None)
-                        st.cache_data.clear()
                         _finish_edit()
                         st.rerun()
                     if c2.button("↩ Annuler", key=f"del_no_{eq_id}"):
                         st.session_state.pop(confirm_key, None)
                         _finish_edit()
                         st.rerun()
-
-                # Specs techniques (lecture seule)
-                specs = safe_json(row.get("technical_specs_json"), {})
-                if specs:
-                    st.markdown("---")
-                    st.markdown("**Spécifications techniques**")
-                    for k, v in specs.items():
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;• **{k}** : {v}")
 
                 # Lien Drive
                 folder_url = drive_folder_url(row.get("final_drive_folder_id"))
@@ -1227,32 +1443,54 @@ def show_equipment_modal(equipment_id: str):
 
     # ── Photos ────────────────────────────────────────────────
     with left_col:
-        st.markdown("**Photos**")
+        zoom_key = f"modal_zoom_{equipment_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
+
         if not media_df.empty:
-            # Photo principale
-            main = media_df.iloc[0]
-            fid  = main.get("final_drive_file_id")
-            if fid:
+            if zoomed_fid:
+                # ── Vue agrandie (pleine largeur) ─────────────
                 try:
-                    st.image(drive_img_src(fid, 700), use_container_width=True)
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
                 except Exception:
-                    st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
-            # Galerie toutes les photos restantes (3 par ligne)
-            remaining = media_df.iloc[1:]
-            for chunk_start in range(0, len(remaining), 3):
-                chunk = remaining.iloc[chunk_start:chunk_start + 3]
-                cols = st.columns(3)
-                for j, (_, m) in enumerate(chunk.iterrows()):
-                    fid2 = m.get("final_drive_file_id")
-                    if fid2:
-                        try:
-                            cols[j].image(
-                                drive_img_src(fid2, 250),
-                                use_container_width=True,
-                                caption=null_str(m.get("image_role")),
-                            )
-                        except Exception:
-                            cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                # pas de st.rerun() — le clic garde la modale ouverte
+                if st.button("✖ Fermer l'agrandissement", key=f"zoom_close_{equipment_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                # ── Galerie ───────────────────────────────────
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"zoom_main_{equipment_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
+
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=800, quality=80),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"zoom_{equipment_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
             st.info("Aucune image disponible.")
 
@@ -1477,6 +1715,7 @@ def show_equipment_modal(equipment_id: str):
             st.session_state["edit_equipment_id"] = equipment_id
             st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
             st.session_state["_nav_request"] = "⚠ Centre de Validation"
+            st.toast("⏳ Chargement de la vue modification…")
             st.rerun()
         # Bouton suppression avec double confirmation
         # Note : pas de st.rerun() sur les états intermédiaires — dans un st.dialog,
@@ -1493,7 +1732,10 @@ def show_equipment_modal(equipment_id: str):
                 run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
                 run_write("DELETE FROM equipment WHERE equipment_id = ?", [equipment_id])
                 if folder_id and folder_id != "—":
-                    trash_drive_folder(folder_id)
+                    call_delete_equipment_webhook(
+                        folder_id, equipment_id,
+                        null_str(row.get("label"), "Équipement"),
+                    )
                 st.session_state.pop(del_key, None)
                 st.rerun()  # Ferme la modale + rafraîchit le parc après suppression
             if col_no.button("✗", key=f"del_no_{equipment_id}", use_container_width=True):
@@ -1608,18 +1850,31 @@ def render_parc_materiel():
         st.info("Aucun équipement ne correspond à votre recherche.")
         return
 
+    # ── Pagination : 20 items par page, chargés progressivement ─
+    PAGE_SIZE = 20
+    _page_key = "parc_page"
+    # Réinitialise la pagination quand les filtres changent
+    _filter_sig = f"{search}|{sel_brands}|{sel_subtypes}|{sel_conds}|{show_review_only}"
+    if st.session_state.get("_parc_filter_sig") != _filter_sig:
+        st.session_state[_page_key] = 1
+        st.session_state["_parc_filter_sig"] = _filter_sig
+    current_page = st.session_state.get(_page_key, 1)
+    shown = current_page * PAGE_SIZE
+    display_df = results_df.iloc[:shown]
+
     # ── Affichage en grille 5 colonnes ─────────────────────────
     COLS = 5
-    rows = [results_df.iloc[i:i+COLS] for i in range(0, len(results_df), COLS)]
+    rows = [display_df.iloc[i:i+COLS] for i in range(0, len(display_df), COLS)]
 
     for chunk in rows:
         cols = st.columns(COLS)
         for col_idx, (_, item) in enumerate(chunk.iterrows()):
             with cols[col_idx]:
-                # Photo miniature compressée (160px, JPEG q=55)
+                # Photo miniature (800px, JPEG q=80) : affichage petit en carte,
+                # qualité suffisante pour le mode Fullscreen natif Streamlit
                 file_id = item.get("main_file_id")
                 if file_id and str(file_id) not in ("nan", "None", ""):
-                    thumb = get_drive_thumb(file_id, max_px=160)
+                    thumb = get_drive_thumb(file_id, max_px=800, quality=80)
                     if thumb:
                         st.image(thumb, use_container_width=True)
                     else:
@@ -1695,7 +1950,35 @@ def render_parc_materiel():
                             st.session_state["loan_basket"][eid] = _display_name(item)
                         st.rerun()
 
+                # Bouton validation rapide (visible uniquement si review_required)
+                if is_admin() and item.get("review_required"):
+                    if st.button("⚡ Valider", key=f"qval_{eid}", use_container_width=True,
+                                 help="Valider cette fiche directement sans la modifier"):
+                        ok = run_write(
+                            "UPDATE equipment SET review_required = false WHERE equipment_id = ?", [eid]
+                        )
+                        if ok:
+                            run_write("""
+                                INSERT INTO equipment_audit
+                                    (audit_id, equipment_id, action, changed_fields, operator)
+                                VALUES (?, ?, 'VALIDATE', 'review_required', ?)
+                            """, [str(uuid.uuid4()), eid, get_current_user()])
+                            st.rerun()
+
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
+
+    # ── Bouton "Charger la suite" ───────────────────────────────
+    if shown < nb:
+        remaining = nb - shown
+        if st.button(
+            f"⬇ Charger la suite ({remaining} équipement(s) restant(s))",
+            key="parc_load_more",
+            use_container_width=True,
+        ):
+            st.session_state[_page_key] = current_page + 1
+            st.rerun()
+    else:
+        st.caption(f"✓ Tous les {nb} équipements affichés.")
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 4 : JOURNAL DES ACCÈS (logs Traefik)
