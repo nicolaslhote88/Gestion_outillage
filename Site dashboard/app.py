@@ -368,21 +368,50 @@ def drive_thumbnail_url(file_id: str, size: int = 400) -> str:
     return f"https://drive.google.com/thumbnail?id={file_id}&sz=w{size}"
 
 
+@st.cache_resource
+def _drive_service_ro():
+    """Service Google Drive lecture seule, mis en cache pour toute la session Streamlit.
+    Évite de reconstruire la connexion (Credentials + HTTP discovery) à chaque image."""
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        )
+        return _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_SVC_RO] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None
+
+
+@st.cache_resource
+def _drive_service_rw():
+    """Service Google Drive lecture/écriture, mis en cache pour toute la session."""
+    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
+    if not Path(sa_path).exists():
+        return None
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_SVC_RW] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None
+
+
 def trash_drive_folder(folder_id: str) -> bool:
     """Déplace un dossier Drive à la corbeille via service account.
     Retourne True si succès, False sinon."""
     if not folder_id or str(folder_id) in ("nan", "None", ""):
         return False
-    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
-    if not Path(sa_path).exists():
+    svc = _drive_service_rw()
+    if svc is None:
         return False
     try:
-        import sys
-        creds = service_account.Credentials.from_service_account_file(
-            sa_path,
-            scopes=["https://www.googleapis.com/auth/drive"],
-        )
-        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
         svc.files().update(
             fileId=folder_id,
             body={"trashed": True},
@@ -390,6 +419,7 @@ def trash_drive_folder(folder_id: str) -> bool:
         ).execute()
         return True
     except Exception as e:
+        import sys
         print(f"[DRIVE_TRASH] folder_id={folder_id} → {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return False
 
@@ -439,21 +469,17 @@ def drive_folder_url(folder_id: str) -> str:
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=7200, show_spinner=False)
 def get_drive_image_bytes(file_id: str) -> bytes | None:
-    """Télécharge une image Drive côté serveur via service account.
-    Retourne None si le service account n'est pas configuré (fallback URL)."""
+    """Télécharge une image Drive côté serveur via service account mis en cache.
+    Retourne None si le service account n'est pas configuré (fallback URL).
+    TTL 2h — le service Drive est mis en cache via _drive_service_ro()."""
     if not file_id or str(file_id) in ("nan", "None", ""):
         return None
-    sa_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
-    if not Path(sa_path).exists():
+    svc = _drive_service_ro()
+    if svc is None:
         return None
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            sa_path,
-            scopes=["https://www.googleapis.com/auth/drive.readonly"],
-        )
-        svc = _build_gdrive("drive", "v3", credentials=creds, cache_discovery=False)
         return svc.files().get_media(fileId=file_id, supportsAllDrives=True).execute()
     except Exception as e:
         import sys
@@ -941,8 +967,9 @@ def render_validation():
                                            key=f"sk_{eq_id}_{_sk}", label_visibility="collapsed")
                             _c2.text_input("Valeur", value=str(_sv),
                                            key=f"sv_{eq_id}_{_sk}", label_visibility="collapsed")
-                            if _c3.button("🗑", key=f"sdel_{eq_id}_{_sk}", help="Marquer pour suppression"):
+                            if _c3.button("🗑", key=f"sdel_{eq_id}_{_sk}", help="Supprimer cette spec"):
                                 st.session_state[_del_specs_key].add(_sk)
+                                st.rerun()  # force re-render pour masquer la ligne immédiatement
                     else:
                         st.caption("Aucune spécification technique.")
                     if st.button("🗑 Tout effacer les specs", key=f"clear_specs_{eq_id}"):
@@ -984,8 +1011,9 @@ def render_validation():
                                            key=f"biz_{eq_id}_{section_key}_{_orig_idx}",
                                            height=60, label_visibility="collapsed")
                             if _bc2.button("🗑", key=f"bizdel_{eq_id}_{section_key}_{_orig_idx}",
-                                           help="Marquer pour suppression"):
+                                           help="Supprimer cet élément"):
                                 st.session_state[_del_biz_key].add(_orig_idx)
+                                st.rerun()  # force re-render pour masquer l'item immédiatement
 
                         if active_count == 0:
                             st.caption("Aucun élément.")
@@ -1688,6 +1716,7 @@ def show_equipment_modal(equipment_id: str):
             st.session_state["edit_equipment_id"] = equipment_id
             st.session_state["edit_return_to"] = st.session_state.get("nav_radio", "🏭 Parc Matériel")
             st.session_state["_nav_request"] = "⚠ Centre de Validation"
+            st.toast("⏳ Chargement de la vue modification…")
             st.rerun()
         # Bouton suppression avec double confirmation
         # Note : pas de st.rerun() sur les états intermédiaires — dans un st.dialog,
@@ -1822,9 +1851,21 @@ def render_parc_materiel():
         st.info("Aucun équipement ne correspond à votre recherche.")
         return
 
+    # ── Pagination : 20 items par page, chargés progressivement ─
+    PAGE_SIZE = 20
+    _page_key = "parc_page"
+    # Réinitialise la pagination quand les filtres changent
+    _filter_sig = f"{search}|{sel_brands}|{sel_subtypes}|{sel_conds}|{show_review_only}"
+    if st.session_state.get("_parc_filter_sig") != _filter_sig:
+        st.session_state[_page_key] = 1
+        st.session_state["_parc_filter_sig"] = _filter_sig
+    current_page = st.session_state.get(_page_key, 1)
+    shown = current_page * PAGE_SIZE
+    display_df = results_df.iloc[:shown]
+
     # ── Affichage en grille 5 colonnes ─────────────────────────
     COLS = 5
-    rows = [results_df.iloc[i:i+COLS] for i in range(0, len(results_df), COLS)]
+    rows = [display_df.iloc[i:i+COLS] for i in range(0, len(display_df), COLS)]
 
     for chunk in rows:
         cols = st.columns(COLS)
@@ -1926,6 +1967,19 @@ def render_parc_materiel():
                             st.rerun()
 
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
+
+    # ── Bouton "Charger la suite" ───────────────────────────────
+    if shown < nb:
+        remaining = nb - shown
+        if st.button(
+            f"⬇ Charger la suite ({remaining} équipement(s) restant(s))",
+            key="parc_load_more",
+            use_container_width=True,
+        ):
+            st.session_state[_page_key] = current_page + 1
+            st.rerun()
+    else:
+        st.caption(f"✓ Tous les {nb} équipements affichés.")
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 4 : JOURNAL DES ACCÈS (logs Traefik)
