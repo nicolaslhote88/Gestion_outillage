@@ -17,7 +17,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// ── Auth check ──────────────────────────────────────────────\nconst SHARED_SECRET = 'TON_SECRET_ICI'; // à remplacer en prod\nconst body    = $input.first().json.body || $input.first().json;\nconst headers = $input.first().json.headers || {};\n\nconst provided =\n  headers['x-siga-shared-secret'] ||\n  (headers['authorization'] || '').replace(/^Bearer\\s+/i, '');\n\nif (provided !== SHARED_SECRET) {\n  return [{ json: { ok: false, error: 'Unauthorized', code: 401 } }];\n}\n\n// ── Validate payload ────────────────────────────────────────\nconst folder_id    = body.folder_id   || null;\nconst equipment_id = body.equipment_id || null;\nconst label        = body.label       || 'Équipement inconnu';\n\nif (!folder_id) {\n  return [{ json: { ok: false, error: 'folder_id manquant dans le payload', code: 400 } }];\n}\n\nreturn [{\n  json: {\n    ok: true,\n    folder_id,\n    equipment_id,\n    label,\n    authorized: true\n  }\n}];"
+        "jsCode": "// ── Auth + validation payload ───────────────────────────────\n// Si auth KO ou payload invalide → throw → output erreur → Respond Error\n// Si tout OK → return payload → Trash Drive Folder\n\nconst SHARED_SECRET = 'TON_SECRET_ICI'; // à remplacer en prod\n\nconst body    = $input.first().json.body || $input.first().json;\nconst headers = $input.first().json.headers || {};\n\nconst provided =\n  headers['x-siga-shared-secret'] ||\n  (headers['authorization'] || '').replace(/^Bearer\\s+/i, '');\n\nif (provided !== SHARED_SECRET) {\n  throw new Error(JSON.stringify({ ok: false, error: 'Unauthorized', code: 401 }));\n}\n\nconst folder_id    = body.folder_id    || null;\nconst equipment_id = body.equipment_id || null;\nconst label        = body.label        || 'Équipement inconnu';\n\nif (!folder_id) {\n  throw new Error(JSON.stringify({ ok: false, error: 'folder_id manquant dans le payload', code: 400 }));\n}\n\nreturn [{ json: { ok: true, folder_id, equipment_id, label } }];"
       },
       "id": "validate-payload",
       "name": "Validate Payload",
@@ -27,39 +27,10 @@
     },
     {
       "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "id": "auth-ok",
-              "leftValue": "={{ $json.authorized }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equal"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "check-authorized",
-      "name": "Check Authorized",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [680, 300]
-    },
-    {
-      "parameters": {
         "operation": "update",
         "fileId": {
           "mode": "expression",
-          "value": "={{ $('Validate Payload').item.json.folder_id }}"
+          "value": "={{ $json.folder_id }}"
         },
         "updateFields": {
           "trashed": true
@@ -69,7 +40,7 @@
       "name": "Trash Drive Folder",
       "type": "n8n-nodes-base.googleDrive",
       "typeVersion": 3,
-      "position": [900, 200],
+      "position": [680, 180],
       "credentials": {
         "googleDriveOAuth2Api": {
           "id": "google-drive-account",
@@ -85,7 +56,7 @@
       "name": "Build Success Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1120, 200]
+      "position": [900, 180]
     },
     {
       "parameters": {
@@ -99,14 +70,24 @@
       "name": "Respond Success",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
-      "position": [1340, 200]
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse l'erreur lancée par Validate Payload ou Trash Drive Folder\nlet body = { ok: false, error: 'Erreur inconnue', code: 500 };\ntry {\n  const msg = $input.first().json.message || $input.first().json.error?.message || '';\n  const parsed = JSON.parse(msg);\n  if (parsed && parsed.error) body = parsed;\n} catch (e) {\n  body.error = $input.first().json.message || 'Erreur interne';\n}\nreturn [{ json: body }];"
+      },
+      "id": "build-error-response",
+      "name": "Build Error Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 420]
     },
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ ok: false, error: $('Validate Payload').item.json.error || 'Unauthorized', code: $('Validate Payload').item.json.code || 401 }) }}",
+        "responseBody": "={{ JSON.stringify($json) }}",
         "options": {
-          "responseCode": 401
+          "responseCode": "={{ $json.code || 500 }}"
         }
       },
       "id": "respond-error",
@@ -114,20 +95,6 @@
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1,
       "position": [900, 420]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ ok: false, error: 'Drive folder deletion failed: ' + $json.message, code: 500 }) }}",
-        "options": {
-          "responseCode": 500
-        }
-      },
-      "id": "respond-drive-error",
-      "name": "Respond Drive Error",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1,
-      "position": [1340, 380]
     }
   ],
   "connections": {
@@ -146,25 +113,16 @@
       "main": [
         [
           {
-            "node": "Check Authorized",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Check Authorized": {
-      "main": [
-        [
-          {
             "node": "Trash Drive Folder",
             "type": "main",
             "index": 0
           }
-        ],
+        ]
+      ],
+      "error": [
         [
           {
-            "node": "Respond Error",
+            "node": "Build Error Response",
             "type": "main",
             "index": 0
           }
@@ -184,7 +142,7 @@
       "error": [
         [
           {
-            "node": "Respond Drive Error",
+            "node": "Build Error Response",
             "type": "main",
             "index": 0
           }
@@ -196,6 +154,17 @@
         [
           {
             "node": "Respond Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Response": {
+      "main": [
+        [
+          {
+            "node": "Respond Error",
             "type": "main",
             "index": 0
           }
@@ -214,5 +183,5 @@
   "tags": ["SIGA", "Drive", "Delete", "Webhook"],
   "triggerCount": 0,
   "updatedAt": "2026-03-19T00:00:00.000Z",
-  "versionId": "1"
+  "versionId": "2"
 }
