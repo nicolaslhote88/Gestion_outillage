@@ -424,14 +424,15 @@ def trash_drive_folder(folder_id: str) -> bool:
         return False
 
 
+_DELETE_WEBHOOK_URL    = ""             # URL du webhook n8n — à renseigner en prod
+_DELETE_WEBHOOK_SECRET = "TON_SECRET_ICI"  # secret partagé — à changer en prod
+
+
 def call_delete_equipment_webhook(folder_id: str, equipment_id: str = "", label: str = "") -> bool:
     """Appelle le webhook n8n de suppression du dossier Drive d'un équipement.
-    URL configurée via la variable d'environnement SIGA_DELETE_WEBHOOK_URL.
-    Retourne True si le webhook répond ok:true, False sinon (ou si non configuré).
-    Fallback automatique sur trash_drive_folder() si webhook non configuré."""
-    webhook_url = os.environ.get("SIGA_DELETE_WEBHOOK_URL", "").strip()
+    Fallback automatique sur trash_drive_folder() si l'URL n'est pas configurée."""
+    webhook_url = _DELETE_WEBHOOK_URL.strip()
     if not webhook_url:
-        # Aucun webhook configuré → fallback direct
         return trash_drive_folder(folder_id)
 
     payload = {
@@ -439,10 +440,10 @@ def call_delete_equipment_webhook(folder_id: str, equipment_id: str = "", label:
         "equipment_id": equipment_id,
         "label": label,
     }
-    secret = os.environ.get("SIGA_WEBHOOK_SECRET") or os.environ.get("SIGA_SHARED_SECRET")
-    headers = {"Content-Type": "application/json"}
-    if secret:
-        headers["X-SIGA-Shared-Secret"] = secret
+    headers = {
+        "Content-Type": "application/json",
+        "X-SIGA-Shared-Secret": _DELETE_WEBHOOK_SECRET,
+    }
 
     try:
         resp = requests.post(webhook_url, json=payload, headers=headers, timeout=15)
