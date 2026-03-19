@@ -1443,34 +1443,54 @@ def show_equipment_modal(equipment_id: str):
 
     # ── Photos ────────────────────────────────────────────────
     with left_col:
-        st.markdown("**Photos** — *utilisez le bouton ⛶ pour agrandir*")
+        zoom_key = f"modal_zoom_{equipment_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
 
         if not media_df.empty:
-            # Photo principale
-            main = media_df.iloc[0]
-            fid  = main.get("final_drive_file_id")
-            if fid:
+            if zoomed_fid:
+                # ── Vue agrandie (pleine largeur) ─────────────
                 try:
-                    st.image(get_drive_thumb(fid, max_px=800, quality=80), use_container_width=True)
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
                 except Exception:
-                    st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                # pas de st.rerun() — le clic garde la modale ouverte
+                if st.button("✖ Fermer l'agrandissement", key=f"zoom_close_{equipment_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                # ── Galerie ───────────────────────────────────
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"zoom_main_{equipment_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
 
-            # Galerie toutes les photos restantes (3 par ligne)
-            remaining = media_df.iloc[1:]
-            for chunk_start in range(0, len(remaining), 3):
-                chunk = remaining.iloc[chunk_start:chunk_start + 3]
-                cols = st.columns(3)
-                for j, (_, m) in enumerate(chunk.iterrows()):
-                    fid2 = m.get("final_drive_file_id")
-                    if fid2:
-                        try:
-                            cols[j].image(
-                                get_drive_thumb(fid2, max_px=800, quality=80),
-                                use_container_width=True,
-                                caption=null_str(m.get("image_role")),
-                            )
-                        except Exception:
-                            cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=800, quality=80),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"zoom_{equipment_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
             st.info("Aucune image disponible.")
 
