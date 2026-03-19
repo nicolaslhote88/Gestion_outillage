@@ -424,7 +424,7 @@ def trash_drive_folder(folder_id: str) -> bool:
         return False
 
 
-_DELETE_WEBHOOK_URL    = ""             # URL du webhook n8n — à renseigner en prod
+_DELETE_WEBHOOK_URL    = "https://n8n.srv961978.hstgr.cloud/webhook/siga-delete-equipment-folder"
 _DELETE_WEBHOOK_SECRET = "TON_SECRET_ICI"  # secret partagé — à changer en prod
 
 
