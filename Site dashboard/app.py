@@ -1443,51 +1443,34 @@ def show_equipment_modal(equipment_id: str):
 
     # ── Photos ────────────────────────────────────────────────
     with left_col:
-        st.markdown("**Photos** — *cliquez pour agrandir*")
-        zoom_key = f"modal_zoom_{equipment_id}"
-        zoomed_fid = st.session_state.get(zoom_key)
+        st.markdown("**Photos** — *utilisez le bouton ⛶ pour agrandir*")
 
         if not media_df.empty:
-            if zoomed_fid:
-                # ── Vue agrandie ──────────────────────────────
+            # Photo principale
+            main = media_df.iloc[0]
+            fid  = main.get("final_drive_file_id")
+            if fid:
                 try:
-                    st.image(drive_img_src(zoomed_fid, 1400), use_container_width=True)
+                    st.image(get_drive_thumb(fid, max_px=800, quality=80), use_container_width=True)
                 except Exception:
-                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
-                if st.button("✖ Fermer l'agrandissement", key=f"zoom_close_{equipment_id}", use_container_width=True):
-                    st.session_state.pop(zoom_key, None)
-                    # pas de st.rerun() — le clic de bouton dans un @st.dialog déclenche
-                    # automatiquement un re-render partiel sans fermer la modale
-            else:
-                # ── Vue galerie normale ───────────────────────
-                main = media_df.iloc[0]
-                fid  = main.get("final_drive_file_id")
-                if fid:
-                    try:
-                        st.image(drive_img_src(fid, 700), use_container_width=True)
-                    except Exception:
-                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
-                    if st.button("🔍 Agrandir", key=f"zoom_main_{equipment_id}", use_container_width=True):
-                        st.session_state[zoom_key] = fid
+                    st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
 
-                # Galerie toutes les photos restantes (3 par ligne)
-                remaining = media_df.iloc[1:]
-                for chunk_start in range(0, len(remaining), 3):
-                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
-                    cols = st.columns(3)
-                    for j, (_, m) in enumerate(chunk.iterrows()):
-                        fid2 = m.get("final_drive_file_id")
-                        if fid2:
-                            try:
-                                cols[j].image(
-                                    drive_img_src(fid2, 250),
-                                    use_container_width=True,
-                                    caption=null_str(m.get("image_role")),
-                                )
-                                if cols[j].button("🔍", key=f"zoom_{equipment_id}_{fid2}", use_container_width=True):
-                                    st.session_state[zoom_key] = fid2
-                            except Exception:
-                                cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
+            # Galerie toutes les photos restantes (3 par ligne)
+            remaining = media_df.iloc[1:]
+            for chunk_start in range(0, len(remaining), 3):
+                chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                cols = st.columns(3)
+                for j, (_, m) in enumerate(chunk.iterrows()):
+                    fid2 = m.get("final_drive_file_id")
+                    if fid2:
+                        try:
+                            cols[j].image(
+                                get_drive_thumb(fid2, max_px=800, quality=80),
+                                use_container_width=True,
+                                caption=null_str(m.get("image_role")),
+                            )
+                        except Exception:
+                            cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
             st.info("Aucune image disponible.")
 
