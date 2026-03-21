@@ -1,6 +1,8 @@
 streamlit>=1.32.0
+streamlit-autorefresh>=1.0.1
 duckdb>=0.10.0
 pandas>=2.0.0
 plotly>=5.18.0
 google-auth>=2.0.0
 google-api-python-client>=2.0.0
+mcp[cli]>=1.0.0
