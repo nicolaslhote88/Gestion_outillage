@@ -30,12 +30,14 @@ ou
     python api_server.py
 """
 
+import json
 import os
 import time
 import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
-from typing import List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import duckdb
 import pandas as pd
@@ -53,6 +55,9 @@ SCORE_MIN  = 0.25
 MAX_RESULTS = 20
 
 VALID_MOVEMENT_TYPES = {"LOAN", "RENTAL", "MAINTENANCE"}
+
+# Fichier JSON partagé avec le kiosque Streamlit — élimine tout polling DuckDB
+KIOSK_STATE_FILE = Path(DB_PATH).parent / "kiosk_state.json"
 
 # ─── Auth ─────────────────────────────────────────────────────
 security = HTTPBearer(auto_error=True)
@@ -125,6 +130,28 @@ def _run_write_many(statements: list[tuple], _retries: int = 5) -> None:
     )
 
 
+# ─── Transport kiosque (JSON file) ───────────────────────────
+
+def _write_kiosk_state(command_type: str, data: Dict[str, Any]) -> None:
+    """Écrit l'état courant du kiosque dans un fichier JSON (écriture atomique).
+
+    Le kiosque Streamlit lit ce fichier toutes les 2 s via le système de
+    fichiers — sans jamais ouvrir de connexion DuckDB — ce qui supprime
+    le verrou continu observé avec le polling sur ui_commands.
+    """
+    state = {
+        "command_type": command_type,
+        "updated_at": datetime.utcnow().isoformat(),
+        "data": data,
+    }
+    tmp = KIOSK_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(
+        json.dumps(state, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    tmp.replace(KIOSK_STATE_FILE)
+
+
 # ─── Scoring fuzzy ────────────────────────────────────────────
 
 def _score(query: str, row: dict) -> float:
@@ -182,6 +209,26 @@ class DisplayResponse(BaseModel):
     display_status: str
     screen: str
     message: str
+
+
+class DisplayGenericResponse(BaseModel):
+    ok: bool
+    command_type: str
+    display_status: str
+    screen: str
+    message: str
+
+
+class DisplayKitRequest(BaseModel):
+    kit_id: str
+
+
+class DisplayConfirmationRequest(BaseModel):
+    title: str
+    subtitle: str
+    details: List[str] = []
+    batch_id: Optional[str] = None
+    color: str = "green"  # "green" | "red" | "blue"
 
 
 class ErrorResponse(BaseModel):
@@ -968,10 +1015,33 @@ def display_equipment(
     body: DisplayRequest,
     _: None = Security(_require_token),
 ) -> DisplayResponse:
-    """Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5."""
+    """Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5.
+
+    Embarque les données équipement + prêts actifs dans le fichier JSON partagé
+    afin que le kiosque n'ait pas à interroger DuckDB lui-même.
+    """
     try:
-        exists_df = _run_query(
-            "SELECT equipment_id FROM equipment WHERE equipment_id = ? LIMIT 1",
+        eq_df = _run_query(
+            """
+            SELECT
+                e.equipment_id, e.label, e.brand, e.model, e.serial_number,
+                e.subtype, e.condition_label, e.location_hint, e.notes,
+                e.technical_specs_json,
+                (
+                    SELECT em.final_drive_file_id
+                    FROM equipment_media em
+                    WHERE em.equipment_id = e.equipment_id
+                    ORDER BY
+                        CASE em.image_role
+                            WHEN 'overview'  THEN 1
+                            WHEN 'nameplate' THEN 2
+                            ELSE 3
+                        END
+                    LIMIT 1
+                ) AS main_file_id
+            FROM equipment e
+            WHERE e.equipment_id = ?
+            """,
             [body.equipment_id],
         )
     except RuntimeError as e:
@@ -980,12 +1050,59 @@ def display_equipment(
             detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump(),
         ) from e
 
-    if exists_df.empty:
+    if eq_df.empty:
         raise HTTPException(
             status_code=404,
             detail=ErrorResponse(ok=False, error="equipment_not_found", equipment_id=body.equipment_id).model_dump(),
         )
 
+    # Prêts actifs
+    try:
+        loans_df = _run_query(
+            """
+            SELECT borrower_name, movement_type, out_date, expected_return_date
+            FROM equipment_movements
+            WHERE equipment_id = ? AND actual_return_date IS NULL
+            ORDER BY out_date DESC LIMIT 5
+            """,
+            [body.equipment_id],
+        )
+        loans = loans_df.to_dict("records")
+    except RuntimeError:
+        loans = []
+
+    row = eq_df.iloc[0]
+    specs_raw = row.get("technical_specs_json")
+    try:
+        specs = json.loads(specs_raw) if specs_raw and str(specs_raw) not in ("None", "nan") else {}
+    except Exception:
+        specs = {}
+
+    eq_data = {
+        "equipment_id": str(row.get("equipment_id") or ""),
+        "label":        str(row.get("label")        or ""),
+        "brand":        str(row.get("brand")        or ""),
+        "model":        str(row.get("model")        or ""),
+        "serial_number":str(row.get("serial_number")or ""),
+        "subtype":      str(row.get("subtype")      or ""),
+        "condition_label":str(row.get("condition_label") or ""),
+        "location_hint":str(row.get("location_hint") or ""),
+        "notes":        str(row.get("notes")        or ""),
+        "technical_specs": specs,
+        "main_file_id": str(row.get("main_file_id") or "") or None,
+        "loans": loans,
+    }
+
+    # Écrit dans le fichier JSON (transport sans DuckDB pour le kiosque)
+    try:
+        _write_kiosk_state("SHOW_EQUIPMENT", eq_data)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump(),
+        ) from e
+
+    # Audit trail DuckDB (optionnel — n'alimente plus le kiosque)
     command_id = str(uuid.uuid4())
     try:
         _run_write(
@@ -993,15 +1110,12 @@ def display_equipment(
             INSERT INTO ui_commands
                 (command_id, target_ui, command_type, payload, created_at, executed)
             VALUES
-                (?, 'atelier_pi_5', 'SHOW_EQUIPMENT', ?, CURRENT_TIMESTAMP, FALSE)
+                (?, 'atelier_pi_5', 'SHOW_EQUIPMENT', ?, CURRENT_TIMESTAMP, TRUE)
             """,
             [command_id, body.equipment_id],
         )
-    except RuntimeError as e:
-        raise HTTPException(
-            status_code=503,
-            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump(),
-        ) from e
+    except RuntimeError:
+        pass  # L'audit est best-effort ; le kiosque a déjà reçu la commande
 
     return DisplayResponse(
         ok=True,
@@ -1010,8 +1124,188 @@ def display_equipment(
         screen="atelier-main",
         message=(
             f"Commande d'affichage transmise à l'écran atelier. "
-            f"L'équipement '{body.equipment_id}' sera visible dans ≤ 2 s."
+            f"'{eq_data['label']}' sera visible dans ≤ 2 s."
         ),
+    )
+
+
+@app.post(
+    "/api/display/show-kit",
+    response_model=DisplayGenericResponse,
+    summary="Affiche le détail d'un kit sur l'écran kiosque",
+    tags=["Kiosque"],
+    responses={
+        404: {"model": ErrorResponse, "description": "Kit inconnu"},
+        503: {"model": ErrorResponse, "description": "Écran indisponible"},
+    },
+)
+def display_kit(
+    body: DisplayKitRequest,
+    _: None = Security(_require_token),
+) -> DisplayGenericResponse:
+    """Envoie une commande `SHOW_KIT` au kiosque : fiche kit + liste des outils."""
+    try:
+        kit_df = _run_query(
+            "SELECT kit_id, name, description FROM kits WHERE kit_id = ? LIMIT 1",
+            [body.kit_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404,
+            detail=ErrorResponse(ok=False, error="kit_not_found", kit_id=body.kit_id).model_dump())
+
+    try:
+        items_df = _run_query(
+            """
+            SELECT e.equipment_id, e.label, e.brand, e.model,
+                   e.condition_label, e.location_hint
+            FROM kit_items ki
+            JOIN equipment e ON e.equipment_id = ki.equipment_id
+            WHERE ki.kit_id = ?
+            ORDER BY e.label
+            """,
+            [body.kit_id],
+        )
+        items = items_df.to_dict("records")
+    except RuntimeError:
+        items = []
+
+    kit_row = kit_df.iloc[0]
+    kit_data = {
+        "kit_id":      str(kit_row.get("kit_id")      or ""),
+        "name":        str(kit_row.get("name")        or ""),
+        "description": str(kit_row.get("description") or ""),
+        "item_count":  len(items),
+        "items":       items,
+    }
+
+    try:
+        _write_kiosk_state("SHOW_KIT", kit_data)
+    except Exception as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    return DisplayGenericResponse(
+        ok=True,
+        command_type="SHOW_KIT",
+        display_status="sent",
+        screen="atelier-main",
+        message=f"Kit '{kit_data['name']}' ({len(items)} outil(s)) affiché sur l'écran atelier.",
+    )
+
+
+@app.post(
+    "/api/display/show-movements",
+    response_model=DisplayGenericResponse,
+    summary="Affiche le tableau des sorties en cours sur l'écran kiosque",
+    tags=["Kiosque"],
+    responses={503: {"model": ErrorResponse}},
+)
+def display_movements(
+    _: None = Security(_require_token),
+) -> DisplayGenericResponse:
+    """Envoie une commande `SHOW_MOVEMENTS_ACTIVE` au kiosque."""
+    try:
+        mv_df = _run_query(
+            """
+            SELECT
+                em.movement_id, em.equipment_id, e.label,
+                em.borrower_name, em.movement_type,
+                em.out_date, em.expected_return_date,
+                em.batch_id, em.kit_id,
+                k.name AS kit_name,
+                (em.expected_return_date IS NOT NULL
+                 AND em.expected_return_date < CURRENT_DATE) AS is_late
+            FROM equipment_movements em
+            JOIN equipment e ON e.equipment_id = em.equipment_id
+            LEFT JOIN kits k ON k.kit_id = em.kit_id
+            WHERE em.actual_return_date IS NULL
+            ORDER BY em.out_date DESC
+            """
+        )
+        items = mv_df.to_dict("records")
+    except RuntimeError as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    mv_data = {"count": len(items), "items": items}
+
+    try:
+        _write_kiosk_state("SHOW_MOVEMENTS_ACTIVE", mv_data)
+    except Exception as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    late = sum(1 for i in items if i.get("is_late"))
+    return DisplayGenericResponse(
+        ok=True,
+        command_type="SHOW_MOVEMENTS_ACTIVE",
+        display_status="sent",
+        screen="atelier-main",
+        message=f"{len(items)} sortie(s) en cours affichée(s) ({late} en retard).",
+    )
+
+
+@app.post(
+    "/api/display/show-confirmation",
+    response_model=DisplayGenericResponse,
+    summary="Affiche un écran de confirmation d'action sur le kiosque",
+    tags=["Kiosque"],
+    responses={503: {"model": ErrorResponse}},
+)
+def display_confirmation(
+    body: DisplayConfirmationRequest,
+    _: None = Security(_require_token),
+) -> DisplayGenericResponse:
+    """Affiche un écran de confirmation après une action OpenClaw (sortie, retour, création kit…)."""
+    data = {
+        "title":    body.title,
+        "subtitle": body.subtitle,
+        "details":  body.details,
+        "batch_id": body.batch_id,
+        "color":    body.color,
+    }
+    try:
+        _write_kiosk_state("SHOW_CONFIRMATION", data)
+    except Exception as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    return DisplayGenericResponse(
+        ok=True,
+        command_type="SHOW_CONFIRMATION",
+        display_status="sent",
+        screen="atelier-main",
+        message=f"Confirmation '{body.title}' affichée sur l'écran atelier.",
+    )
+
+
+@app.post(
+    "/api/display/clear",
+    response_model=DisplayGenericResponse,
+    summary="Repasse le kiosque en mode veille",
+    tags=["Kiosque"],
+    responses={503: {"model": ErrorResponse}},
+)
+def display_clear(
+    _: None = Security(_require_token),
+) -> DisplayGenericResponse:
+    """Efface l'affichage et repasse le kiosque sur l'écran de veille SIGA."""
+    try:
+        _write_kiosk_state("CLEAR_SCREEN", {})
+    except Exception as e:
+        raise HTTPException(status_code=503,
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump()) from e
+
+    return DisplayGenericResponse(
+        ok=True,
+        command_type="CLEAR_SCREEN",
+        display_status="sent",
+        screen="atelier-main",
+        message="Kiosque repassé en mode veille.",
     )
 
 

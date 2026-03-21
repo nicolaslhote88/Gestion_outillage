@@ -488,11 +488,17 @@ POST /api/kits/{kit_id}/checkin
 
 ## 4. Kiosque atelier
 
-### 4.1 Afficher un outil sur l'écran
+Le kiosque (Raspberry Pi 5, écran plein écran en atelier) reçoit les commandes via un fichier JSON partagé écrit par l'API. **Il ne touche plus du tout à DuckDB** pendant l'affichage — ce qui supprime le verrou qui rendait la base inutilisable.
+
+L'écran bascule en **≤ 2 secondes** après chaque appel. Toutes ces commandes sont réservées aux conversations **en atelier** (pas WhatsApp).
+
+---
+
+### 4.1 Afficher un outil
 ```
 POST /api/display/show
 ```
-**Quand l'utiliser :** L'utilisateur est à l'atelier et veut voir la fiche complète d'un outil sur le grand écran. Il dit « montre-moi la fiche de la meuleuse sur l'écran », « affiche cet outil »
+**Quand l'utiliser :** L'utilisateur veut voir la fiche d'un outil sur le grand écran. « Montre-moi la meuleuse », « affiche la fiche de la perceuse »
 
 **Corps :**
 ```json
@@ -508,14 +514,112 @@ POST /api/display/show
   "equipment_id": "uuid-eq-...",
   "display_status": "sent",
   "screen": "atelier-main",
-  "message": "Commande d'affichage transmise à l'écran atelier. L'équipement 'uuid-eq-...' sera visible dans ≤ 2 s."
+  "message": "Meuleuse d'angle 125mm sera visible dans ≤ 2 s."
 }
 ```
 
-**Points clés :**
-- La commande est envoyée au Raspberry Pi 5 de l'atelier via la table `ui_commands`
-- L'écran bascule automatiquement en moins de 2 secondes
-- Ne pas appeler si l'utilisateur est sur WhatsApp (inutile) — réservé aux conversations atelier
+**Ce qui s'affiche :** fiche complète — image, marque/modèle, état, spécifications techniques, emplacement, statut de disponibilité (libre ou sorti par qui/jusqu'à quand).
+
+---
+
+### 4.2 Afficher un kit
+```
+POST /api/display/show-kit
+```
+**Quand l'utiliser :** L'utilisateur veut voir le contenu d'un kit sur l'écran. « Affiche le kit plomberie », « montre ce qu'il y a dans la caisse »
+
+**Corps :**
+```json
+{
+  "kit_id": "uuid-kit-..."
+}
+```
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "command_type": "SHOW_KIT",
+  "display_status": "sent",
+  "screen": "atelier-main",
+  "message": "Kit 'Caisse Plomberie Urgence' (8 outil(s)) affiché sur l'écran atelier."
+}
+```
+
+**Ce qui s'affiche :** nom du kit, description, liste de tous les outils (label, marque/modèle, état, emplacement) en grille 2 colonnes.
+
+---
+
+### 4.3 Afficher les sorties en cours
+```
+POST /api/display/show-movements
+```
+**Quand l'utiliser :** L'utilisateur veut voir en un coup d'œil ce qui est sorti. « Montre les sorties en cours sur l'écran », « affiche l'état des prêts »
+
+**Pas de corps** (aucun paramètre requis).
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "command_type": "SHOW_MOVEMENTS_ACTIVE",
+  "display_status": "sent",
+  "screen": "atelier-main",
+  "message": "4 sortie(s) en cours affichée(s) (1 en retard)."
+}
+```
+
+**Ce qui s'affiche :** tableau de toutes les sorties actives — outil, emprunteur, type, date de sortie, retour prévu, badge « EN RETARD » si la date est dépassée.
+
+---
+
+### 4.4 Afficher une confirmation d'action
+```
+POST /api/display/show-confirmation
+```
+**Quand l'utiliser :** Après une action importante (sortie enregistrée, retour confirmé, kit créé) pour que l'utilisateur en atelier voie la confirmation sur le grand écran.
+
+**Corps :**
+```json
+{
+  "title":    "Sortie enregistrée",
+  "subtitle": "2 outil(s) pour Entreprise Martin",
+  "details":  ["Perceuse visseuse 18V", "Meuleuse d'angle 125mm"],
+  "batch_id": "uuid-batch-...",
+  "color":    "green"
+}
+```
+
+| Champ | Obligatoire | Valeurs |
+|---|---|---|
+| `title` | Oui | Titre principal affiché en grand |
+| `subtitle` | Non | Sous-titre (emprunteur, quantité…) |
+| `details` | Non | Liste d'outils ou de détails |
+| `batch_id` | Non | Affiché en bas pour référence |
+| `color` | Non (défaut : `green`) | `green` · `red` · `blue` |
+
+**Couleurs :** `green` = succès, `red` = alerte / problème, `blue` = information
+
+---
+
+### 4.5 Repasser en veille
+```
+POST /api/display/clear
+```
+**Quand l'utiliser :** Effacer l'écran et revenir au screensaver SIGA. « Efface l'écran », « repasse en veille »
+
+**Pas de corps.**
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "command_type": "CLEAR_SCREEN",
+  "display_status": "sent",
+  "screen": "atelier-main",
+  "message": "Kiosque repassé en mode veille."
+}
+```
 
 ---
 
@@ -556,7 +660,11 @@ GET /api/health
 | PUT | `/api/kits/{id}/content` | Oui | Redéfinir le contenu |
 | POST | `/api/kits/{id}/checkout` | Oui | Sortir un kit |
 | POST | `/api/kits/{id}/checkin` | Oui | Rentrer un kit |
-| POST | `/api/display/show` | Oui | Afficher sur kiosque |
+| POST | `/api/display/show` | Oui | Afficher fiche outil sur kiosque |
+| POST | `/api/display/show-kit` | Oui | Afficher fiche kit sur kiosque |
+| POST | `/api/display/show-movements` | Oui | Afficher sorties en cours sur kiosque |
+| POST | `/api/display/show-confirmation` | Oui | Afficher écran de confirmation |
+| POST | `/api/display/clear` | Oui | Repasser le kiosque en veille |
 
 ---
 
@@ -617,7 +725,31 @@ GET /api/health
 
 ```
 1. GET /api/equipment/search?q=<outil>    → trouver l'equipment_id
-2. POST /api/display/show                 → afficher sur l'écran
+2. POST /api/display/show                 → afficher sur l'écran (fiche + disponibilité)
+```
+
+### Situation H — Afficher un kit avant de le sortir
+
+```
+1. GET /api/kits                          → choisir le kit
+2. POST /api/display/show-kit             → montrer le contenu sur l'écran
+3. POST /api/kits/{id}/checkout           → valider la sortie
+4. POST /api/display/show-confirmation    → confirmer sur l'écran
+   { title: "Kit sorti", subtitle: "...", color: "green" }
+```
+
+### Situation I — Confirmer une action sur l'écran
+
+```
+→ Après tout checkout / checkin important, enchaîner avec :
+POST /api/display/show-confirmation  { title, subtitle, details, batch_id, color }
+```
+
+### Situation J — État des lieux visuel en atelier
+
+```
+1. POST /api/display/show-movements       → afficher le tableau des sorties en cours
+   → les retards sont mis en évidence automatiquement (badge rouge)
 ```
 
 ---
