@@ -261,6 +261,20 @@ def _b64img(file_id: str | None, *, mime: str = "image/jpeg") -> str | None:
     return f"data:{mime};base64,{base64.b64encode(img).decode()}"
 
 
+def _b64thumb(file_id: str | None, max_px: int = 160, quality: int = 55) -> str | None:
+    """Comme _b64img mais retourne une miniature compressée via get_drive_thumb.
+
+    Réduit drastiquement la taille base64 embarquée dans le HTML :
+    une image brute de 7 MB devient ~20-200 KB selon max_px/quality.
+    """
+    if not file_id or str(file_id) in ("None", "nan", ""):
+        return None
+    img = get_drive_thumb(file_id, max_px=max_px, quality=quality)
+    if not img:
+        return None
+    return f"data:image/jpeg;base64,{base64.b64encode(img).decode()}"
+
+
 
 def get_current_user() -> str:
     """Retourne le login de l'utilisateur authentifié (en minuscules).
@@ -3052,8 +3066,8 @@ def render_kiosk_equipment(data: dict) -> None:
     # ── Colonne gauche : galerie de toutes les photos ──────────
     with col_img:
         if media:
-            # Première photo grande, les suivantes en ligne de miniatures
-            primary_url = _b64img(media[0]["file_id"])
+            # Première photo grande (compressée 1200px/q80 ≈ 100-400 KB)
+            primary_url = _b64thumb(media[0]["file_id"], max_px=1200, quality=80)
             if primary_url:
                 st.markdown(
                     f"<img src='{primary_url}' style='width:100%;border-radius:1rem;"
@@ -3067,11 +3081,11 @@ def render_kiosk_equipment(data: dict) -> None:
                     unsafe_allow_html=True,
                 )
 
-            # Photos supplémentaires en ligne de miniatures
+            # Miniatures (compressées 160px/q55 ≈ 10-25 KB chacune)
             if len(media) > 1:
                 thumbs_html = "<div style='display:flex;gap:0.5rem;margin-top:0.6rem;flex-wrap:wrap;'>"
                 for m in media[1:]:
-                    url = _b64img(m["file_id"])
+                    url = _b64thumb(m["file_id"], max_px=160, quality=55)
                     if url:
                         role_label = {"overview": "Vue générale", "nameplate": "Plaque"}.get(
                             m.get("role", ""), m.get("role", "")
