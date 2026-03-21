@@ -1067,6 +1067,9 @@ def display_equipment(
         ]
     except RuntimeError:
         media_files = []
+
+    # Prêts actifs
+    try:
         loans_df = _run_query(
             """
             SELECT borrower_name, movement_type, out_date, expected_return_date
@@ -1171,18 +1174,24 @@ def display_kit(
             """
             SELECT e.equipment_id, e.label, e.brand, e.model,
                    e.condition_label, e.location_hint,
-                   (
-                       SELECT em.final_drive_file_id
-                       FROM equipment_media em
-                       WHERE em.equipment_id = e.equipment_id
-                       ORDER BY CASE em.image_role
-                           WHEN 'overview'  THEN 1
-                           WHEN 'nameplate' THEN 2
-                           ELSE 3
-                       END LIMIT 1
-                   ) AS main_file_id
+                   mf.final_drive_file_id AS main_file_id
             FROM kit_items ki
             JOIN equipment e ON e.equipment_id = ki.equipment_id
+            LEFT JOIN (
+                SELECT equipment_id, final_drive_file_id
+                FROM (
+                    SELECT equipment_id, final_drive_file_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY equipment_id
+                               ORDER BY CASE image_role
+                                   WHEN 'overview'  THEN 1
+                                   WHEN 'nameplate' THEN 2
+                                   ELSE 3
+                               END
+                           ) AS rn
+                    FROM equipment_media
+                ) t WHERE rn = 1
+            ) mf ON mf.equipment_id = e.equipment_id
             WHERE ki.kit_id = ?
             ORDER BY e.label
             """,
@@ -1238,19 +1247,25 @@ def display_movements(
                 k.name AS kit_name,
                 (em.expected_return_date IS NOT NULL
                  AND em.expected_return_date < CURRENT_DATE) AS is_late,
-                (
-                    SELECT emi.final_drive_file_id
-                    FROM equipment_media emi
-                    WHERE emi.equipment_id = em.equipment_id
-                    ORDER BY CASE emi.image_role
-                        WHEN 'overview'  THEN 1
-                        WHEN 'nameplate' THEN 2
-                        ELSE 3
-                    END LIMIT 1
-                ) AS main_file_id
+                mf.final_drive_file_id AS main_file_id
             FROM equipment_movements em
             JOIN equipment e ON e.equipment_id = em.equipment_id
             LEFT JOIN kits k ON k.kit_id = em.kit_id
+            LEFT JOIN (
+                SELECT equipment_id, final_drive_file_id
+                FROM (
+                    SELECT equipment_id, final_drive_file_id,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY equipment_id
+                               ORDER BY CASE image_role
+                                   WHEN 'overview'  THEN 1
+                                   WHEN 'nameplate' THEN 2
+                                   ELSE 3
+                               END
+                           ) AS rn
+                    FROM equipment_media
+                ) t WHERE rn = 1
+            ) mf ON mf.equipment_id = em.equipment_id
             WHERE em.actual_return_date IS NULL
             ORDER BY em.out_date DESC
             """
