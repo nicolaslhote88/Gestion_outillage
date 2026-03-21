@@ -3147,9 +3147,19 @@ def render_kiosk_equipment(equipment_id: str) -> None:
 
 
 def render_kiosk_mode() -> None:
-    """Point d'entrée du mode kiosque : poll ui_commands et affiche la fiche ou le screensaver."""
+    """Point d'entrée du mode kiosque : poll ui_commands et affiche la fiche ou le screensaver.
+
+    L'équipement reste affiché jusqu'à la prochaine commande (SHOW_EQUIPMENT ou
+    CLEAR_SCREEN). session_state conserve l'identifiant entre les refreshes
+    automatiques toutes les 2 s — sans lui, la fiche disparaissait dès le 2e cycle.
+    """
     st_autorefresh(interval=2000, key="kioskreload")
 
+    # Initialise l'état persistant entre refreshes
+    if "kiosk_equipment_id" not in st.session_state:
+        st.session_state["kiosk_equipment_id"] = None
+
+    # Poll : cherche la commande la plus récente non exécutée
     cmd_df = run_query("""
         SELECT command_id, command_type, payload
         FROM ui_commands
@@ -3159,22 +3169,27 @@ def render_kiosk_mode() -> None:
     """)
 
     if not cmd_df.empty:
-        cmd = cmd_df.iloc[0]
-        cmd_id    = cmd["command_id"]
-        cmd_type  = cmd["command_type"]
-        payload   = cmd["payload"]
+        cmd      = cmd_df.iloc[0]
+        cmd_id   = cmd["command_id"]
+        cmd_type = cmd["command_type"]
+        payload  = cmd["payload"]
 
-        # Marque la commande comme exécutée
+        # Marque la commande comme exécutée avant de rendre quoi que ce soit
         run_write(
             "UPDATE ui_commands SET executed = TRUE WHERE command_id = ?",
             [cmd_id],
         )
 
         if cmd_type == "SHOW_EQUIPMENT" and payload:
-            render_kiosk_equipment(payload)
-            return
+            st.session_state["kiosk_equipment_id"] = payload
+        elif cmd_type == "CLEAR_SCREEN":
+            st.session_state["kiosk_equipment_id"] = None
 
-    render_kiosk_screensaver()
+    # Affichage basé sur l'état courant (persisté entre refreshes)
+    if st.session_state["kiosk_equipment_id"]:
+        render_kiosk_equipment(st.session_state["kiosk_equipment_id"])
+    else:
+        render_kiosk_screensaver()
 
 
 def main():
