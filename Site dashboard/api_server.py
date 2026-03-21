@@ -1026,19 +1026,7 @@ def display_equipment(
             SELECT
                 e.equipment_id, e.label, e.brand, e.model, e.serial_number,
                 e.subtype, e.condition_label, e.location_hint, e.notes,
-                e.technical_specs_json,
-                (
-                    SELECT em.final_drive_file_id
-                    FROM equipment_media em
-                    WHERE em.equipment_id = e.equipment_id
-                    ORDER BY
-                        CASE em.image_role
-                            WHEN 'overview'  THEN 1
-                            WHEN 'nameplate' THEN 2
-                            ELSE 3
-                        END
-                    LIMIT 1
-                ) AS main_file_id
+                e.technical_specs_json
             FROM equipment e
             WHERE e.equipment_id = ?
             """,
@@ -1056,8 +1044,29 @@ def display_equipment(
             detail=ErrorResponse(ok=False, error="equipment_not_found", equipment_id=body.equipment_id).model_dump(),
         )
 
-    # Prêts actifs
+    # Toutes les photos (triées : overview > nameplate > autres)
     try:
+        media_df = _run_query(
+            """
+            SELECT final_drive_file_id, image_role
+            FROM equipment_media
+            WHERE equipment_id = ?
+            ORDER BY
+                CASE image_role
+                    WHEN 'overview'  THEN 1
+                    WHEN 'nameplate' THEN 2
+                    ELSE 3
+                END
+            """,
+            [body.equipment_id],
+        )
+        media_files = [
+            {"file_id": str(r["final_drive_file_id"]), "role": str(r["image_role"] or "")}
+            for _, r in media_df.iterrows()
+            if r["final_drive_file_id"] and str(r["final_drive_file_id"]) not in ("None", "nan")
+        ]
+    except RuntimeError:
+        media_files = []
         loans_df = _run_query(
             """
             SELECT borrower_name, movement_type, out_date, expected_return_date
@@ -1079,18 +1088,18 @@ def display_equipment(
         specs = {}
 
     eq_data = {
-        "equipment_id": str(row.get("equipment_id") or ""),
-        "label":        str(row.get("label")        or ""),
-        "brand":        str(row.get("brand")        or ""),
-        "model":        str(row.get("model")        or ""),
-        "serial_number":str(row.get("serial_number")or ""),
-        "subtype":      str(row.get("subtype")      or ""),
-        "condition_label":str(row.get("condition_label") or ""),
-        "location_hint":str(row.get("location_hint") or ""),
-        "notes":        str(row.get("notes")        or ""),
+        "equipment_id":   str(row.get("equipment_id")   or ""),
+        "label":          str(row.get("label")          or ""),
+        "brand":          str(row.get("brand")          or ""),
+        "model":          str(row.get("model")          or ""),
+        "serial_number":  str(row.get("serial_number")  or ""),
+        "subtype":        str(row.get("subtype")        or ""),
+        "condition_label":str(row.get("condition_label")or ""),
+        "location_hint":  str(row.get("location_hint")  or ""),
+        "notes":          str(row.get("notes")          or ""),
         "technical_specs": specs,
-        "main_file_id": str(row.get("main_file_id") or "") or None,
-        "loans": loans,
+        "media_files":    media_files,   # toutes les photos
+        "loans":          loans,
     }
 
     # Écrit dans le fichier JSON (transport sans DuckDB pour le kiosque)
@@ -1161,7 +1170,17 @@ def display_kit(
         items_df = _run_query(
             """
             SELECT e.equipment_id, e.label, e.brand, e.model,
-                   e.condition_label, e.location_hint
+                   e.condition_label, e.location_hint,
+                   (
+                       SELECT em.final_drive_file_id
+                       FROM equipment_media em
+                       WHERE em.equipment_id = e.equipment_id
+                       ORDER BY CASE em.image_role
+                           WHEN 'overview'  THEN 1
+                           WHEN 'nameplate' THEN 2
+                           ELSE 3
+                       END LIMIT 1
+                   ) AS main_file_id
             FROM kit_items ki
             JOIN equipment e ON e.equipment_id = ki.equipment_id
             WHERE ki.kit_id = ?
@@ -1218,7 +1237,17 @@ def display_movements(
                 em.batch_id, em.kit_id,
                 k.name AS kit_name,
                 (em.expected_return_date IS NOT NULL
-                 AND em.expected_return_date < CURRENT_DATE) AS is_late
+                 AND em.expected_return_date < CURRENT_DATE) AS is_late,
+                (
+                    SELECT emi.final_drive_file_id
+                    FROM equipment_media emi
+                    WHERE emi.equipment_id = em.equipment_id
+                    ORDER BY CASE emi.image_role
+                        WHEN 'overview'  THEN 1
+                        WHEN 'nameplate' THEN 2
+                        ELSE 3
+                    END LIMIT 1
+                ) AS main_file_id
             FROM equipment_movements em
             JOIN equipment e ON e.equipment_id = em.equipment_id
             LEFT JOIN kits k ON k.kit_id = em.kit_id

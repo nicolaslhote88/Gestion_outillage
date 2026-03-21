@@ -6,6 +6,7 @@ Architecture : single-file app.py modulaire avec fonctions par section.
 Connexion DuckDB en read_only=True (compatible avec n8n qui écrit en parallèle).
 """
 
+import base64
 import io
 import json
 import os
@@ -248,6 +249,17 @@ def _read_kiosk_state() -> dict:
         return json.loads(KIOSK_STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"command_type": "CLEAR_SCREEN", "updated_at": "", "data": {}}
+
+
+def _b64img(file_id: str | None, *, mime: str = "image/jpeg") -> str | None:
+    """Retourne une data-URL base64 pour un file_id Google Drive, ou None."""
+    if not file_id or str(file_id) in ("None", "nan", ""):
+        return None
+    img = get_drive_image_bytes(file_id)
+    if not img:
+        return None
+    return f"data:{mime};base64,{base64.b64encode(img).decode()}"
+
 
 
 def get_current_user() -> str:
@@ -2981,11 +2993,23 @@ def render_kiosk_screensaver() -> None:
     )
 
 
-def render_kiosk_equipment(data: dict) -> None:
-    """Affiche la fiche équipement en plein écran (mode kiosque).
+def _fmt_kiosk_date(d) -> str:
+    """Formate une date (datetime ou str JSON) en dd/mm/yyyy."""
+    if d is None or (isinstance(d, float) and pd.isna(d)) or str(d) in ("", "None", "nan", "NaT"):
+        return "?"
+    try:
+        return pd.Timestamp(d).strftime("%d/%m/%Y")
+    except Exception:
+        return str(d)[:10]
 
-    Reçoit les données pré-embarquées par l'API dans kiosk_state.json :
-    aucune connexion DuckDB n'est ouverte pendant l'affichage.
+
+def render_kiosk_equipment(data: dict) -> None:
+    """Affiche la fiche équipement complète en mode kiosque.
+
+    - Toutes les photos (galerie verticale à gauche)
+    - Toutes les infos disponibles (droite) : badges, spécifications, n° série,
+      emplacement, notes, état des prêts actifs.
+    Aucune connexion DuckDB : données pré-embarquées dans kiosk_state.json.
     """
     if not data:
         render_kiosk_screensaver()
@@ -3000,149 +3024,150 @@ def render_kiosk_equipment(data: dict) -> None:
     location  = null_str(data.get("location_hint"),   "")
     notes     = null_str(data.get("notes"),           "")
     specs     = data.get("technical_specs") or {}
-
-    # Prêts actifs (données embarquées par l'API)
+    media     = data.get("media_files") or []   # liste {file_id, role}
     loans_raw = data.get("loans") or []
 
-    # Reconstitue un DataFrame-like pour la suite du rendu
-    import pandas as _pd
-    loans_df = _pd.DataFrame(loans_raw) if loans_raw else _pd.DataFrame()
+    st.markdown("""<style>
+    header, section[data-testid="stSidebar"] { display: none !important; }
+    .kiosk-card  { background: #0f172a; border-radius: 1.5rem; padding: 1.5rem; }
+    .kiosk-title { font-size: 2.8rem; font-weight: 900; color: #f1f5f9; line-height: 1.1; }
+    .kiosk-sub   { font-size: 1.3rem; color: #38bdf8; font-weight: 600; margin-top: 0.3rem; }
+    .kiosk-badge { display:inline-block; padding:0.3rem 0.9rem; border-radius:9999px;
+                   font-size:1rem; font-weight:600; margin-right:0.4rem; margin-bottom:0.3rem; }
+    .kiosk-spec-label { color:#64748b; font-size:0.9rem; }
+    .kiosk-spec-val   { color:#f1f5f9; font-size:1rem; font-weight:600; }
+    .kiosk-sep   { border:none; border-top:1px solid #1e293b; margin:1rem 0; }
+    </style>""", unsafe_allow_html=True)
 
-    # ── CSS plein écran kiosque ────────────────────────────────
-    st.markdown("""
-        <style>
-        header, section[data-testid="stSidebar"] { display: none !important; }
-        .kiosk-card { background: #0f172a; border-radius: 1.5rem; padding: 2rem; }
-        .kiosk-title { font-size: 3rem; font-weight: 900; color: #f1f5f9; line-height: 1.1; }
-        .kiosk-sub   { font-size: 1.4rem; color: #38bdf8; font-weight: 600; margin-top: 0.3rem; }
-        .kiosk-badge { display: inline-block; padding: 0.3rem 0.9rem; border-radius: 9999px;
-                       font-size: 1rem; font-weight: 600; margin-right: 0.4rem; }
-        .kiosk-spec-label { color: #64748b; font-size: 0.95rem; }
-        .kiosk-spec-val   { color: #f1f5f9; font-size: 1.05rem; font-weight: 600; }
-        </style>
-    """, unsafe_allow_html=True)
+    col_img, col_info = st.columns([2, 3], gap="large")
 
-    col_img, col_info = st.columns([1, 2], gap="large")
-
+    # ── Colonne gauche : galerie de toutes les photos ──────────
     with col_img:
-        file_id = data.get("main_file_id")
-        if file_id and file_id not in ("None", "nan", ""):
-            img_bytes = get_drive_image_bytes(file_id)
-            if img_bytes:
-                st.image(img_bytes, use_container_width=True)
-            else:
+        if media:
+            # Première photo grande, les suivantes en ligne de miniatures
+            primary_url = _b64img(media[0]["file_id"])
+            if primary_url:
                 st.markdown(
-                    "<div style='height:350px;background:#1e293b;border-radius:1rem;"
-                    "display:flex;align-items:center;justify-content:center;"
-                    "font-size:5rem;'>🔧</div>",
+                    f"<img src='{primary_url}' style='width:100%;border-radius:1rem;"
+                    f"object-fit:cover;max-height:380px;display:block;'>",
                     unsafe_allow_html=True,
                 )
+            else:
+                st.markdown(
+                    "<div style='height:320px;background:#1e293b;border-radius:1rem;"
+                    "display:flex;align-items:center;justify-content:center;font-size:5rem;'>🔧</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Photos supplémentaires en ligne de miniatures
+            if len(media) > 1:
+                thumbs_html = "<div style='display:flex;gap:0.5rem;margin-top:0.6rem;flex-wrap:wrap;'>"
+                for m in media[1:]:
+                    url = _b64img(m["file_id"])
+                    if url:
+                        role_label = {"overview": "Vue générale", "nameplate": "Plaque"}.get(
+                            m.get("role", ""), m.get("role", "")
+                        )
+                        thumbs_html += (
+                            f"<div style='flex:1;min-width:80px;'>"
+                            f"<img src='{url}' title='{role_label}' style='width:100%;border-radius:0.6rem;"
+                            f"object-fit:cover;height:90px;'>"
+                            f"</div>"
+                        )
+                thumbs_html += "</div>"
+                st.markdown(thumbs_html, unsafe_allow_html=True)
         else:
             st.markdown(
-                "<div style='height:350px;background:#1e293b;border-radius:1rem;"
-                "display:flex;align-items:center;justify-content:center;"
-                "font-size:5rem;'>🔧</div>",
+                "<div style='height:320px;background:#1e293b;border-radius:1rem;"
+                "display:flex;align-items:center;justify-content:center;font-size:5rem;'>🔧</div>",
                 unsafe_allow_html=True,
             )
 
+    # ── Colonne droite : toutes les infos ─────────────────────
     with col_info:
         condition_color = {
             "bon": "#22c55e", "fonctionnel": "#84cc16", "dégradé": "#f59e0b",
             "hors service": "#ef4444",
         }.get((condition or "").lower(), "#94a3b8")
-
         subtype_badge = (
             f"<span class='kiosk-badge' style='background:#334155;color:#94a3b8;'>{subtype}</span>"
             if subtype else ""
         )
+        bm = f"{brand} {model}".strip()
         st.markdown(
-            f"<div class='kiosk-card'>"
             f"<div class='kiosk-title'>{label}</div>"
-            f"<div class='kiosk-sub'>{brand} {model}</div>"
-            f"<div style='margin-top:1.2rem;'>"
+            f"{'<div class=\"kiosk-sub\">' + bm + '</div>' if bm else ''}"
+            f"<div style='margin-top:0.9rem;'>"
             f"<span class='kiosk-badge' style='background:{condition_color}22;color:{condition_color};"
             f"border:1px solid {condition_color}44;'>{condition or 'État inconnu'}</span>"
-            f"{subtype_badge}"
-            f"</div></div>",
+            f"{subtype_badge}</div>",
             unsafe_allow_html=True,
         )
 
-        # Specs techniques
+        # Specs techniques — toutes (pas de limite à 8)
         if specs:
-            st.markdown("**Spécifications techniques**")
-            spec_cols = st.columns(2)
-            for i, (k, v) in enumerate(list(specs.items())[:8]):
-                with spec_cols[i % 2]:
-                    st.markdown(
-                        f"<span class='kiosk-spec-label'>{k}</span><br>"
-                        f"<span class='kiosk-spec-val'>{v}</span>",
-                        unsafe_allow_html=True,
-                    )
+            specs_html = "<hr class='kiosk-sep'><div style='display:grid;grid-template-columns:1fr 1fr;gap:0.6rem 1.5rem;'>"
+            for k, v in specs.items():
+                specs_html += (
+                    f"<div><div class='kiosk-spec-label'>{k}</div>"
+                    f"<div class='kiosk-spec-val'>{v}</div></div>"
+                )
+            specs_html += "</div>"
+            st.markdown(specs_html, unsafe_allow_html=True)
 
-        # Infos pratiques
-        details = []
+        # Infos pratiques (serial, emplacement, notes)
+        pratique_items = []
         if serial:
-            details.append(("N° série", serial))
+            pratique_items.append(("N° série", serial))
         if location:
-            details.append(("Emplacement", location))
-        if details:
-            st.markdown("---")
-            dcols = st.columns(len(details))
-            for i, (lbl, val) in enumerate(details):
-                with dcols[i]:
-                    st.markdown(
-                        f"<span class='kiosk-spec-label'>{lbl}</span><br>"
-                        f"<span class='kiosk-spec-val'>{val}</span>",
-                        unsafe_allow_html=True,
-                    )
+            pratique_items.append(("Emplacement", location))
+        if pratique_items:
+            pratique_html = "<hr class='kiosk-sep'><div style='display:flex;gap:2rem;flex-wrap:wrap;'>"
+            for lbl, val in pratique_items:
+                pratique_html += (
+                    f"<div><div class='kiosk-spec-label'>{lbl}</div>"
+                    f"<div class='kiosk-spec-val'>{val}</div></div>"
+                )
+            pratique_html += "</div>"
+            st.markdown(pratique_html, unsafe_allow_html=True)
 
         if notes:
-            st.markdown("---")
-            st.caption(f"Notes : {notes}")
-
-    # ── État des prêts ─────────────────────────────────────────
-    st.markdown("---")
-    if loans_df.empty:
-        st.markdown(
-            "<div style='text-align:center;padding:1.5rem;"
-            "background:#14532d22;border-radius:1rem;"
-            "border:1px solid #22c55e44;'>"
-            "<span style='font-size:1.5rem;color:#22c55e;font-weight:700;'>"
-            "✅ Disponible</span></div>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            "<div style='text-align:center;padding:1.5rem;"
-            "background:#7f1d1d22;border-radius:1rem;"
-            "border:1px solid #ef444444;margin-bottom:1rem;'>"
-            "<span style='font-size:1.5rem;color:#ef4444;font-weight:700;'>"
-            "🔴 En cours d'utilisation</span></div>",
-            unsafe_allow_html=True,
-        )
-        for _, mv in loans_df.iterrows():
-            borrower = null_str(mv.get("borrower_name"), "Inconnu")
-            mv_type  = null_str(mv.get("movement_type"), "")
-            out_d    = mv.get("out_date")
-            ret_d    = mv.get("expected_return_date")
-            # Les dates peuvent être datetime (DataFrame DuckDB) ou str (JSON)
-            def _fmt_date(d):
-                if d is None or (isinstance(d, float) and pd.isna(d)) or str(d) in ("", "None", "nan", "NaT"):
-                    return "?"
-                try:
-                    return pd.Timestamp(d).strftime("%d/%m/%Y")
-                except Exception:
-                    return str(d)[:10]
-            out_str  = _fmt_date(out_d)
-            ret_str  = _fmt_date(ret_d)
             st.markdown(
-                f"<div style='background:#1e293b;border-radius:0.8rem;"
-                f"padding:0.8rem 1.2rem;margin-bottom:0.5rem;'>"
-                f"<b style='color:#f1f5f9;'>{borrower}</b> "
-                f"<span style='color:#64748b;'>— {mv_type} | Sorti le {out_str}"
-                f" | Retour prévu {ret_str}</span></div>",
+                f"<hr class='kiosk-sep'><div style='color:#94a3b8;font-size:0.95rem;"
+                f"font-style:italic;background:#1e293b;border-radius:0.6rem;"
+                f"padding:0.6rem 1rem;'>📝 {notes}</div>",
                 unsafe_allow_html=True,
             )
+
+        # État des prêts
+        st.markdown("<hr class='kiosk-sep'>", unsafe_allow_html=True)
+        if not loans_raw:
+            st.markdown(
+                "<div style='text-align:center;padding:1rem;background:#14532d22;"
+                "border-radius:1rem;border:1px solid #22c55e44;'>"
+                "<span style='font-size:1.4rem;color:#22c55e;font-weight:700;'>✅ Disponible</span></div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='text-align:center;padding:1rem;background:#7f1d1d22;"
+                "border-radius:1rem;border:1px solid #ef444444;margin-bottom:0.8rem;'>"
+                "<span style='font-size:1.4rem;color:#ef4444;font-weight:700;'>🔴 En cours d'utilisation</span></div>",
+                unsafe_allow_html=True,
+            )
+            for mv in loans_raw:
+                borrower = null_str(mv.get("borrower_name"), "Inconnu")
+                mv_type  = null_str(mv.get("movement_type"), "")
+                out_str  = _fmt_kiosk_date(mv.get("out_date"))
+                ret_str  = _fmt_kiosk_date(mv.get("expected_return_date"))
+                st.markdown(
+                    f"<div style='background:#1e293b;border-radius:0.7rem;padding:0.7rem 1rem;"
+                    f"margin-bottom:0.4rem;'>"
+                    f"<b style='color:#f1f5f9;'>{borrower}</b> "
+                    f"<span style='color:#64748b;'>— {mv_type} | Sorti le {out_str} | Retour prévu {ret_str}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 def render_kiosk_kit(data: dict) -> None:
@@ -3151,43 +3176,47 @@ def render_kiosk_kit(data: dict) -> None:
     description = null_str(data.get("description"), "")
     items       = data.get("items") or []
 
-    st.markdown("""
-        <style>
-        header, section[data-testid="stSidebar"] { display: none !important; }
-        .kiosk-card   { background: #0f172a; border-radius: 1.5rem; padding: 2rem; }
-        .kiosk-title  { font-size: 2.8rem; font-weight: 900; color: #f1f5f9; line-height: 1.1; }
-        .kiosk-sub    { font-size: 1.3rem; color: #38bdf8; font-weight: 600; margin-top: 0.3rem; }
-        .kit-item     { background: #1e293b; border-radius: 0.8rem; padding: 0.7rem 1.1rem;
-                        margin-bottom: 0.5rem; border-left: 3px solid #38bdf8; }
-        .kit-item-lbl { color: #f1f5f9; font-weight: 700; font-size: 1.05rem; }
-        .kit-item-sub { color: #64748b; font-size: 0.9rem; }
-        </style>
-    """, unsafe_allow_html=True)
+    st.markdown("""<style>
+    header, section[data-testid="stSidebar"] { display: none !important; }
+    .kit-thumb { width:80px;height:80px;object-fit:cover;border-radius:0.5rem;flex-shrink:0; }
+    .kit-thumb-ph { width:80px;height:80px;background:#334155;border-radius:0.5rem;
+                    display:flex;align-items:center;justify-content:center;
+                    font-size:1.8rem;flex-shrink:0; }
+    </style>""", unsafe_allow_html=True)
 
+    desc_html = f"<div style='font-size:1.2rem;color:#38bdf8;font-weight:600;margin-top:0.3rem;'>{description}</div>" if description else ""
     st.markdown(
-        f"""
-        <div class="kiosk-card" style="margin-bottom:1.5rem;">
-            <div style="font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;">🧰 KIT</div>
-            <div class="kiosk-title">{name}</div>
-            {"<div class='kiosk-sub'>" + description + "</div>" if description else ""}<div style="margin-top:1rem;color:#94a3b8;font-size:1.1rem;">{len(items)} outil(s)</div>
-        </div>
-        """,
+        f"<div style='background:#0f172a;border-radius:1.5rem;padding:1.5rem 2rem;margin-bottom:1.2rem;'>"
+        f"<div style='font-size:0.9rem;color:#64748b;font-weight:600;letter-spacing:0.1em;'>🧰 KIT</div>"
+        f"<div style='font-size:2.6rem;font-weight:900;color:#f1f5f9;line-height:1.1;'>{name}</div>"
+        f"{desc_html}<div style='margin-top:0.8rem;color:#94a3b8;font-size:1rem;'>{len(items)} outil(s)</div></div>",
         unsafe_allow_html=True,
     )
 
     if items:
+        # Grille 2 colonnes ; chaque item = thumbnail + texte côte à côte
         cols = st.columns(2)
         for i, item in enumerate(items):
             lbl  = null_str(item.get("label"),          "—")
-            bm   = " ".join(filter(None, [item.get("brand"), item.get("model")])) or ""
+            bm   = " ".join(filter(None, [str(item.get("brand") or ""), str(item.get("model") or "")])).strip()
             cond = null_str(item.get("condition_label"), "")
             loc  = null_str(item.get("location_hint"),   "")
             sub  = " · ".join(filter(None, [bm, cond, loc]))
+            fid  = item.get("main_file_id")
+            url  = _b64img(fid) if fid and str(fid) not in ("None", "nan", "") else None
+
+            img_html = (
+                f"<img class='kit-thumb' src='{url}'>" if url
+                else "<div class='kit-thumb-ph'>🔧</div>"
+            )
+            sub_html = f"<div style='color:#64748b;font-size:0.88rem;margin-top:0.2rem;'>{sub}</div>" if sub else ""
             with cols[i % 2]:
                 st.markdown(
-                    f"<div class='kit-item'>"
-                    f"<div class='kit-item-lbl'>{lbl}</div>"
-                    f"{'<div class=\"kit-item-sub\">' + sub + '</div>' if sub else ''}"
+                    f"<div style='display:flex;align-items:center;gap:0.9rem;"
+                    f"background:#1e293b;border-radius:0.8rem;padding:0.7rem;"
+                    f"margin-bottom:0.5rem;border-left:3px solid #38bdf8;'>"
+                    f"{img_html}"
+                    f"<div><div style='color:#f1f5f9;font-weight:700;font-size:1rem;'>{lbl}</div>{sub_html}</div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )
@@ -3199,71 +3228,30 @@ def render_kiosk_kit(data: dict) -> None:
 
 
 def render_kiosk_movements_active(data: dict) -> None:
-    """Affiche le tableau des sorties en cours (mode kiosque)."""
+    """Affiche le tableau des sorties en cours avec thumbnails (mode kiosque)."""
     items = data.get("items") or []
     count = data.get("count", len(items))
     late  = sum(1 for i in items if i.get("is_late"))
 
-    st.markdown("""
-        <style>
-        header, section[data-testid="stSidebar"] { display: none !important; }
-        .mv-row       { background: #1e293b; border-radius: 0.8rem; padding: 0.8rem 1.2rem;
-                        margin-bottom: 0.5rem; display: flex; justify-content: space-between;
-                        align-items: center; }
-        .mv-label     { color: #f1f5f9; font-weight: 700; font-size: 1rem; }
-        .mv-borrower  { color: #38bdf8; font-size: 0.95rem; }
-        .mv-meta      { color: #64748b; font-size: 0.88rem; }
-        .badge-late   { background: #7f1d1d44; color: #ef4444; border: 1px solid #ef444466;
-                        border-radius: 9999px; padding: 0.15rem 0.7rem; font-size: 0.82rem;
-                        font-weight: 700; }
-        .badge-ok     { background: #14532d44; color: #22c55e; border: 1px solid #22c55e66;
-                        border-radius: 9999px; padding: 0.15rem 0.7rem; font-size: 0.82rem; }
-        </style>
-    """, unsafe_allow_html=True)
+    st.markdown("""<style>
+    header, section[data-testid="stSidebar"] { display: none !important; }
+    .mv-thumb { width:72px;height:72px;object-fit:cover;border-radius:0.5rem;flex-shrink:0; }
+    .mv-thumb-ph { width:72px;height:72px;background:#334155;border-radius:0.5rem;
+                   display:flex;align-items:center;justify-content:center;
+                   font-size:1.6rem;flex-shrink:0; }
+    </style>""", unsafe_allow_html=True)
 
     late_badge = (
-        f"<span style='color:#ef4444;font-size:1.1rem;font-weight:700;'>"
-        f"⚠ {late} en retard</span>"
+        f"<span style='color:#ef4444;font-size:1.1rem;font-weight:700;'>⚠ {late} en retard</span>"
         if late else ""
     )
     st.markdown(
-        f"<div style='background:#0f172a;border-radius:1.5rem;padding:1.5rem 2rem;margin-bottom:1.5rem;'>"
-        f"<div style='font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;'>📤 SORTIES EN COURS</div>"
-        f"<div style='font-size:2.5rem;font-weight:900;color:#f1f5f9;'>{count} outil(s)</div>"
-        f"{late_badge}"
-        f"</div>",
+        f"<div style='background:#0f172a;border-radius:1.5rem;padding:1.2rem 2rem;margin-bottom:1.2rem;'>"
+        f"<div style='font-size:0.9rem;color:#64748b;font-weight:600;letter-spacing:0.1em;'>📤 SORTIES EN COURS</div>"
+        f"<div style='font-size:2.3rem;font-weight:900;color:#f1f5f9;'>{count} outil(s)</div>"
+        f"{late_badge}</div>",
         unsafe_allow_html=True,
     )
-
-    def _fmt(d):
-        if not d or str(d) in ("None", "nan", "NaT", ""):
-            return "?"
-        try:
-            return pd.Timestamp(d).strftime("%d/%m/%Y")
-        except Exception:
-            return str(d)[:10]
-
-    for item in items:
-        lbl      = null_str(item.get("label"),         "—")
-        borrower = null_str(item.get("borrower_name"), "?")
-        mv_type  = null_str(item.get("movement_type"), "")
-        out_str  = _fmt(item.get("out_date"))
-        ret_str  = _fmt(item.get("expected_return_date"))
-        kit_name = item.get("kit_name")
-        is_late  = bool(item.get("is_late"))
-        badge    = "<span class='badge-late'>EN RETARD</span>" if is_late else "<span class='badge-ok'>OK</span>"
-        kit_tag  = f" · Kit : {kit_name}" if kit_name else ""
-        st.markdown(
-            f"<div class='mv-row'>"
-            f"  <div>"
-            f"    <div class='mv-label'>{lbl}</div>"
-            f"    <div class='mv-borrower'>{borrower}</div>"
-            f"    <div class='mv-meta'>{mv_type} | Sorti {out_str} | Retour {ret_str}{kit_tag}</div>"
-            f"  </div>"
-            f"  {badge}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
 
     if not items:
         st.markdown(
@@ -3271,6 +3259,43 @@ def render_kiosk_movements_active(data: dict) -> None:
             "font-weight:700;'>✅ Aucun outil sorti en ce moment</div>",
             unsafe_allow_html=True,
         )
+        return
+
+    # Grille 2 colonnes ; chaque item = thumbnail + texte + badge
+    cols = st.columns(2)
+    for i, item in enumerate(items):
+        lbl      = null_str(item.get("label"),         "—")
+        borrower = null_str(item.get("borrower_name"), "?")
+        mv_type  = null_str(item.get("movement_type"), "")
+        out_str  = _fmt_kiosk_date(item.get("out_date"))
+        ret_str  = _fmt_kiosk_date(item.get("expected_return_date"))
+        kit_name = item.get("kit_name")
+        is_late  = bool(item.get("is_late"))
+        fid      = item.get("main_file_id")
+        url      = _b64img(fid) if fid and str(fid) not in ("None", "nan", "") else None
+
+        img_html  = f"<img class='mv-thumb' src='{url}'>" if url else "<div class='mv-thumb-ph'>🔧</div>"
+        badge     = ("<span style='background:#7f1d1d44;color:#ef4444;border:1px solid #ef444466;"
+                     "border-radius:9999px;padding:0.15rem 0.7rem;font-size:0.78rem;font-weight:700;"
+                     "white-space:nowrap;'>EN RETARD</span>") if is_late else (
+                    "<span style='background:#14532d44;color:#22c55e;border:1px solid #22c55e66;"
+                     "border-radius:9999px;padding:0.15rem 0.7rem;font-size:0.78rem;'>OK</span>")
+        kit_tag   = f" · Kit : {kit_name}" if kit_name else ""
+        border_c  = "#ef4444" if is_late else "#38bdf8"
+
+        with cols[i % 2]:
+            st.markdown(
+                f"<div style='display:flex;align-items:center;gap:0.9rem;background:#1e293b;"
+                f"border-radius:0.8rem;padding:0.7rem;margin-bottom:0.5rem;"
+                f"border-left:3px solid {border_c};'>"
+                f"{img_html}"
+                f"<div style='flex:1;min-width:0;'>"
+                f"<div style='color:#f1f5f9;font-weight:700;font-size:1rem;'>{lbl}</div>"
+                f"<div style='color:#38bdf8;font-size:0.92rem;'>{borrower}</div>"
+                f"<div style='color:#64748b;font-size:0.82rem;'>{mv_type} | {out_str} → {ret_str}{kit_tag}</div>"
+                f"</div>{badge}</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_kiosk_confirmation(data: dict) -> None:
