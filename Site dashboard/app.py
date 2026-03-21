@@ -14,6 +14,7 @@ import re
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
@@ -3029,6 +3030,14 @@ def render_kiosk_equipment(data: dict) -> None:
 
     st.markdown("""<style>
     header, section[data-testid="stSidebar"] { display: none !important; }
+    /* Fond sombre sur toute la page en mode kiosque */
+    body, .stApp,
+    [data-testid="stAppViewContainer"],
+    [data-testid="stMain"],
+    [data-testid="stMainBlockContainer"] {
+        background-color: #0f172a !important;
+        color: #f1f5f9 !important;
+    }
     .kiosk-card  { background: #0f172a; border-radius: 1.5rem; padding: 1.5rem; }
     .kiosk-title { font-size: 2.8rem; font-weight: 900; color: #f1f5f9; line-height: 1.1; }
     .kiosk-sub   { font-size: 1.3rem; color: #38bdf8; font-weight: 600; margin-top: 0.3rem; }
@@ -3041,11 +3050,29 @@ def render_kiosk_equipment(data: dict) -> None:
 
     col_img, col_info = st.columns([2, 3], gap="large")
 
+    # ── Pré-chargement parallèle de toutes les images ──────────
+    # Télécharge simultanément via ThreadPoolExecutor pour éviter
+    # le délai séquentiel (5 photos × ~3 s = 15 s → réduit à ~3 s).
+    file_ids = [m["file_id"] for m in media if m.get("file_id")]
+    _img_cache: dict[str, bytes | None] = {}
+    if file_ids:
+        with ThreadPoolExecutor(max_workers=min(len(file_ids), 5)) as _ex:
+            _futures = {_ex.submit(get_drive_image_bytes, fid): fid for fid in file_ids}
+            for _fut in as_completed(_futures):
+                _img_cache[_futures[_fut]] = _fut.result()
+
+    def _b64img_cached(file_id: str, mime: str = "image/jpeg") -> str | None:
+        """Retourne data-URL depuis le cache pré-chargé, ou None."""
+        img = _img_cache.get(file_id)
+        if not img:
+            return None
+        return f"data:{mime};base64,{base64.b64encode(img).decode()}"
+
     # ── Colonne gauche : galerie de toutes les photos ──────────
     with col_img:
         if media:
             # Première photo grande, les suivantes en ligne de miniatures
-            primary_url = _b64img(media[0]["file_id"])
+            primary_url = _b64img_cached(media[0]["file_id"])
             if primary_url:
                 st.markdown(
                     f"<img src='{primary_url}' style='width:100%;border-radius:1rem;"
@@ -3063,7 +3090,7 @@ def render_kiosk_equipment(data: dict) -> None:
             if len(media) > 1:
                 thumbs_html = "<div style='display:flex;gap:0.5rem;margin-top:0.6rem;flex-wrap:wrap;'>"
                 for m in media[1:]:
-                    url = _b64img(m["file_id"])
+                    url = _b64img_cached(m["file_id"])
                     if url:
                         role_label = {"overview": "Vue générale", "nameplate": "Plaque"}.get(
                             m.get("role", ""), m.get("role", "")
