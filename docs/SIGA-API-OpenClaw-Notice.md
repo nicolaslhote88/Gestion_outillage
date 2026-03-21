@@ -518,7 +518,14 @@ POST /api/display/show
 }
 ```
 
-**Ce qui s'affiche :** fiche complète — image, marque/modèle, état, spécifications techniques, emplacement, statut de disponibilité (libre ou sorti par qui/jusqu'à quand).
+**Ce qui s'affiche :** fiche complète identique à la vue dashboard :
+- Photos (galerie)
+- Titre, marque / modèle, état, catégorie
+- Spécifications techniques (grille clé/valeur)
+- Infos pratiques : N° série, emplacement, mode d'acquisition, prix d'achat
+- Accessoires livrés, consommables associés, éléments associés (si renseignés)
+- Notes
+- Statut de disponibilité : « Disponible » ou « En cours d'utilisation (emprunteur, retour prévu) »
 
 ---
 
