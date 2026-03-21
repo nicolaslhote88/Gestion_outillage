@@ -120,9 +120,16 @@ mcp = FastMCP(
         "Tu peux : rechercher des équipements, consulter leur disponibilité, "
         "enregistrer des sorties et retours (individuels ou groupés), "
         "préparer des chantiers via les kits/paniers, "
-        "et piloter l'affichage de l'écran kiosque atelier.\n\n"
+        "piloter l'affichage de l'écran kiosque atelier, "
+        "et gérer les réservations de matériel.\n\n"
         "Types de mouvement valides : LOAN (prêt), RENTAL (location), MAINTENANCE.\n"
-        "Les dates doivent être au format YYYY-MM-DD."
+        "Les dates doivent être au format YYYY-MM-DD ou YYYY-MM-DDTHH:MM.\n\n"
+        "Workflow réservation : quand un utilisateur demande de réserver un outil :\n"
+        "1. Identifier l'outil via search_equipment.\n"
+        "2. Normaliser les dates (ex: 'mardi prochain' -> date ISO).\n"
+        "3. Vérifier les conflits via check_reservation_conflicts.\n"
+        "4. Si pas de conflit : appeler create_reservation et confirmer.\n"
+        "5. Si conflit : expliquer précisément le problème à l'utilisateur."
     ),
 )
 
@@ -1006,6 +1013,240 @@ def delete_kit(kit_id: str) -> str:
         "kit_id": kit_id,
         "message": f"Kit '{name}' supprimé définitivement.",
     }, ensure_ascii=False)
+
+
+# ════════════════════════════════════════════════════════════
+# OUTILS RÉSERVATIONS & PLANNING
+# ════════════════════════════════════════════════════════════
+
+def _parse_date_mcp(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+@mcp.tool()
+def check_reservation_conflicts(equipment_id: str, start_date: str, end_date: str) -> str:
+    """
+    Vérifie si un équipement est disponible pour une plage horaire donnée.
+
+    Contrôle deux types de blocages :
+    - Chevauchement avec une réservation existante (PENDING ou ACTIVE).
+    - Équipement actuellement en MAINTENANCE (mouvement actif).
+
+    Appeler cet outil AVANT de proposer une réservation à l'utilisateur.
+
+    Args:
+        equipment_id: Identifiant UUID de l'équipement.
+        start_date:   Début de la plage souhaitée (format : YYYY-MM-DD ou YYYY-MM-DDTHH:MM).
+        end_date:     Fin de la plage souhaitée  (format : YYYY-MM-DD ou YYYY-MM-DDTHH:MM).
+
+    Returns:
+        JSON indiquant has_conflict (bool) et la liste des conflits détectés.
+    """
+    start_dt = _parse_date_mcp(start_date)
+    end_dt   = _parse_date_mcp(end_date)
+    if not start_dt or not end_dt:
+        return json.dumps({"ok": False, "error": "Dates invalides. Utiliser YYYY-MM-DD ou YYYY-MM-DDTHH:MM."})
+    if end_dt <= start_dt:
+        return json.dumps({"ok": False, "error": "end_date doit être postérieure à start_date."})
+
+    conflicts = []
+
+    # Chevauchements de réservations
+    res_df = _run_query(
+        """
+        SELECT user_name, start_date, end_date, status
+        FROM reservations
+        WHERE equipment_id = ?
+          AND status IN ('PENDING', 'ACTIVE')
+          AND start_date < ?
+          AND end_date   > ?
+        """,
+        [equipment_id, end_dt, start_dt],
+    )
+    for _, r in res_df.iterrows():
+        conflicts.append({
+            "type":       "reservation",
+            "user_name":  str(r.get("user_name") or ""),
+            "start_date": str(r["start_date"]) if r.get("start_date") is not None else None,
+            "end_date":   str(r["end_date"])   if r.get("end_date")   is not None else None,
+        })
+
+    # Maintenance active
+    maint_df = _run_query(
+        """
+        SELECT borrower_name, out_date, expected_return_date
+        FROM equipment_movements
+        WHERE equipment_id  = ?
+          AND movement_type = 'MAINTENANCE'
+          AND actual_return_date IS NULL
+        LIMIT 1
+        """,
+        [equipment_id],
+    )
+    for _, r in maint_df.iterrows():
+        conflicts.append({
+            "type":            "maintenance",
+            "user_name":       str(r.get("borrower_name") or ""),
+            "start_date":      str(r["out_date"]) if r.get("out_date") is not None else None,
+            "expected_return": str(r["expected_return_date"]) if r.get("expected_return_date") is not None else None,
+        })
+
+    result = {
+        "equipment_id": equipment_id,
+        "has_conflict": len(conflicts) > 0,
+        "conflicts":    conflicts,
+    }
+    if not conflicts:
+        result["message"] = "Aucun conflit détecté. La réservation est possible."
+    else:
+        c = conflicts[0]
+        if c["type"] == "maintenance":
+            result["message"] = f"L'équipement est en maintenance (responsable : {c.get('user_name', '?')})."
+        else:
+            result["message"] = (
+                f"Déjà réservé par {c.get('user_name', '?')} "
+                f"de {c.get('start_date', '?')} à {c.get('end_date', '?')}."
+            )
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def create_reservation(
+    equipment_id: str,
+    user_name: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """
+    Crée une réservation sur un équipement après vérification des conflits.
+
+    Workflow conseillé : appeler check_reservation_conflicts d'abord, puis
+    cette fonction seulement si has_conflict == False.
+
+    Args:
+        equipment_id: Identifiant UUID de l'équipement à réserver.
+        user_name:    Prénom/nom de la personne qui réserve.
+        start_date:   Début de la réservation (YYYY-MM-DD ou YYYY-MM-DDTHH:MM).
+        end_date:     Fin de la réservation   (YYYY-MM-DD ou YYYY-MM-DDTHH:MM).
+
+    Returns:
+        JSON avec res_id si succès, ou message d'erreur/conflit.
+    """
+    start_dt = _parse_date_mcp(start_date)
+    end_dt   = _parse_date_mcp(end_date)
+    if not start_dt or not end_dt:
+        return json.dumps({"ok": False, "error": "Dates invalides."})
+    if end_dt <= start_dt:
+        return json.dumps({"ok": False, "error": "end_date doit être postérieure à start_date."})
+
+    # Vérification de l'équipement
+    eq_df = _run_query("SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1", [equipment_id])
+    if eq_df.empty:
+        return json.dumps({"ok": False, "error": "equipment_not_found", "equipment_id": equipment_id})
+
+    # Vérification des conflits
+    conflict_check = json.loads(
+        check_reservation_conflicts(equipment_id, start_date, end_date)
+    )
+    if conflict_check.get("has_conflict"):
+        return json.dumps({
+            "ok": False,
+            "error": "conflict",
+            "message": conflict_check.get("message", "Conflit détecté."),
+            "conflicts": conflict_check.get("conflicts", []),
+        }, ensure_ascii=False)
+
+    res_id = str(uuid.uuid4())
+    _run_write(
+        """
+        INSERT INTO reservations
+            (res_id, equipment_id, user_name, start_date, end_date, status, created_at)
+        VALUES
+            (?, ?, ?, ?, ?, 'PENDING', CURRENT_TIMESTAMP)
+        """,
+        [res_id, equipment_id, user_name, start_dt, end_dt],
+    )
+
+    eq_label = str(eq_df.iloc[0]["label"] or equipment_id)
+    return json.dumps({
+        "ok":      True,
+        "res_id":  res_id,
+        "message": f"C'est noté, '{eq_label}' est bloqué pour {user_name} du {start_date} au {end_date} !",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def list_reservations(
+    equipment_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+) -> str:
+    """
+    Liste les réservations à venir ou en cours.
+
+    Args:
+        equipment_id: (optionnel) Filtrer par équipement.
+        user_name:    (optionnel) Filtrer par nom d'utilisateur.
+
+    Returns:
+        JSON avec la liste des réservations actives/en attente.
+    """
+    conditions = ["r.status IN ('PENDING', 'ACTIVE')", "r.end_date >= CURRENT_TIMESTAMP"]
+    params = []
+    if equipment_id:
+        conditions.append("r.equipment_id = ?")
+        params.append(equipment_id)
+    if user_name:
+        conditions.append("LOWER(r.user_name) = LOWER(?)")
+        params.append(user_name)
+
+    where = " AND ".join(conditions)
+    df = _run_query(
+        f"""
+        SELECT r.res_id, r.equipment_id, r.user_name, r.start_date, r.end_date, r.status,
+               e.label AS equipment_label
+        FROM reservations r
+        JOIN equipment e ON e.equipment_id = r.equipment_id
+        WHERE {where}
+        ORDER BY r.start_date ASC
+        """,
+        params or None,
+    )
+    if df.empty:
+        return json.dumps({"count": 0, "reservations": [], "message": "Aucune réservation à venir."})
+    return _df_to_json(df)
+
+
+@mcp.tool()
+def cancel_reservation(res_id: str) -> str:
+    """
+    Annule une réservation existante.
+
+    Args:
+        res_id: Identifiant UUID de la réservation à annuler.
+
+    Returns:
+        JSON de confirmation ou d'erreur.
+    """
+    res_df = _run_query(
+        "SELECT res_id, status FROM reservations WHERE res_id = ? LIMIT 1",
+        [res_id],
+    )
+    if res_df.empty:
+        return json.dumps({"ok": False, "error": "reservation_not_found", "res_id": res_id})
+
+    current_status = str(res_df.iloc[0]["status"] or "")
+    if current_status == "CANCELLED":
+        return json.dumps({"ok": True, "res_id": res_id, "message": "Réservation déjà annulée."})
+
+    _run_write("UPDATE reservations SET status = 'CANCELLED' WHERE res_id = ?", [res_id])
+    return json.dumps({"ok": True, "res_id": res_id, "message": "Réservation annulée avec succès."}, ensure_ascii=False)
 
 
 # ─── Lancement ────────────────────────────────────────────────
