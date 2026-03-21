@@ -2,9 +2,17 @@
 SIGA — API HTTP Métier
 Interface JSON simple pour le skill OpenClaw (chat principal + WhatsApp).
 
-Deux opérations :
-  GET  /api/equipment/search?q=<texte>  → recherche fuzzy avec score
-  POST /api/display/show                → envoie une commande au kiosque atelier
+Opérations :
+  GET  /api/equipment/search?q=<texte>       → recherche fuzzy avec score
+  GET  /api/equipment/{id}/status            → disponibilité d'un équipement
+  POST /api/display/show                     → envoie une commande au kiosque atelier
+  POST /api/movements/checkout               → sortie individuelle ou groupée
+  POST /api/movements/checkin                → entrée individuelle, groupée ou par batch
+  GET  /api/movements/active                 → liste des sorties en cours
+  GET  /api/kits                             → liste des kits disponibles
+  GET  /api/kits/{kit_id}                    → détail + contenu d'un kit
+  POST /api/kits/{kit_id}/checkout           → sortie d'un kit complet
+  POST /api/kits/{kit_id}/checkin            → retour d'un kit (par batch_id)
 
 Auth : Bearer token statique (header Authorization: Bearer <token>)
        Défini par la variable d'environnement SIGA_API_TOKEN.
@@ -19,6 +27,7 @@ ou
 import os
 import time
 import uuid
+from datetime import datetime
 from difflib import SequenceMatcher
 from typing import List, Optional
 
@@ -34,8 +43,10 @@ DB_PATH    = "/files/duckdb/siga_v1.duckdb"
 API_TOKEN  = os.getenv("SIGA_API_TOKEN", "siga-secret-token-change-me")
 API_PORT   = int(os.getenv("SIGA_API_PORT", "8001"))
 
-SCORE_MIN  = 0.25   # Score minimum pour inclure un résultat
+SCORE_MIN  = 0.25
 MAX_RESULTS = 20
+
+VALID_MOVEMENT_TYPES = {"LOAN", "RENTAL", "MAINTENANCE"}
 
 # ─── Auth ─────────────────────────────────────────────────────
 security = HTTPBearer(auto_error=True)
@@ -51,7 +62,7 @@ def _require_token(
         )
 
 
-# ─── DuckDB helpers (même pattern retry que app.py) ───────────
+# ─── DuckDB helpers ───────────────────────────────────────────
 
 def _run_query(sql: str, params=None) -> pd.DataFrame:
     try:
@@ -86,35 +97,44 @@ def _run_write(sql: str, params=None, _retries: int = 5) -> None:
     )
 
 
+def _run_write_many(statements: list[tuple], _retries: int = 5) -> None:
+    """Exécute plusieurs (sql, params) dans une seule connexion (atomique)."""
+    delay = 2
+    last_err = None
+    for attempt in range(_retries):
+        try:
+            with duckdb.connect(DB_PATH, read_only=False) as conn:
+                for sql, params in statements:
+                    conn.execute(sql, params)
+            return
+        except duckdb.IOException as e:
+            last_err = e
+            if attempt < _retries - 1:
+                time.sleep(delay)
+                delay *= 2
+        except Exception as e:
+            raise RuntimeError(f"Écriture DuckDB : {e}") from e
+    raise RuntimeError(
+        f"Base inaccessible après {_retries} tentatives (lock n8n ?) : {last_err}"
+    )
+
+
 # ─── Scoring fuzzy ────────────────────────────────────────────
 
 def _score(query: str, row: dict) -> float:
-    """
-    Calcule un score de pertinence [0, 1] entre la requête et une ligne equipment.
-
-    Stratégie par priorité décroissante :
-      1. Égalité exacte (insensible à la casse)        → 1.00
-      2. Sous-chaîne exacte dans le champ               → 0.85 × poids
-      3. Tous les mots de la requête présents            → 0.75 × poids
-      4. SequenceMatcher ratio (correspondance partielle)→ ratio × poids
-    """
     q = query.strip().lower()
     words = q.split()
-
-    # Champs à scorer, avec leur poids
     fields = [
         (str(row.get("label",    "") or ""), 1.0),
         (str(row.get("brand",    "") or ""), 0.9),
         (str(row.get("model",    "") or ""), 0.9),
         (str(row.get("subtype",  "") or ""), 0.75),
     ]
-
     best = 0.0
     for text, weight in fields:
         t = text.lower().strip()
         if not t:
             continue
-
         if q == t:
             s = 1.0
         elif q in t or t in q:
@@ -123,9 +143,7 @@ def _score(query: str, row: dict) -> float:
             s = 0.75
         else:
             s = SequenceMatcher(None, q, t).ratio()
-
         best = max(best, s * weight)
-
     return round(min(best, 1.0), 3)
 
 
@@ -167,16 +185,123 @@ class ErrorResponse(BaseModel):
     equipment_id: Optional[str] = None
 
 
+# — Mouvements ────────────────────────────────────────────────
+
+class CheckoutRequest(BaseModel):
+    equipment_ids: List[str]
+    borrower_name: str
+    movement_type: str = "LOAN"          # LOAN | RENTAL | MAINTENANCE
+    borrower_contact: Optional[str] = None
+    expected_return_date: Optional[str] = None   # ISO 8601 : "2025-06-30"
+    notes: Optional[str] = None
+
+
+class CheckoutResponse(BaseModel):
+    ok: bool
+    batch_id: str
+    movement_ids: List[str]
+    count: int
+    message: str
+
+
+class CheckinRequest(BaseModel):
+    movement_ids: Optional[List[str]] = None   # entrée individuelle ou liste
+    batch_id: Optional[str] = None             # retour groupé par lot
+
+
+class CheckinResponse(BaseModel):
+    ok: bool
+    returned_count: int
+    message: str
+
+
+class ActiveMovementItem(BaseModel):
+    movement_id: str
+    equipment_id: str
+    label: str
+    borrower_name: str
+    movement_type: str
+    out_date: Optional[str] = None
+    expected_return_date: Optional[str] = None
+    batch_id: Optional[str] = None
+    kit_id: Optional[str] = None
+    kit_name: Optional[str] = None
+    is_late: bool
+
+
+class ActiveMovementsResponse(BaseModel):
+    count: int
+    items: List[ActiveMovementItem]
+
+
+class EquipmentStatusResponse(BaseModel):
+    equipment_id: str
+    label: str
+    available: bool
+    movement_type: Optional[str] = None
+    borrower_name: Optional[str] = None
+    out_date: Optional[str] = None
+    expected_return_date: Optional[str] = None
+
+
+# — Kits ──────────────────────────────────────────────────────
+
+class KitSummary(BaseModel):
+    kit_id: str
+    name: str
+    description: Optional[str] = None
+    item_count: int
+
+
+class KitListResponse(BaseModel):
+    count: int
+    kits: List[KitSummary]
+
+
+class KitItem(BaseModel):
+    equipment_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    condition: Optional[str] = None
+    location: Optional[str] = None
+
+
+class KitDetailResponse(BaseModel):
+    kit_id: str
+    name: str
+    description: Optional[str] = None
+    item_count: int
+    items: List[KitItem]
+
+
+class KitCheckoutRequest(BaseModel):
+    borrower_name: str
+    movement_type: str = "LOAN"
+    borrower_contact: Optional[str] = None
+    expected_return_date: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class KitCheckinRequest(BaseModel):
+    batch_id: str
+    returned_equipment_ids: Optional[List[str]] = None   # None = tout renvoyer
+
+
 # ─── App FastAPI ──────────────────────────────────────────────
 
 app = FastAPI(
     title="SIGA API",
     description="API HTTP métier pour le pilotage de SIGA par OpenClaw.",
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/api/docs",
     redoc_url=None,
 )
 
+
+# ════════════════════════════════════════════════════════════
+# ÉQUIPEMENTS — Recherche & Statut
+# ════════════════════════════════════════════════════════════
 
 @app.get(
     "/api/equipment/search",
@@ -188,29 +313,17 @@ def search_equipment(
     q: str,
     _: None = Security(_require_token),
 ) -> SearchResponse:
-    """
-    Recherche fuzzy dans le catalogue.
-
-    - Cherche dans : **label**, **brand**, **model**, **subtype**
-    - Tri par score de pertinence décroissant
-    - Renvoie une liste vide si aucun résultat (pas d'erreur HTTP)
-    """
+    """Recherche fuzzy dans le catalogue (label, brand, model, subtype)."""
     if not q or not q.strip():
         return SearchResponse(query=q, count=0, results=[])
 
     like = f"%{q.strip()}%"
-
     try:
         df = _run_query(
             """
             SELECT
-                equipment_id,
-                label,
-                brand,
-                model,
-                subtype,
-                condition_label,
-                location_hint
+                equipment_id, label, brand, model,
+                subtype, condition_label, location_hint
             FROM equipment
             WHERE
                 LOWER(label)   LIKE LOWER(?)
@@ -226,10 +339,8 @@ def search_equipment(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     if df.empty:
-        # Aucun résultat LIKE → on retourne vide (pas d'erreur)
         return SearchResponse(query=q, count=0, results=[])
 
-    # Score chaque ligne et filtre
     results: List[EquipmentResult] = []
     for _, row in df.iterrows():
         sc = _score(q, row.to_dict())
@@ -249,10 +360,568 @@ def search_equipment(
         )
 
     results.sort(key=lambda r: r.score, reverse=True)
-    results = results[:MAX_RESULTS]
+    return SearchResponse(query=q, count=len(results), results=results[:MAX_RESULTS])
 
-    return SearchResponse(query=q, count=len(results), results=results)
 
+@app.get(
+    "/api/equipment/{equipment_id}/status",
+    response_model=EquipmentStatusResponse,
+    summary="Disponibilité d'un équipement",
+    tags=["Équipements"],
+    responses={404: {"model": ErrorResponse}},
+)
+def equipment_status(
+    equipment_id: str,
+    _: None = Security(_require_token),
+) -> EquipmentStatusResponse:
+    """Indique si un équipement est disponible ou actuellement sorti."""
+    try:
+        eq_df = _run_query(
+            "SELECT equipment_id, label FROM equipment WHERE equipment_id = ? LIMIT 1",
+            [equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if eq_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorResponse(ok=False, error="equipment_not_found", equipment_id=equipment_id).model_dump(),
+        )
+
+    label = str(eq_df.iloc[0]["label"] or "")
+
+    try:
+        mv_df = _run_query(
+            """
+            SELECT movement_type, borrower_name, out_date, expected_return_date
+            FROM equipment_movements
+            WHERE equipment_id = ? AND actual_return_date IS NULL
+            ORDER BY out_date DESC LIMIT 1
+            """,
+            [equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if mv_df.empty:
+        return EquipmentStatusResponse(equipment_id=equipment_id, label=label, available=True)
+
+    row = mv_df.iloc[0]
+    return EquipmentStatusResponse(
+        equipment_id=equipment_id,
+        label=label,
+        available=False,
+        movement_type=str(row["movement_type"]) if pd.notna(row.get("movement_type")) else None,
+        borrower_name=str(row["borrower_name"]) if pd.notna(row.get("borrower_name")) else None,
+        out_date=str(row["out_date"])[:16] if pd.notna(row.get("out_date")) else None,
+        expected_return_date=str(row["expected_return_date"])[:16] if pd.notna(row.get("expected_return_date")) else None,
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# MOUVEMENTS — Sorties & Entrées
+# ════════════════════════════════════════════════════════════
+
+@app.post(
+    "/api/movements/checkout",
+    response_model=CheckoutResponse,
+    summary="Sortie d'équipement (individuelle ou groupée)",
+    tags=["Mouvements"],
+    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def checkout_equipment(
+    body: CheckoutRequest,
+    _: None = Security(_require_token),
+) -> CheckoutResponse:
+    """
+    Enregistre la sortie d'un ou plusieurs équipements.
+
+    - Un seul `equipment_id` → mouvement individuel (pas de batch_id).
+    - Plusieurs `equipment_ids` → sortie groupée, tous partagent un `batch_id`.
+    - `movement_type` : `LOAN` (prêt), `RENTAL` (location), `MAINTENANCE`.
+    - `expected_return_date` au format ISO 8601 (`YYYY-MM-DD` ou `YYYY-MM-DDTHH:MM`).
+    """
+    if not body.equipment_ids:
+        raise HTTPException(status_code=400, detail="equipment_ids ne peut pas être vide.")
+
+    mv_type = body.movement_type.upper()
+    if mv_type not in VALID_MOVEMENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"movement_type invalide : {mv_type}. Valeurs : {VALID_MOVEMENT_TYPES}",
+        )
+
+    if not body.borrower_name or not body.borrower_name.strip():
+        raise HTTPException(status_code=400, detail="borrower_name est obligatoire.")
+
+    # Parse expected_return_date
+    exp_dt: Optional[datetime] = None
+    if body.expected_return_date:
+        for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                exp_dt = datetime.strptime(body.expected_return_date, fmt)
+                break
+            except ValueError:
+                continue
+        if exp_dt is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"expected_return_date invalide : '{body.expected_return_date}'. Format attendu : YYYY-MM-DD",
+            )
+
+    # Vérifie que tous les equipment_ids existent
+    try:
+        ids_placeholder = ", ".join(["?"] * len(body.equipment_ids))
+        exists_df = _run_query(
+            f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_placeholder})",
+            body.equipment_ids,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    found_ids = set(exists_df["equipment_id"].tolist())
+    missing = [eid for eid in body.equipment_ids if eid not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Équipements introuvables : {missing}",
+        )
+
+    # Génère batch_id si sortie groupée
+    batch_id = str(uuid.uuid4()) if len(body.equipment_ids) > 1 else None
+    movement_ids: List[str] = []
+    statements = []
+
+    for eid in body.equipment_ids:
+        mid = str(uuid.uuid4())
+        movement_ids.append(mid)
+        statements.append((
+            """
+            INSERT INTO equipment_movements
+                (movement_id, equipment_id, movement_type,
+                 borrower_name, borrower_contact,
+                 out_date, expected_return_date, notes, batch_id)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+            """,
+            [mid, eid, mv_type,
+             body.borrower_name.strip(),
+             body.borrower_contact.strip() if body.borrower_contact else None,
+             exp_dt, body.notes, batch_id],
+        ))
+
+    try:
+        _run_write_many(statements)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    count = len(body.equipment_ids)
+    msg = (
+        f"{count} équipement(s) sorti(s) pour '{body.borrower_name.strip()}' "
+        f"(type : {mv_type}"
+        + (f", retour prévu : {body.expected_return_date}" if exp_dt else "")
+        + ")."
+    )
+    return CheckoutResponse(
+        ok=True,
+        batch_id=batch_id or movement_ids[0],
+        movement_ids=movement_ids,
+        count=count,
+        message=msg,
+    )
+
+
+@app.post(
+    "/api/movements/checkin",
+    response_model=CheckinResponse,
+    summary="Entrée d'équipement (individuelle, groupée ou par batch)",
+    tags=["Mouvements"],
+    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def checkin_equipment(
+    body: CheckinRequest,
+    _: None = Security(_require_token),
+) -> CheckinResponse:
+    """
+    Enregistre le retour d'un ou plusieurs équipements.
+
+    - Fournir `movement_ids` pour un retour ciblé (liste de 1..N).
+    - Fournir `batch_id` pour solder tous les équipements d'un lot.
+    - Les deux peuvent être combinés.
+    """
+    if not body.movement_ids and not body.batch_id:
+        raise HTTPException(status_code=400, detail="Fournir movement_ids ou batch_id.")
+
+    statements = []
+    now_str = datetime.now().isoformat(sep=" ", timespec="seconds")
+
+    if body.movement_ids:
+        for mid in body.movement_ids:
+            statements.append((
+                "UPDATE equipment_movements SET actual_return_date = CURRENT_TIMESTAMP WHERE movement_id = ? AND actual_return_date IS NULL",
+                [mid],
+            ))
+
+    if body.batch_id:
+        statements.append((
+            "UPDATE equipment_movements SET actual_return_date = CURRENT_TIMESTAMP WHERE batch_id = ? AND actual_return_date IS NULL",
+            [body.batch_id],
+        ))
+
+    try:
+        _run_write_many(statements)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    # Compte les lignes effectivement mises à jour
+    try:
+        if body.batch_id:
+            count_df = _run_query(
+                "SELECT COUNT(*) AS n FROM equipment_movements WHERE batch_id = ? AND actual_return_date IS NOT NULL",
+                [body.batch_id],
+            )
+        else:
+            ids_ph = ", ".join(["?"] * len(body.movement_ids))
+            count_df = _run_query(
+                f"SELECT COUNT(*) AS n FROM equipment_movements WHERE movement_id IN ({ids_ph}) AND actual_return_date IS NOT NULL",
+                body.movement_ids,
+            )
+        returned = int(count_df.iloc[0]["n"]) if not count_df.empty else 0
+    except RuntimeError:
+        returned = len(body.movement_ids or [])
+
+    return CheckinResponse(
+        ok=True,
+        returned_count=returned,
+        message=f"{returned} équipement(s) enregistré(s) comme rendu(s).",
+    )
+
+
+@app.get(
+    "/api/movements/active",
+    response_model=ActiveMovementsResponse,
+    summary="Liste des équipements actuellement sortis",
+    tags=["Mouvements"],
+)
+def active_movements(
+    _: None = Security(_require_token),
+) -> ActiveMovementsResponse:
+    """
+    Retourne tous les mouvements non soldés (actual_return_date IS NULL),
+    triés par date de sortie décroissante.
+    Indique si le retour est en retard (`is_late`).
+    """
+    try:
+        df = _run_query(
+            """
+            SELECT
+                m.movement_id,
+                m.equipment_id,
+                COALESCE(NULLIF(e.label, ''), e.brand || ' ' || e.model, m.equipment_id) AS label,
+                m.borrower_name,
+                m.movement_type,
+                m.out_date,
+                m.expected_return_date,
+                m.batch_id,
+                m.kit_id,
+                k.name AS kit_name
+            FROM equipment_movements m
+            JOIN equipment e ON e.equipment_id = m.equipment_id
+            LEFT JOIN kits k ON k.kit_id = m.kit_id
+            WHERE m.actual_return_date IS NULL
+            ORDER BY m.out_date DESC
+            """
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    now = datetime.now()
+    items: List[ActiveMovementItem] = []
+    for _, row in df.iterrows():
+        exp = row.get("expected_return_date")
+        is_late = bool(pd.notna(exp) and pd.Timestamp(exp).to_pydatetime() < now)
+        items.append(ActiveMovementItem(
+            movement_id=str(row["movement_id"]),
+            equipment_id=str(row["equipment_id"]),
+            label=str(row["label"] or ""),
+            borrower_name=str(row["borrower_name"] or ""),
+            movement_type=str(row["movement_type"] or ""),
+            out_date=str(row["out_date"])[:16] if pd.notna(row.get("out_date")) else None,
+            expected_return_date=str(row["expected_return_date"])[:16] if pd.notna(row.get("expected_return_date")) else None,
+            batch_id=str(row["batch_id"]) if pd.notna(row.get("batch_id")) else None,
+            kit_id=str(row["kit_id"]) if pd.notna(row.get("kit_id")) else None,
+            kit_name=str(row["kit_name"]) if pd.notna(row.get("kit_name")) else None,
+            is_late=is_late,
+        ))
+
+    return ActiveMovementsResponse(count=len(items), items=items)
+
+
+# ════════════════════════════════════════════════════════════
+# KITS — Gestion des paniers / caisses à outils
+# ════════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/kits",
+    response_model=KitListResponse,
+    summary="Liste de tous les kits disponibles",
+    tags=["Kits"],
+)
+def list_kits(
+    _: None = Security(_require_token),
+) -> KitListResponse:
+    """Retourne tous les kits avec leur nombre d'équipements."""
+    try:
+        df = _run_query(
+            """
+            SELECT k.kit_id, k.name, k.description, COUNT(ki.equipment_id) AS item_count
+            FROM kits k
+            LEFT JOIN kit_items ki ON ki.kit_id = k.kit_id
+            GROUP BY k.kit_id, k.name, k.description
+            ORDER BY k.name
+            """
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    kits = [
+        KitSummary(
+            kit_id=str(row["kit_id"]),
+            name=str(row["name"] or ""),
+            description=str(row["description"]) if pd.notna(row.get("description")) else None,
+            item_count=int(row["item_count"]),
+        )
+        for _, row in df.iterrows()
+    ]
+    return KitListResponse(count=len(kits), kits=kits)
+
+
+@app.get(
+    "/api/kits/{kit_id}",
+    response_model=KitDetailResponse,
+    summary="Détail d'un kit avec son contenu",
+    tags=["Kits"],
+    responses={404: {"model": ErrorResponse}},
+)
+def get_kit(
+    kit_id: str,
+    _: None = Security(_require_token),
+) -> KitDetailResponse:
+    """Retourne les informations du kit et la liste détaillée de ses équipements."""
+    try:
+        kit_df = _run_query(
+            "SELECT kit_id, name, description FROM kits WHERE kit_id = ? LIMIT 1",
+            [kit_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorResponse(ok=False, error="kit_not_found").model_dump(),
+        )
+
+    kit_row = kit_df.iloc[0]
+
+    try:
+        items_df = _run_query(
+            """
+            SELECT e.equipment_id, e.label, e.brand, e.model, e.condition_label, e.location_hint
+            FROM kit_items ki
+            JOIN equipment e ON e.equipment_id = ki.equipment_id
+            WHERE ki.kit_id = ?
+            ORDER BY e.label
+            """,
+            [kit_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    items = [
+        KitItem(
+            equipment_id=str(row["equipment_id"]),
+            label=str(row["label"] or ""),
+            brand=str(row["brand"]) if pd.notna(row.get("brand")) else None,
+            model=str(row["model"]) if pd.notna(row.get("model")) else None,
+            condition=str(row["condition_label"]) if pd.notna(row.get("condition_label")) else None,
+            location=str(row["location_hint"]) if pd.notna(row.get("location_hint")) else None,
+        )
+        for _, row in items_df.iterrows()
+    ]
+
+    return KitDetailResponse(
+        kit_id=str(kit_row["kit_id"]),
+        name=str(kit_row["name"] or ""),
+        description=str(kit_row["description"]) if pd.notna(kit_row.get("description")) else None,
+        item_count=len(items),
+        items=items,
+    )
+
+
+@app.post(
+    "/api/kits/{kit_id}/checkout",
+    response_model=CheckoutResponse,
+    summary="Sortie d'un kit complet pour un chantier",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def checkout_kit(
+    kit_id: str,
+    body: KitCheckoutRequest,
+    _: None = Security(_require_token),
+) -> CheckoutResponse:
+    """
+    Enregistre la sortie de tous les équipements d'un kit pour un chantier.
+
+    Tous les mouvements partagent un `batch_id` commun et sont liés au `kit_id`.
+    Permet le retour groupé via `/api/kits/{kit_id}/checkin`.
+    """
+    mv_type = body.movement_type.upper()
+    if mv_type not in VALID_MOVEMENT_TYPES:
+        raise HTTPException(status_code=400, detail=f"movement_type invalide : {mv_type}")
+
+    if not body.borrower_name or not body.borrower_name.strip():
+        raise HTTPException(status_code=400, detail="borrower_name est obligatoire.")
+
+    exp_dt: Optional[datetime] = None
+    if body.expected_return_date:
+        for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+            try:
+                exp_dt = datetime.strptime(body.expected_return_date, fmt)
+                break
+            except ValueError:
+                continue
+        if exp_dt is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"expected_return_date invalide : '{body.expected_return_date}'",
+            )
+
+    # Vérifie que le kit existe
+    try:
+        kit_df = _run_query("SELECT kit_id, name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    kit_name = str(kit_df.iloc[0]["name"] or "")
+
+    # Récupère les équipements du kit
+    try:
+        items_df = _run_query("SELECT equipment_id FROM kit_items WHERE kit_id = ?", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if items_df.empty:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Le kit '{kit_name}' ne contient aucun équipement.",
+        )
+
+    equipment_ids = items_df["equipment_id"].tolist()
+    batch_id = str(uuid.uuid4())
+    movement_ids: List[str] = []
+    statements = []
+
+    for eid in equipment_ids:
+        mid = str(uuid.uuid4())
+        movement_ids.append(mid)
+        statements.append((
+            """
+            INSERT INTO equipment_movements
+                (movement_id, equipment_id, movement_type,
+                 borrower_name, borrower_contact,
+                 out_date, expected_return_date, notes, batch_id, kit_id)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+            """,
+            [mid, eid, mv_type,
+             body.borrower_name.strip(),
+             body.borrower_contact.strip() if body.borrower_contact else None,
+             exp_dt, body.notes, batch_id, kit_id],
+        ))
+
+    try:
+        _run_write_many(statements)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    count = len(equipment_ids)
+    msg = (
+        f"Kit '{kit_name}' sorti ({count} outil(s)) pour '{body.borrower_name.strip()}' "
+        + (f"— retour prévu le {body.expected_return_date}." if exp_dt else ".")
+    )
+    return CheckoutResponse(ok=True, batch_id=batch_id, movement_ids=movement_ids, count=count, message=msg)
+
+
+@app.post(
+    "/api/kits/{kit_id}/checkin",
+    response_model=CheckinResponse,
+    summary="Retour d'un kit (total ou partiel via batch_id)",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def checkin_kit(
+    kit_id: str,
+    body: KitCheckinRequest,
+    _: None = Security(_require_token),
+) -> CheckinResponse:
+    """
+    Enregistre le retour d'un kit sorti par lot.
+
+    - `batch_id` : identifiant du lot de sortie (retourné par `/checkout`).
+    - `returned_equipment_ids` : si fourni, seuls ces équipements sont soldés
+      (retour partiel — les autres restent ouverts).
+    - Si `returned_equipment_ids` est absent ou vide → retour total du lot.
+    """
+    if not body.batch_id:
+        raise HTTPException(status_code=400, detail="batch_id est obligatoire.")
+
+    try:
+        if body.returned_equipment_ids:
+            # Retour partiel : on filtre par equipment_id ET batch_id
+            ids_ph = ", ".join(["?"] * len(body.returned_equipment_ids))
+            _run_write(
+                f"""
+                UPDATE equipment_movements
+                SET actual_return_date = CURRENT_TIMESTAMP
+                WHERE batch_id = ?
+                  AND equipment_id IN ({ids_ph})
+                  AND actual_return_date IS NULL
+                """,
+                [body.batch_id] + body.returned_equipment_ids,
+            )
+        else:
+            # Retour total du lot
+            _run_write(
+                "UPDATE equipment_movements SET actual_return_date = CURRENT_TIMESTAMP WHERE batch_id = ? AND actual_return_date IS NULL",
+                [body.batch_id],
+            )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    # Compte les retours effectifs
+    try:
+        count_df = _run_query(
+            "SELECT COUNT(*) AS n FROM equipment_movements WHERE batch_id = ? AND actual_return_date IS NOT NULL",
+            [body.batch_id],
+        )
+        returned = int(count_df.iloc[0]["n"]) if not count_df.empty else 0
+    except RuntimeError:
+        returned = len(body.returned_equipment_ids or [])
+
+    return CheckinResponse(
+        ok=True,
+        returned_count=returned,
+        message=f"{returned} outil(s) du kit enregistré(s) comme rendu(s).",
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# KIOSQUE
+# ════════════════════════════════════════════════════════════
 
 @app.post(
     "/api/display/show",
@@ -268,13 +937,7 @@ def display_equipment(
     body: DisplayRequest,
     _: None = Security(_require_token),
 ) -> DisplayResponse:
-    """
-    Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5.
-
-    L'écran kiosque (Streamlit `?kiosk=true`) poll la table `ui_commands`
-    toutes les 2 secondes et bascule automatiquement sur la fiche.
-    """
-    # Vérifie que l'équipement existe
+    """Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5."""
     try:
         exists_df = _run_query(
             "SELECT equipment_id FROM equipment WHERE equipment_id = ? LIMIT 1",
@@ -283,24 +946,15 @@ def display_equipment(
     except RuntimeError as e:
         raise HTTPException(
             status_code=503,
-            detail=ErrorResponse(
-                ok=False,
-                error="screen_unavailable",
-                detail=str(e),
-            ).model_dump(),
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump(),
         ) from e
 
     if exists_df.empty:
         raise HTTPException(
             status_code=404,
-            detail=ErrorResponse(
-                ok=False,
-                error="equipment_not_found",
-                equipment_id=body.equipment_id,
-            ).model_dump(),
+            detail=ErrorResponse(ok=False, error="equipment_not_found", equipment_id=body.equipment_id).model_dump(),
         )
 
-    # Insère la commande dans la boîte aux lettres
     command_id = str(uuid.uuid4())
     try:
         _run_write(
@@ -315,11 +969,7 @@ def display_equipment(
     except RuntimeError as e:
         raise HTTPException(
             status_code=503,
-            detail=ErrorResponse(
-                ok=False,
-                error="screen_unavailable",
-                detail=str(e),
-            ).model_dump(),
+            detail=ErrorResponse(ok=False, error="screen_unavailable", detail=str(e)).model_dump(),
         ) from e
 
     return DisplayResponse(
