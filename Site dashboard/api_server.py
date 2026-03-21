@@ -33,7 +33,6 @@ ou
 import json
 import os
 import time
-import traceback
 import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
@@ -1029,21 +1028,11 @@ def display_equipment(
     body: DisplayRequest,
     _: None = Security(_require_token),
 ) -> DisplayResponse:
-    """Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5."""
-    try:
-        return _display_equipment_inner(body)
-    except HTTPException:
-        raise
-    except Exception:
-        tb = traceback.format_exc()
-        raise HTTPException(
-            status_code=500,
-            detail={"ok": False, "error": "internal_error", "traceback": tb},
-        )
+    """Envoie une commande `SHOW_EQUIPMENT` au kiosque Raspberry Pi 5.
 
-
-def _display_equipment_inner(body: DisplayRequest) -> DisplayResponse:
-    """Corps de display_equipment — isolé pour capturer tout traceback."""
+    Embarque les données équipement + prêts actifs dans le fichier JSON partagé
+    afin que le kiosque n'ait pas à interroger DuckDB lui-même.
+    """
     try:
         eq_df = _run_query(
             """
