@@ -1038,8 +1038,9 @@ def display_equipment(
             """
             SELECT
                 e.equipment_id, e.label, e.brand, e.model, e.serial_number,
-                e.subtype, e.condition_label, e.location_hint, e.notes,
-                e.technical_specs_json
+                e.subtype, e.category, e.condition_label, e.location_hint, e.notes,
+                e.ownership_mode, e.purchase_price, e.purchase_currency,
+                e.technical_specs_json, e.business_context_json
             FROM equipment e
             WHERE e.equipment_id = ?
             """,
@@ -1098,11 +1099,28 @@ def display_equipment(
         loans = []
 
     row = eq_df.iloc[0]
+
     specs_raw = _s(row.get("technical_specs_json"))
     try:
         specs = json.loads(specs_raw) if specs_raw else {}
     except Exception:
         specs = {}
+
+    biz_raw = _s(row.get("business_context_json"))
+    try:
+        biz = json.loads(biz_raw) if biz_raw else {}
+    except Exception:
+        biz = {}
+
+    purchase_price = row.get("purchase_price")
+    try:
+        purchase_price_str = (
+            f"{float(purchase_price):.2f} {_s(row.get('purchase_currency')) or '€'}"
+            if purchase_price is not None and pd.notna(purchase_price)
+            else ""
+        )
+    except Exception:
+        purchase_price_str = ""
 
     eq_data = {
         "equipment_id":    _s(row.get("equipment_id")),
@@ -1111,10 +1129,16 @@ def display_equipment(
         "model":           _s(row.get("model")),
         "serial_number":   _s(row.get("serial_number")),
         "subtype":         _s(row.get("subtype")),
+        "category":        _s(row.get("category")),
         "condition_label": _s(row.get("condition_label")),
         "location_hint":   _s(row.get("location_hint")),
+        "ownership_mode":  _s(row.get("ownership_mode")),
+        "purchase_price":  purchase_price_str,
         "notes":           _s(row.get("notes")),
         "technical_specs": specs,
+        "accessories":     biz.get("accessories") or biz.get("accessoires") or [],
+        "consumables":     biz.get("consumables") or biz.get("consommables") or [],
+        "associated_items": biz.get("associated_items") or biz.get("elements_associes") or [],
         "media_files":     media_files,
         "loans":           loans,
     }

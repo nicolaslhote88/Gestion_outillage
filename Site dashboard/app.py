@@ -3031,15 +3031,21 @@ def render_kiosk_equipment(data: dict) -> None:
 
     label     = null_str(data.get("label"),          "Équipement")
     brand     = null_str(data.get("brand"),           "")
-    model     = null_str(data.get("model"),           "")
-    serial    = null_str(data.get("serial_number"),   "")
-    subtype   = null_str(data.get("subtype"),         "")
-    condition = null_str(data.get("condition_label"), "")
-    location  = null_str(data.get("location_hint"),   "")
-    notes     = null_str(data.get("notes"),           "")
-    specs     = data.get("technical_specs") or {}
-    media     = data.get("media_files") or []   # liste {file_id, role}
-    loans_raw = data.get("loans") or []
+    model          = null_str(data.get("model"),           "")
+    serial         = null_str(data.get("serial_number"),   "")
+    subtype        = null_str(data.get("subtype"),         "")
+    category       = null_str(data.get("category"),        "")
+    condition      = null_str(data.get("condition_label"), "")
+    location       = null_str(data.get("location_hint"),   "")
+    ownership_mode = null_str(data.get("ownership_mode"),  "")
+    purchase_price = null_str(data.get("purchase_price"),  "")
+    notes          = null_str(data.get("notes"),           "")
+    specs          = data.get("technical_specs") or {}
+    accessories    = data.get("accessories")     or []
+    consumables    = data.get("consumables")     or []
+    associated     = data.get("associated_items") or []
+    media          = data.get("media_files") or []   # liste {file_id, role}
+    loans_raw      = data.get("loans") or []
 
     st.markdown("""<style>
     header, section[data-testid="stSidebar"] { display: none !important; }
@@ -3137,14 +3143,20 @@ def render_kiosk_equipment(data: dict) -> None:
             specs_html += "</div>"
             st.markdown(specs_html, unsafe_allow_html=True)
 
-        # Infos pratiques (serial, emplacement, notes)
+        # Infos pratiques (catégorie, serial, emplacement, mode acquisition, prix)
         pratique_items = []
+        if category:
+            pratique_items.append(("Catégorie", category))
         if serial:
             pratique_items.append(("N° série", serial))
         if location:
             pratique_items.append(("Emplacement", location))
+        if ownership_mode:
+            pratique_items.append(("Mode acquisition", ownership_mode))
+        if purchase_price:
+            pratique_items.append(("Prix d'achat", purchase_price))
         if pratique_items:
-            pratique_html = "<hr class='kiosk-sep'><div style='display:flex;gap:2rem;flex-wrap:wrap;'>"
+            pratique_html = "<hr class='kiosk-sep'><div style='display:grid;grid-template-columns:1fr 1fr;gap:0.6rem 1.5rem;'>"
             for lbl, val in pratique_items:
                 pratique_html += (
                     f"<div><div class='kiosk-spec-label'>{lbl}</div>"
@@ -3152,6 +3164,40 @@ def render_kiosk_equipment(data: dict) -> None:
                 )
             pratique_html += "</div>"
             st.markdown(pratique_html, unsafe_allow_html=True)
+
+        # Accessoires, consommables, éléments associés
+        def _fmt_biz_item(item) -> str:
+            if isinstance(item, dict):
+                lbl   = item.get("label") or item.get("raw_label") or item.get("detected_object_type") or "?"
+                brand = item.get("brand", "")
+                model = item.get("model", "")
+                cond  = item.get("item_condition") or item.get("consumable_state") or ""
+                parts = [lbl]
+                if brand: parts.append(brand)
+                if model: parts.append(model)
+                if cond:  parts.append(f"<em>({cond})</em>")
+                return " · ".join(parts)
+            return str(item)
+
+        for section_icon, section_title, section_items in [
+            ("✦", "Accessoires livrés",  accessories),
+            ("⚙", "Consommables associés", consumables),
+            ("🔗", "Éléments associés",   associated),
+        ]:
+            if section_items:
+                items_html = (
+                    f"<hr class='kiosk-sep'>"
+                    f"<div class='kiosk-spec-label' style='margin-bottom:0.4rem;font-size:0.85rem;"
+                    f"text-transform:uppercase;letter-spacing:0.05em;'>{section_title}</div>"
+                    f"<div style='display:flex;flex-direction:column;gap:0.3rem;'>"
+                )
+                for it in section_items:
+                    items_html += (
+                        f"<div style='color:#cbd5e1;font-size:0.95rem;'>"
+                        f"{section_icon} {_fmt_biz_item(it)}</div>"
+                    )
+                items_html += "</div>"
+                st.markdown(items_html, unsafe_allow_html=True)
 
         if notes:
             st.markdown(
