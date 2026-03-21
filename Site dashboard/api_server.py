@@ -13,6 +13,12 @@ Opérations :
   GET  /api/kits/{kit_id}                    → détail + contenu d'un kit
   POST /api/kits/{kit_id}/checkout           → sortie d'un kit complet
   POST /api/kits/{kit_id}/checkin            → retour d'un kit (par batch_id)
+  POST /api/kits                             → créer un kit (+ peupler en une passe)
+  PUT  /api/kits/{kit_id}                    → renommer / modifier la description
+  DELETE /api/kits/{kit_id}                  → supprimer un kit
+  POST /api/kits/{kit_id}/items              → ajouter des équipements à un kit
+  DELETE /api/kits/{kit_id}/items            → retirer des équipements d'un kit
+  PUT  /api/kits/{kit_id}/content            → remplacer entièrement le contenu
 
 Auth : Bearer token statique (header Authorization: Bearer <token>)
        Défini par la variable d'environnement SIGA_API_TOKEN.
@@ -245,6 +251,31 @@ class EquipmentStatusResponse(BaseModel):
 
 
 # — Kits ──────────────────────────────────────────────────────
+
+class KitCreateRequest(BaseModel):
+    name: str
+    description: Optional[str] = None
+    equipment_ids: Optional[List[str]] = None   # optionnel : peupler le kit à la création
+
+
+class KitUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class KitAddItemsRequest(BaseModel):
+    equipment_ids: List[str]
+
+
+class KitSetContentRequest(BaseModel):
+    equipment_ids: List[str]   # remplace entièrement le contenu existant
+
+
+class KitMutationResponse(BaseModel):
+    ok: bool
+    kit_id: str
+    message: str
+
 
 class KitSummary(BaseModel):
     kit_id: str
@@ -981,6 +1012,315 @@ def display_equipment(
             f"Commande d'affichage transmise à l'écran atelier. "
             f"L'équipement '{body.equipment_id}' sera visible dans ≤ 2 s."
         ),
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# KITS — Création & Administration
+# ════════════════════════════════════════════════════════════
+
+@app.post(
+    "/api/kits",
+    response_model=KitMutationResponse,
+    status_code=201,
+    summary="Crée un nouveau kit",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def create_kit(
+    body: KitCreateRequest,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """
+    Crée un kit (caisse à outils / panier chantier).
+
+    - `name` : nom du kit (obligatoire).
+    - `description` : description libre — optionnel.
+    - `equipment_ids` : liste d'équipements à intégrer immédiatement — optionnel.
+      Le kit peut aussi être peuplé ultérieurement via `POST /api/kits/{id}/items`.
+    """
+    if not body.name or not body.name.strip():
+        raise HTTPException(status_code=400, detail="Le nom du kit est obligatoire.")
+
+    kit_id = str(uuid.uuid4())
+
+    try:
+        _run_write(
+            "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
+            [kit_id, body.name.strip(), body.description.strip() if body.description else None],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    # Peupler si equipment_ids fournis
+    if body.equipment_ids:
+        # Vérifie existence
+        ids_ph = ", ".join(["?"] * len(body.equipment_ids))
+        try:
+            exists_df = _run_query(
+                f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+                body.equipment_ids,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        found_ids = set(exists_df["equipment_id"].tolist())
+        missing = [eid for eid in body.equipment_ids if eid not in found_ids]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Kit créé (id={kit_id}) mais équipements introuvables : {missing}",
+            )
+
+        stmts = [
+            ("INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+            for eid in body.equipment_ids
+        ]
+        try:
+            _run_write_many(stmts)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    count = len(body.equipment_ids) if body.equipment_ids else 0
+    return KitMutationResponse(
+        ok=True,
+        kit_id=kit_id,
+        message=f"Kit '{body.name.strip()}' créé" + (f" avec {count} équipement(s)." if count else "."),
+    )
+
+
+@app.put(
+    "/api/kits/{kit_id}",
+    response_model=KitMutationResponse,
+    summary="Renomme ou modifie la description d'un kit",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def update_kit(
+    kit_id: str,
+    body: KitUpdateRequest,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """Met à jour le `name` et/ou la `description` d'un kit existant."""
+    if not body.name and body.description is None:
+        raise HTTPException(status_code=400, detail="Fournir name ou description à modifier.")
+
+    try:
+        kit_df = _run_query("SELECT kit_id FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    if body.name:
+        try:
+            _run_write("UPDATE kits SET name = ? WHERE kit_id = ?", [body.name.strip(), kit_id])
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if body.description is not None:
+        try:
+            _run_write(
+                "UPDATE kits SET description = ? WHERE kit_id = ?",
+                [body.description.strip() or None, kit_id],
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return KitMutationResponse(ok=True, kit_id=kit_id, message="Kit mis à jour.")
+
+
+@app.delete(
+    "/api/kits/{kit_id}",
+    response_model=KitMutationResponse,
+    summary="Supprime un kit et son contenu",
+    tags=["Kits"],
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_kit(
+    kit_id: str,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """
+    Supprime le kit et toutes ses entrées dans `kit_items`.
+    Les mouvements passés référençant ce kit ne sont pas supprimés (historique conservé).
+    """
+    try:
+        kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    name = str(kit_df.iloc[0]["name"] or kit_id)
+
+    try:
+        _run_write_many([
+            ("DELETE FROM kit_items WHERE kit_id = ?", [kit_id]),
+            ("DELETE FROM kits WHERE kit_id = ?", [kit_id]),
+        ])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return KitMutationResponse(ok=True, kit_id=kit_id, message=f"Kit '{name}' supprimé.")
+
+
+@app.post(
+    "/api/kits/{kit_id}/items",
+    response_model=KitMutationResponse,
+    status_code=201,
+    summary="Ajoute des équipements à un kit existant",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def add_kit_items(
+    kit_id: str,
+    body: KitAddItemsRequest,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """
+    Ajoute un ou plusieurs équipements à un kit.
+    Les doublons sont ignorés silencieusement (INSERT OR IGNORE).
+    """
+    if not body.equipment_ids:
+        raise HTTPException(status_code=400, detail="equipment_ids ne peut pas être vide.")
+
+    try:
+        kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    # Vérifie existence des équipements
+    ids_ph = ", ".join(["?"] * len(body.equipment_ids))
+    try:
+        exists_df = _run_query(
+            f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+            body.equipment_ids,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    found_ids = set(exists_df["equipment_id"].tolist())
+    missing = [eid for eid in body.equipment_ids if eid not in found_ids]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Équipements introuvables : {missing}")
+
+    stmts = [
+        ("INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+        for eid in body.equipment_ids
+    ]
+    try:
+        _run_write_many(stmts)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return KitMutationResponse(
+        ok=True,
+        kit_id=kit_id,
+        message=f"{len(body.equipment_ids)} équipement(s) ajouté(s) au kit.",
+    )
+
+
+@app.delete(
+    "/api/kits/{kit_id}/items",
+    response_model=KitMutationResponse,
+    summary="Retire des équipements d'un kit",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def remove_kit_items(
+    kit_id: str,
+    body: KitAddItemsRequest,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """Retire un ou plusieurs équipements d'un kit (sans les supprimer du catalogue)."""
+    if not body.equipment_ids:
+        raise HTTPException(status_code=400, detail="equipment_ids ne peut pas être vide.")
+
+    try:
+        kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    ids_ph = ", ".join(["?"] * len(body.equipment_ids))
+    try:
+        _run_write(
+            f"DELETE FROM kit_items WHERE kit_id = ? AND equipment_id IN ({ids_ph})",
+            [kit_id] + body.equipment_ids,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return KitMutationResponse(
+        ok=True,
+        kit_id=kit_id,
+        message=f"{len(body.equipment_ids)} équipement(s) retiré(s) du kit.",
+    )
+
+
+@app.put(
+    "/api/kits/{kit_id}/content",
+    response_model=KitMutationResponse,
+    summary="Remplace entièrement le contenu d'un kit",
+    tags=["Kits"],
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def set_kit_content(
+    kit_id: str,
+    body: KitSetContentRequest,
+    _: None = Security(_require_token),
+) -> KitMutationResponse:
+    """
+    Remplace atomiquement la liste complète des équipements d'un kit.
+    Équivalent à : vider le kit puis ajouter `equipment_ids`.
+    Passer une liste vide pour vider le kit sans le supprimer.
+    """
+    try:
+        kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if kit_df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="kit_not_found").model_dump())
+
+    if body.equipment_ids:
+        ids_ph = ", ".join(["?"] * len(body.equipment_ids))
+        try:
+            exists_df = _run_query(
+                f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+                body.equipment_ids,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        found_ids = set(exists_df["equipment_id"].tolist())
+        missing = [eid for eid in body.equipment_ids if eid not in found_ids]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Équipements introuvables : {missing}")
+
+    stmts: list[tuple] = [("DELETE FROM kit_items WHERE kit_id = ?", [kit_id])]
+    stmts += [
+        ("INSERT INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+        for eid in body.equipment_ids
+    ]
+    try:
+        _run_write_many(stmts)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    name = str(kit_df.iloc[0]["name"] or kit_id)
+    return KitMutationResponse(
+        ok=True,
+        kit_id=kit_id,
+        message=f"Contenu du kit '{name}' mis à jour : {len(body.equipment_ids)} équipement(s).",
     )
 
 

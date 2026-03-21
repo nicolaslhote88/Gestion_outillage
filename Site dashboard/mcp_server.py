@@ -4,6 +4,7 @@ Expose des outils pour qu'un agent IA (Openclaw) puisse :
   - Rechercher des équipements dans le catalogue DuckDB
   - Consulter la disponibilité et les sorties en cours
   - Enregistrer des sorties et retours (individuels, groupés, par kit)
+  - Créer, composer et supprimer des kits (caisses à outils / paniers chantier)
   - Préparer un chantier via les kits / paniers
   - Piloter l'affichage de l'écran kiosque atelier (Raspberry Pi 5)
 
@@ -753,6 +754,258 @@ def display_on_screen(equipment_id: str) -> str:
         f"L'équipement '{equipment_id}' sera affiché dans les 2 secondes "
         f"(command_id: {command_id})."
     )
+
+
+# ════════════════════════════════════════════════════════════
+# OUTILS 11-15 — Création & administration des kits
+# ════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def create_kit(
+    name: str,
+    description: Optional[str] = None,
+    equipment_ids: Optional[list[str]] = None,
+) -> str:
+    """
+    Crée un nouveau kit (caisse à outils / panier chantier).
+
+    Un kit est un ensemble pré-configuré d'équipements destiné à un type de
+    chantier ou d'intervention. Il peut être sorti entièrement d'un coup via
+    checkout_kit().
+
+    Args:
+        name: Nom du kit (ex : "Caisse Plomberie Urgence"). Obligatoire.
+        description: Description libre du kit — optionnel.
+        equipment_ids: Liste d'equipment_id à inclure dès la création.
+                       Si absent, le kit est créé vide et on peut le peupler
+                       ensuite via add_equipment_to_kit() ou set_kit_content().
+
+    Returns:
+        JSON avec le kit_id généré et un message de confirmation.
+    """
+    if not name or not name.strip():
+        return json.dumps({"ok": False, "error": "Le nom du kit est obligatoire."})
+
+    kit_id = str(uuid.uuid4())
+
+    _run_write(
+        "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
+        [kit_id, name.strip(), description.strip() if description else None],
+    )
+
+    added = 0
+    if equipment_ids:
+        # Vérifie que les équipements existent
+        ids_ph = ", ".join(["?"] * len(equipment_ids))
+        exists_df = _run_query(
+            f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+            equipment_ids,
+        )
+        found_ids = set(exists_df["equipment_id"].tolist())
+        missing = [eid for eid in equipment_ids if eid not in found_ids]
+
+        valid_ids = [eid for eid in equipment_ids if eid in found_ids]
+        if valid_ids:
+            stmts = [
+                ("INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+                for eid in valid_ids
+            ]
+            _run_write_many(stmts)
+            added = len(valid_ids)
+
+        if missing:
+            return json.dumps({
+                "ok": True,
+                "kit_id": kit_id,
+                "added_count": added,
+                "warning": f"Kit créé mais équipements introuvables ignorés : {missing}",
+                "message": f"Kit '{name.strip()}' créé avec {added} équipement(s). {len(missing)} ID(s) ignoré(s).",
+            }, ensure_ascii=False)
+
+    return json.dumps({
+        "ok": True,
+        "kit_id": kit_id,
+        "added_count": added,
+        "message": f"Kit '{name.strip()}' créé" + (f" avec {added} équipement(s)." if added else " (vide)."),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def add_equipment_to_kit(
+    kit_id: str,
+    equipment_ids: list[str],
+) -> str:
+    """
+    Ajoute un ou plusieurs équipements à un kit existant.
+
+    Les doublons sont ignorés silencieusement : si un équipement est déjà
+    dans le kit, il n'est pas ajouté en double.
+
+    Args:
+        kit_id: Identifiant du kit cible.
+        equipment_ids: Liste d'equipment_id à ajouter au kit.
+
+    Returns:
+        JSON avec le nombre d'équipements ajoutés.
+    """
+    if not equipment_ids:
+        return json.dumps({"ok": False, "error": "equipment_ids ne peut pas être vide."})
+
+    kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    if kit_df.empty:
+        return json.dumps({"ok": False, "error": "kit_not_found", "kit_id": kit_id})
+
+    ids_ph = ", ".join(["?"] * len(equipment_ids))
+    exists_df = _run_query(
+        f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+        equipment_ids,
+    )
+    found_ids = set(exists_df["equipment_id"].tolist())
+    missing = [eid for eid in equipment_ids if eid not in found_ids]
+
+    valid_ids = [eid for eid in equipment_ids if eid in found_ids]
+    if valid_ids:
+        stmts = [
+            ("INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+            for eid in valid_ids
+        ]
+        _run_write_many(stmts)
+
+    result = {
+        "ok": True,
+        "kit_id": kit_id,
+        "added_count": len(valid_ids),
+        "message": f"{len(valid_ids)} équipement(s) ajouté(s) au kit.",
+    }
+    if missing:
+        result["warning"] = f"IDs introuvables ignorés : {missing}"
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def remove_equipment_from_kit(
+    kit_id: str,
+    equipment_ids: list[str],
+) -> str:
+    """
+    Retire un ou plusieurs équipements d'un kit sans les supprimer du catalogue.
+
+    Args:
+        kit_id: Identifiant du kit.
+        equipment_ids: Liste d'equipment_id à retirer du kit.
+
+    Returns:
+        JSON de confirmation.
+    """
+    if not equipment_ids:
+        return json.dumps({"ok": False, "error": "equipment_ids ne peut pas être vide."})
+
+    kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    if kit_df.empty:
+        return json.dumps({"ok": False, "error": "kit_not_found", "kit_id": kit_id})
+
+    ids_ph = ", ".join(["?"] * len(equipment_ids))
+    _run_write(
+        f"DELETE FROM kit_items WHERE kit_id = ? AND equipment_id IN ({ids_ph})",
+        [kit_id] + equipment_ids,
+    )
+
+    return json.dumps({
+        "ok": True,
+        "kit_id": kit_id,
+        "message": f"{len(equipment_ids)} équipement(s) retiré(s) du kit.",
+    })
+
+
+@mcp.tool()
+def set_kit_content(
+    kit_id: str,
+    equipment_ids: list[str],
+) -> str:
+    """
+    Remplace entièrement le contenu d'un kit.
+
+    Opération atomique : vide d'abord le kit puis insère les nouveaux équipements.
+    Utiliser cette fonction pour redéfinir complètement la composition d'un kit
+    (ex. après recherche préalable via search_equipment).
+    Passer une liste vide pour vider le kit sans le supprimer.
+
+    Args:
+        kit_id: Identifiant du kit à reconfigurer.
+        equipment_ids: Nouvelle liste complète d'equipment_id pour ce kit.
+
+    Returns:
+        JSON avec le bilan de la mise à jour.
+    """
+    kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    if kit_df.empty:
+        return json.dumps({"ok": False, "error": "kit_not_found", "kit_id": kit_id})
+
+    kit_name = str(kit_df.iloc[0]["name"] or kit_id)
+
+    missing = []
+    valid_ids = equipment_ids[:]
+    if equipment_ids:
+        ids_ph = ", ".join(["?"] * len(equipment_ids))
+        exists_df = _run_query(
+            f"SELECT equipment_id FROM equipment WHERE equipment_id IN ({ids_ph})",
+            equipment_ids,
+        )
+        found_ids = set(exists_df["equipment_id"].tolist())
+        missing = [eid for eid in equipment_ids if eid not in found_ids]
+        valid_ids = [eid for eid in equipment_ids if eid in found_ids]
+
+    stmts: list[tuple] = [("DELETE FROM kit_items WHERE kit_id = ?", [kit_id])]
+    stmts += [
+        ("INSERT INTO kit_items (kit_id, equipment_id) VALUES (?, ?)", [kit_id, eid])
+        for eid in valid_ids
+    ]
+    _run_write_many(stmts)
+
+    result = {
+        "ok": True,
+        "kit_id": kit_id,
+        "kit_name": kit_name,
+        "item_count": len(valid_ids),
+        "message": f"Kit '{kit_name}' reconfiguré avec {len(valid_ids)} équipement(s).",
+    }
+    if missing:
+        result["warning"] = f"IDs introuvables ignorés : {missing}"
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+@mcp.tool()
+def delete_kit(kit_id: str) -> str:
+    """
+    Supprime un kit et toutes ses lignes dans kit_items.
+
+    Les mouvements historiques référençant ce kit sont conservés.
+    Cette action est irréversible : demander confirmation à l'utilisateur avant.
+
+    Args:
+        kit_id: Identifiant du kit à supprimer.
+
+    Returns:
+        JSON de confirmation ou d'erreur.
+    """
+    kit_df = _run_query("SELECT name FROM kits WHERE kit_id = ? LIMIT 1", [kit_id])
+    if kit_df.empty:
+        return json.dumps({"ok": False, "error": "kit_not_found", "kit_id": kit_id})
+
+    name = str(kit_df.iloc[0]["name"] or kit_id)
+
+    _run_write_many([
+        ("DELETE FROM kit_items WHERE kit_id = ?", [kit_id]),
+        ("DELETE FROM kits WHERE kit_id = ?", [kit_id]),
+    ])
+
+    return json.dumps({
+        "ok": True,
+        "kit_id": kit_id,
+        "message": f"Kit '{name}' supprimé définitivement.",
+    }, ensure_ascii=False)
 
 
 # ─── Lancement ────────────────────────────────────────────────
