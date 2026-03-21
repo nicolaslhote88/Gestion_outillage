@@ -19,6 +19,10 @@ Opérations :
   POST /api/kits/{kit_id}/items              → ajouter des équipements à un kit
   DELETE /api/kits/{kit_id}/items            → retirer des équipements d'un kit
   PUT  /api/kits/{kit_id}/content            → remplacer entièrement le contenu
+  POST /api/reservations                     → créer une réservation (vérifie conflits)
+  GET  /api/reservations/conflicts           → vérifier la disponibilité d'un équipement
+  GET  /api/reservations/active              → lister les réservations à venir
+  DELETE /api/reservations/{res_id}          → annuler une réservation
 
 Auth : Bearer token statique (header Authorization: Bearer <token>)
        Défini par la variable d'environnement SIGA_API_TOKEN.
@@ -379,12 +383,56 @@ class KitCheckinRequest(BaseModel):
     returned_equipment_ids: Optional[List[str]] = None   # None = tout renvoyer
 
 
+# — Réservations ──────────────────────────────────────────────
+
+class ReservationCreateRequest(BaseModel):
+    equipment_id: str
+    user_name: str
+    start_date: str   # ISO 8601 : "2025-06-30T08:00" ou "2025-06-30"
+    end_date: str
+
+
+class ReservationCreateResponse(BaseModel):
+    ok: bool
+    res_id: str
+    message: str
+
+
+class ConflictItem(BaseModel):
+    type: str          # "reservation" | "maintenance"
+    user_name: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    movement_type: Optional[str] = None
+
+
+class ConflictCheckResponse(BaseModel):
+    equipment_id: str
+    has_conflict: bool
+    conflicts: List[ConflictItem]
+
+
+class ReservationItem(BaseModel):
+    res_id: str
+    equipment_id: str
+    equipment_label: str
+    user_name: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    status: str
+
+
+class ActiveReservationsResponse(BaseModel):
+    count: int
+    reservations: List[ReservationItem]
+
+
 # ─── App FastAPI ──────────────────────────────────────────────
 
 app = FastAPI(
     title="SIGA API",
     description="API HTTP métier pour le pilotage de SIGA par OpenClaw.",
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/api/docs",
     redoc_url=None,
 )
@@ -1122,6 +1170,32 @@ def display_equipment(
     except Exception:
         purchase_price_str = ""
 
+    # Prochaine réservation (si existante)
+    try:
+        next_res_df = _run_query(
+            """
+            SELECT user_name, start_date, end_date
+            FROM reservations
+            WHERE equipment_id = ?
+              AND status IN ('PENDING', 'ACTIVE')
+              AND end_date >= CURRENT_TIMESTAMP
+            ORDER BY start_date ASC
+            LIMIT 1
+            """,
+            [body.equipment_id],
+        )
+        if not next_res_df.empty:
+            nr = next_res_df.iloc[0]
+            next_reservation = {
+                "user_name":  _s(nr.get("user_name")),
+                "start_date": str(nr["start_date"]) if pd.notna(nr.get("start_date")) else None,
+                "end_date":   str(nr["end_date"])   if pd.notna(nr.get("end_date"))   else None,
+            }
+        else:
+            next_reservation = None
+    except Exception:
+        next_reservation = None
+
     eq_data = {
         "equipment_id":    _s(row.get("equipment_id")),
         "label":           _s(row.get("label")),
@@ -1141,6 +1215,7 @@ def display_equipment(
         "associated_items": biz.get("associated_items") or biz.get("elements_associes") or [],
         "media_files":     media_files,
         "loans":           loans,
+        "next_reservation": next_reservation,
     }
 
     # Écrit dans le fichier JSON (transport sans DuckDB pour le kiosque)
@@ -1698,6 +1773,268 @@ def set_kit_content(
         kit_id=kit_id,
         message=f"Contenu du kit '{name}' mis à jour : {len(body.equipment_ids)} équipement(s).",
     )
+
+
+# ════════════════════════════════════════════════════════════
+# RÉSERVATIONS & PLANNING
+# ════════════════════════════════════════════════════════════
+
+def _parse_iso_date(date_str: str) -> datetime:
+    """Parse une date ISO 8601 (avec ou sans heure). Lève ValueError si invalide."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Format de date invalide : {date_str!r} (attendu YYYY-MM-DD ou YYYY-MM-DDTHH:MM)")
+
+
+def _check_reservation_conflicts(equipment_id: str, start: datetime, end: datetime) -> List[ConflictItem]:
+    """Vérifie les chevauchements de réservations et la maintenance active."""
+    conflicts: List[ConflictItem] = []
+
+    # Chevauchement avec réservations existantes
+    try:
+        res_df = _run_query(
+            """
+            SELECT user_name, start_date, end_date
+            FROM reservations
+            WHERE equipment_id = ?
+              AND status IN ('PENDING', 'ACTIVE')
+              AND start_date < ?
+              AND end_date   > ?
+            """,
+            [equipment_id, end, start],
+        )
+        for _, r in res_df.iterrows():
+            conflicts.append(ConflictItem(
+                type="reservation",
+                user_name=_s(r.get("user_name")),
+                start_date=str(r["start_date"]) if pd.notna(r.get("start_date")) else None,
+                end_date=str(r["end_date"])   if pd.notna(r.get("end_date"))   else None,
+            ))
+    except RuntimeError:
+        pass
+
+    # Maintenance active (movement_type = MAINTENANCE, non retourné)
+    try:
+        maint_df = _run_query(
+            """
+            SELECT borrower_name, out_date, expected_return_date
+            FROM equipment_movements
+            WHERE equipment_id   = ?
+              AND movement_type  = 'MAINTENANCE'
+              AND actual_return_date IS NULL
+            LIMIT 1
+            """,
+            [equipment_id],
+        )
+        for _, r in maint_df.iterrows():
+            conflicts.append(ConflictItem(
+                type="maintenance",
+                user_name=_s(r.get("borrower_name")),
+                start_date=str(r["out_date"]) if pd.notna(r.get("out_date")) else None,
+                end_date=str(r["expected_return_date"]) if pd.notna(r.get("expected_return_date")) else None,
+                movement_type="MAINTENANCE",
+            ))
+    except RuntimeError:
+        pass
+
+    return conflicts
+
+
+@app.post(
+    "/api/reservations",
+    response_model=ReservationCreateResponse,
+    summary="Créer une réservation",
+    tags=["Réservations"],
+    responses={
+        400: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+def create_reservation(
+    body: ReservationCreateRequest,
+    _: None = Security(_require_token),
+) -> ReservationCreateResponse:
+    """Vérifie les conflits, puis insère la réservation si la plage est libre."""
+    # Validation des dates
+    try:
+        start_dt = _parse_iso_date(body.start_date)
+        end_dt   = _parse_iso_date(body.end_date)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if end_dt <= start_dt:
+        raise HTTPException(status_code=400, detail="end_date doit être postérieure à start_date.")
+
+    # Vérification que l'équipement existe
+    try:
+        eq_df = _run_query(
+            "SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1",
+            [body.equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if eq_df.empty:
+        raise HTTPException(status_code=404, detail=f"Équipement inconnu : {body.equipment_id}")
+
+    # Vérification des conflits
+    conflicts = _check_reservation_conflicts(body.equipment_id, start_dt, end_dt)
+    if conflicts:
+        first = conflicts[0]
+        if first.type == "maintenance":
+            msg = f"Impossible : l'équipement est en maintenance"
+            if first.user_name:
+                msg += f" (responsable : {first.user_name})"
+        else:
+            msg = f"Impossible : déjà réservé par {first.user_name or '?'} de {first.start_date} à {first.end_date}"
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorResponse(ok=False, error="conflict", detail=msg).model_dump(),
+        )
+
+    res_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """
+            INSERT INTO reservations
+                (res_id, equipment_id, user_name, start_date, end_date, status, created_at)
+            VALUES
+                (?, ?, ?, ?, ?, 'PENDING', CURRENT_TIMESTAMP)
+            """,
+            [res_id, body.equipment_id, body.user_name, start_dt, end_dt],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    eq_label = _s(eq_df.iloc[0]["label"])
+    return ReservationCreateResponse(
+        ok=True,
+        res_id=res_id,
+        message=f"C'est noté, '{eq_label}' est bloqué pour {body.user_name} du {body.start_date} au {body.end_date} !",
+    )
+
+
+@app.get(
+    "/api/reservations/conflicts",
+    response_model=ConflictCheckResponse,
+    summary="Vérifier les conflits avant réservation",
+    tags=["Réservations"],
+)
+def check_conflicts(
+    equipment_id: str,
+    start: str,
+    end: str,
+    _: None = Security(_require_token),
+) -> ConflictCheckResponse:
+    """Permet à OpenClaw de vérifier la faisabilité avant de proposer la réservation à l'utilisateur."""
+    try:
+        start_dt = _parse_iso_date(start)
+        end_dt   = _parse_iso_date(end)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    conflicts = _check_reservation_conflicts(equipment_id, start_dt, end_dt)
+    return ConflictCheckResponse(
+        equipment_id=equipment_id,
+        has_conflict=len(conflicts) > 0,
+        conflicts=conflicts,
+    )
+
+
+@app.get(
+    "/api/reservations/active",
+    response_model=ActiveReservationsResponse,
+    summary="Lister les réservations à venir",
+    tags=["Réservations"],
+)
+def list_active_reservations(
+    equipment_id: Optional[str] = None,
+    user_name: Optional[str] = None,
+    _: None = Security(_require_token),
+) -> ActiveReservationsResponse:
+    """Liste toutes les réservations en cours ou à venir, avec filtres optionnels."""
+    conditions = ["r.status IN ('PENDING', 'ACTIVE')", "r.end_date >= CURRENT_TIMESTAMP"]
+    params: List[Any] = []
+
+    if equipment_id:
+        conditions.append("r.equipment_id = ?")
+        params.append(equipment_id)
+    if user_name:
+        conditions.append("LOWER(r.user_name) = LOWER(?)")
+        params.append(user_name)
+
+    where_clause = " AND ".join(conditions)
+    try:
+        df = _run_query(
+            f"""
+            SELECT
+                r.res_id, r.equipment_id, r.user_name,
+                r.start_date, r.end_date, r.status,
+                e.label AS equipment_label
+            FROM reservations r
+            JOIN equipment e ON e.equipment_id = r.equipment_id
+            WHERE {where_clause}
+            ORDER BY r.start_date ASC
+            """,
+            params or None,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    items: List[ReservationItem] = []
+    for _, row in df.iterrows():
+        items.append(ReservationItem(
+            res_id=_s(row["res_id"]),
+            equipment_id=_s(row["equipment_id"]),
+            equipment_label=_s(row.get("equipment_label")),
+            user_name=_s(row["user_name"]),
+            start_date=str(row["start_date"]) if pd.notna(row.get("start_date")) else None,
+            end_date=str(row["end_date"])   if pd.notna(row.get("end_date"))   else None,
+            status=_s(row["status"]),
+        ))
+    return ActiveReservationsResponse(count=len(items), reservations=items)
+
+
+@app.delete(
+    "/api/reservations/{res_id}",
+    summary="Annuler une réservation",
+    tags=["Réservations"],
+    responses={404: {"model": ErrorResponse}},
+)
+def cancel_reservation(
+    res_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    """Annule une réservation en passant son statut à CANCELLED."""
+    try:
+        res_df = _run_query(
+            "SELECT res_id, status FROM reservations WHERE res_id = ? LIMIT 1",
+            [res_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    if res_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorResponse(ok=False, error="reservation_not_found").model_dump(),
+        )
+    current_status = _s(res_df.iloc[0]["status"])
+    if current_status == "CANCELLED":
+        return {"ok": True, "res_id": res_id, "message": "Réservation déjà annulée."}
+
+    try:
+        _run_write(
+            "UPDATE reservations SET status = 'CANCELLED' WHERE res_id = ?",
+            [res_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    return {"ok": True, "res_id": res_id, "message": "Réservation annulée avec succès."}
 
 
 # ─── Health check (sans auth) ─────────────────────────────────

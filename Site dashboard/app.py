@@ -401,6 +401,19 @@ def init_db_tables() -> None:
         )
     """)
 
+    # ── Réservations & Planning ────────────────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS reservations (
+            res_id       VARCHAR PRIMARY KEY,
+            equipment_id VARCHAR NOT NULL,
+            user_name    VARCHAR NOT NULL,
+            start_date   TIMESTAMP NOT NULL,
+            end_date     TIMESTAMP NOT NULL,
+            status       VARCHAR DEFAULT 'PENDING',
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 def safe_json(value, default=None):
     """Parse une colonne JSON stockée en VARCHAR. Retourne default si NULL ou invalide."""
@@ -780,6 +793,55 @@ def render_dashboard():
             use_container_width=True,
             hide_index=True,
         )
+
+    st.markdown("---")
+
+    # ── Widget Prochaines Réservations ────────────────────
+    st.markdown("#### 📅 Prochaines Réservations")
+    upcoming_df = run_query("""
+        SELECT
+            r.res_id,
+            r.user_name,
+            r.start_date,
+            r.end_date,
+            r.status,
+            e.label AS equipment_label,
+            e.brand AS equipment_brand
+        FROM reservations r
+        JOIN equipment e ON e.equipment_id = r.equipment_id
+        WHERE r.status IN ('PENDING', 'ACTIVE')
+          AND r.end_date >= CURRENT_TIMESTAMP
+        ORDER BY r.start_date ASC
+        LIMIT 3
+    """)
+
+    if upcoming_df is None or upcoming_df.empty:
+        st.info("Aucune réservation à venir.")
+    else:
+        for _, res_row in upcoming_df.iterrows():
+            equip_name = str(res_row.get("equipment_label") or "—")
+            brand      = str(res_row.get("equipment_brand") or "")
+            user       = str(res_row.get("user_name") or "—")
+            start      = fmt_datetime(res_row.get("start_date"))
+            end        = fmt_datetime(res_row.get("end_date"))
+            status_val = str(res_row.get("status") or "PENDING")
+            status_color = {"ACTIVE": "#22c55e", "PENDING": "#f59e0b"}.get(status_val, "#94a3b8")
+            display_name = f"{equip_name} ({brand})" if brand else equip_name
+            st.markdown(
+                f"<div style='background:#1e293b;border-radius:0.7rem;padding:0.6rem 1rem;"
+                f"margin-bottom:0.4rem;display:flex;align-items:center;gap:1rem;'>"
+                f"<span style='font-size:1.3rem;'>📅</span>"
+                f"<div style='flex:1;'>"
+                f"<b style='color:#f1f5f9;'>{display_name}</b>"
+                f"<span style='color:#64748b;'> — {user} | {start} → {end}</span>"
+                f"</div>"
+                f"<span style='background:{status_color}22;color:{status_color};"
+                f"border:1px solid {status_color}44;border-radius:9999px;"
+                f"padding:0.15rem 0.6rem;font-size:0.8rem;font-weight:600;'>{status_val}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 2 : CENTRE DE VALIDATION
@@ -3044,8 +3106,9 @@ def render_kiosk_equipment(data: dict) -> None:
     accessories    = data.get("accessories")     or []
     consumables    = data.get("consumables")     or []
     associated     = data.get("associated_items") or []
-    media          = data.get("media_files") or []   # liste {file_id, role}
-    loans_raw      = data.get("loans") or []
+    media             = data.get("media_files") or []   # liste {file_id, role}
+    loans_raw         = data.get("loans") or []
+    next_reservation  = data.get("next_reservation")    # dict ou None
 
     st.markdown("""<style>
     header, section[data-testid="stSidebar"] { display: none !important; }
@@ -3236,6 +3299,23 @@ def render_kiosk_equipment(data: dict) -> None:
                     f"</div>",
                     unsafe_allow_html=True,
                 )
+
+        # Badge prochaine réservation
+        if next_reservation:
+            res_user  = null_str(next_reservation.get("user_name"), "—")
+            res_start = _fmt_kiosk_date(next_reservation.get("start_date"))
+            res_end   = _fmt_kiosk_date(next_reservation.get("end_date"))
+            st.markdown(
+                f"<hr class='kiosk-sep'>"
+                f"<div style='background:#1e3a5f22;border-radius:1rem;border:1px solid #38bdf844;"
+                f"padding:0.8rem 1.2rem;display:flex;align-items:center;gap:0.8rem;'>"
+                f"<span style='font-size:1.5rem;'>📅</span>"
+                f"<div><div style='color:#38bdf8;font-weight:700;font-size:1rem;'>Prochaine réservation</div>"
+                f"<div style='color:#cbd5e1;font-size:0.95rem;'>{res_start} → {res_end} "
+                f"<b style='color:#f1f5f9;'>({res_user})</b></div></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 def render_kiosk_kit(data: dict) -> None:

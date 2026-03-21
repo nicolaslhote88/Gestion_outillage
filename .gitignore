@@ -10,6 +10,9 @@ Thumbs.db
 node_modules/
 dist/
 coverage/
+__pycache__/
+*.pyc
+*.pyo
 .vscode/
 .idea/
 tmp/*

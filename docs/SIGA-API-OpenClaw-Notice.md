@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 2.0 — Mars 2026
+**Version :** 3.0 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -10,7 +10,7 @@
 ## Vue d'ensemble
 
 L'API SIGA est l'interface entre OpenClaw et la base de données d'inventaire d'atelier.
-Elle couvre **cinq domaines** :
+Elle couvre **six domaines** :
 
 | Domaine | Ce que tu peux faire |
 |---|---|
@@ -18,6 +18,7 @@ Elle couvre **cinq domaines** :
 | **Mouvements** | Enregistrer les sorties et les retours d'outils |
 | **Kits** | Créer, composer, sortir et rentrer des caisses à outils |
 | **Kiosque** | Afficher un outil sur l'écran de l'atelier |
+| **Réservations** | Réserver un outil sur une plage de dates, vérifier les conflits, annuler |
 | **Système** | Vérifier que l'API fonctionne |
 
 Toutes les réponses sont en JSON. Les erreurs ont toujours la forme :
@@ -630,9 +631,187 @@ POST /api/display/clear
 
 ---
 
-## 5. Système
+## 5. Réservations
 
-### 5.1 Vérifier que l'API fonctionne
+Une **réservation** bloque un outil sur une plage de dates future sans le sortir physiquement. Elle permet de planifier l'utilisation et d'éviter les conflits.
+
+Statuts possibles : `PENDING` (réservation future), `ACTIVE` (en cours), `CANCELLED` (annulée).
+
+---
+
+### 5.1 Vérifier les conflits avant de réserver
+```
+GET /api/reservations/conflicts?equipment_id=<uuid>&start=<date>&end=<date>
+```
+**Quand l'utiliser :** Avant de créer une réservation — vérifier que la plage est libre. L'utilisateur dit « je veux réserver la perceuse du 5 au 10 avril, est-ce possible ? »
+
+**Paramètres (query string) :**
+
+| Paramètre | Obligatoire | Format |
+|---|---|---|
+| `equipment_id` | Oui | UUID de l'équipement |
+| `start` | Oui | `YYYY-MM-DD` ou `YYYY-MM-DDTHH:MM` |
+| `end` | Oui | `YYYY-MM-DD` ou `YYYY-MM-DDTHH:MM` |
+
+**Réponse si aucun conflit :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "has_conflict": false,
+  "conflicts": []
+}
+```
+
+**Réponse si conflit détecté :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "has_conflict": true,
+  "conflicts": [
+    {
+      "type": "reservation",
+      "user_name": "Entreprise Martin",
+      "start_date": "2025-04-03 00:00:00",
+      "end_date": "2025-04-08 00:00:00",
+      "movement_type": null
+    }
+  ]
+}
+```
+
+**Types de conflit possibles :**
+- `reservation` — chevauchement avec une réservation existante (`PENDING` ou `ACTIVE`)
+- `maintenance` — l'équipement est actuellement en maintenance (mouvement `MAINTENANCE` non clôturé)
+
+**Points clés :**
+- Appeler cet endpoint avant `POST /api/reservations` si l'utilisateur demande d'abord une vérification
+- Si `has_conflict: true`, expliquer le conflit à l'utilisateur avant de proposer une autre date
+- `POST /api/reservations` fait aussi cette vérification et renvoie une 409 si conflit — les deux approches sont valides
+
+---
+
+### 5.2 Créer une réservation
+```
+POST /api/reservations
+```
+**Quand l'utiliser :** L'utilisateur veut bloquer un outil sur une plage de dates. « Je veux réserver la meuleuse pour la semaine du 14 avril », « bloque la perceuse pour Martin du 20 au 25 »
+
+**Corps :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "user_name": "Entreprise Martin",
+  "start_date": "2025-04-14",
+  "end_date": "2025-04-18"
+}
+```
+
+| Champ | Obligatoire | Format |
+|---|---|---|
+| `equipment_id` | Oui | UUID de l'équipement |
+| `user_name` | Oui | Nom libre (personne ou entreprise) |
+| `start_date` | Oui | `YYYY-MM-DD` ou `YYYY-MM-DDTHH:MM` |
+| `end_date` | Oui | `YYYY-MM-DD` ou `YYYY-MM-DDTHH:MM` (doit être > `start_date`) |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "res_id": "uuid-res-...",
+  "message": "C'est noté, 'Meuleuse d'angle 125mm' est bloqué pour Entreprise Martin du 2025-04-14 au 2025-04-18 !"
+}
+```
+
+**Erreur 409 si conflit :**
+```json
+{
+  "ok": false,
+  "error": "conflict",
+  "detail": "Impossible : déjà réservé par Entreprise Dupont de 2025-04-12 00:00:00 à 2025-04-16 00:00:00"
+}
+```
+
+**Points clés :**
+- Retenir le `res_id` pour une éventuelle annulation
+- La réservation est créée avec le statut `PENDING`
+- Un conflit avec une maintenance active bloque aussi la réservation (409)
+- Vérifie automatiquement les conflits — pas besoin d'appeler `/conflicts` avant si on veut juste créer directement
+
+---
+
+### 5.3 Lister les réservations à venir
+```
+GET /api/reservations/active
+```
+**Quand l'utiliser :** « Quels outils sont réservés ? », « qui a réservé quelque chose cette semaine ? », « est-ce que Martin a des réservations ? »
+
+**Paramètres optionnels (query string) :**
+
+| Paramètre | Description |
+|---|---|
+| `equipment_id` | Filtrer par équipement |
+| `user_name` | Filtrer par nom (insensible à la casse) |
+
+**Réponse :**
+```json
+{
+  "count": 2,
+  "reservations": [
+    {
+      "res_id": "uuid-res-...",
+      "equipment_id": "uuid-eq-...",
+      "equipment_label": "Meuleuse d'angle 125mm",
+      "user_name": "Entreprise Martin",
+      "start_date": "2025-04-14 00:00:00",
+      "end_date": "2025-04-18 00:00:00",
+      "status": "PENDING"
+    }
+  ]
+}
+```
+
+**Points clés :**
+- Retourne uniquement les réservations non terminées (`PENDING` ou `ACTIVE`) dont la date de fin est dans le futur
+- Triées par `start_date` croissante
+- Sans paramètre = toutes les réservations à venir, tous équipements confondus
+
+---
+
+### 5.4 Annuler une réservation
+```
+DELETE /api/reservations/{res_id}
+```
+**Quand l'utiliser :** L'utilisateur veut annuler une réservation. « Annule la réservation de Martin », « on n'a plus besoin de la perceuse la semaine prochaine »
+
+**Pas de corps** — le `res_id` est dans l'URL.
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "res_id": "uuid-res-...",
+  "message": "Réservation annulée avec succès."
+}
+```
+
+**Erreur 404 si introuvable :**
+```json
+{
+  "ok": false,
+  "error": "reservation_not_found"
+}
+```
+
+**Points clés :**
+- Passe le statut à `CANCELLED` (non-destructif — la réservation reste dans la base pour traçabilité)
+- Si la réservation est déjà annulée, renvoie `ok: true` sans erreur
+- Si le `res_id` est inconnu, utiliser `/api/reservations/active` pour le retrouver
+
+---
+
+## 6. Système
+
+### 6.1 Vérifier que l'API fonctionne
 ```
 GET /api/health
 ```
@@ -672,6 +851,10 @@ GET /api/health
 | POST | `/api/display/show-movements` | Oui | Afficher sorties en cours sur kiosque |
 | POST | `/api/display/show-confirmation` | Oui | Afficher écran de confirmation |
 | POST | `/api/display/clear` | Oui | Repasser le kiosque en veille |
+| GET | `/api/reservations/conflicts?equipment_id=&start=&end=` | Oui | Vérifier conflits avant réservation |
+| POST | `/api/reservations` | Oui | Créer une réservation |
+| GET | `/api/reservations/active` | Oui | Lister les réservations à venir |
+| DELETE | `/api/reservations/{res_id}` | Oui | Annuler une réservation |
 
 ---
 
@@ -759,6 +942,27 @@ POST /api/display/show-confirmation  { title, subtitle, details, batch_id, color
    → les retards sont mis en évidence automatiquement (badge rouge)
 ```
 
+### Situation K — Réserver un outil sur une plage de dates
+
+```
+1. GET /api/equipment/search?q=<outil>           → trouver l'equipment_id
+2. GET /api/reservations/conflicts               → vérifier la disponibilité sur la plage
+   ?equipment_id=<id>&start=<date>&end=<date>
+   → si has_conflict: true, proposer une autre date à l'utilisateur
+3. POST /api/reservations                        → créer la réservation
+   { equipment_id, user_name, start_date, end_date }
+   → conserver le res_id pour une éventuelle annulation
+```
+
+### Situation L — Annuler une réservation existante
+
+```
+1. GET /api/reservations/active                  → retrouver la réservation
+   ?user_name=<nom>  — ou —  ?equipment_id=<id>
+   → noter le res_id
+2. DELETE /api/reservations/{res_id}             → annuler
+```
+
 ---
 
 ## Types de mouvement
@@ -787,6 +991,8 @@ Format étendu accepté : `2025-04-30T14:00`
 | 401 | — | Token absent ou incorrect |
 | 404 | `equipment_not_found` | L'`equipment_id` n'existe pas dans la base |
 | 404 | `kit_not_found` | Le `kit_id` n'existe pas |
+| 404 | `reservation_not_found` | Le `res_id` n'existe pas |
+| 409 | `conflict` | La plage demandée est déjà réservée ou l'outil est en maintenance |
 | 503 | `screen_unavailable` | L'écran kiosque ou la base est inaccessible |
 
 En cas d'erreur 503, la base DuckDB est temporairement verrouillée par n8n. Réessayer dans quelques secondes.
