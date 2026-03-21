@@ -2,8 +2,8 @@
 
 **Version :** 2.0 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
-**Base URL :** `http://localhost:8001`
-**Auth :** header `Authorization: Bearer <SIGA_API_TOKEN>`
+**Base URL :** variable d'environnement `SIGA_API_BASE_URL`
+**Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
 
 ---
 
