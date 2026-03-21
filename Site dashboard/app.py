@@ -3051,22 +3051,19 @@ def render_kiosk_equipment(data: dict) -> None:
             "hors service": "#ef4444",
         }.get((condition or "").lower(), "#94a3b8")
 
+        subtype_badge = (
+            f"<span class='kiosk-badge' style='background:#334155;color:#94a3b8;'>{subtype}</span>"
+            if subtype else ""
+        )
         st.markdown(
-            f"""
-            <div class="kiosk-card">
-                <div class="kiosk-title">{label}</div>
-                <div class="kiosk-sub">{brand} {model}</div>
-                <div style="margin-top:1.2rem;">
-                    <span class="kiosk-badge"
-                          style="background:{condition_color}22;color:{condition_color};
-                                 border:1px solid {condition_color}44;">
-                        {condition or "État inconnu"}
-                    </span>
-                    {"<span class='kiosk-badge' style='background:#334155;color:#94a3b8;'>"
-                     + subtype + "</span>" if subtype else ""}
-                </div>
-            </div>
-            """,
+            f"<div class='kiosk-card'>"
+            f"<div class='kiosk-title'>{label}</div>"
+            f"<div class='kiosk-sub'>{brand} {model}</div>"
+            f"<div style='margin-top:1.2rem;'>"
+            f"<span class='kiosk-badge' style='background:{condition_color}22;color:{condition_color};"
+            f"border:1px solid {condition_color}44;'>{condition or 'État inconnu'}</span>"
+            f"{subtype_badge}"
+            f"</div></div>",
             unsafe_allow_html=True,
         )
 
@@ -3170,14 +3167,9 @@ def render_kiosk_kit(data: dict) -> None:
     st.markdown(
         f"""
         <div class="kiosk-card" style="margin-bottom:1.5rem;">
-            <div style="font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;">
-                🧰 KIT
-            </div>
+            <div style="font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;">🧰 KIT</div>
             <div class="kiosk-title">{name}</div>
-            {"<div class='kiosk-sub'>" + description + "</div>" if description else ""}
-            <div style="margin-top:1rem;color:#94a3b8;font-size:1.1rem;">
-                {len(items)} outil(s)
-            </div>
+            {"<div class='kiosk-sub'>" + description + "</div>" if description else ""}<div style="margin-top:1rem;color:#94a3b8;font-size:1.1rem;">{len(items)} outil(s)</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3235,15 +3227,11 @@ def render_kiosk_movements_active(data: dict) -> None:
         if late else ""
     )
     st.markdown(
-        f"""
-        <div style="background:#0f172a;border-radius:1.5rem;padding:1.5rem 2rem;margin-bottom:1.5rem;">
-            <div style="font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;">
-                📤 SORTIES EN COURS
-            </div>
-            <div style="font-size:2.5rem;font-weight:900;color:#f1f5f9;">{count} outil(s)</div>
-            {late_badge}
-        </div>
-        """,
+        f"<div style='background:#0f172a;border-radius:1.5rem;padding:1.5rem 2rem;margin-bottom:1.5rem;'>"
+        f"<div style='font-size:1rem;color:#64748b;font-weight:600;letter-spacing:0.1em;'>📤 SORTIES EN COURS</div>"
+        f"<div style='font-size:2.5rem;font-weight:900;color:#f1f5f9;'>{count} outil(s)</div>"
+        f"{late_badge}"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
@@ -3320,23 +3308,23 @@ def render_kiosk_confirmation(data: dict) -> None:
         </style>
     """, unsafe_allow_html=True)
 
+    subtitle_html = (
+        f"<div style='font-size:1.4rem;color:#94a3b8;text-align:center;'>{subtitle}</div>"
+        if subtitle else ""
+    )
+    details_block = (
+        f"<div style='background:{c_bg};border:1px solid {c_border};"
+        f"border-radius:1rem;padding:1.2rem 2rem;max-width:700px;width:100%;'>"
+        f"{details_html}</div>"
+        if details else ""
+    )
     st.markdown(
-        f"""
-        <div style="
-            display:flex;flex-direction:column;align-items:center;
-            justify-content:center;min-height:70vh;gap:1.5rem;
-        ">
-            <div style="font-size:5rem;">{icon}</div>
-            <div style="font-size:3rem;font-weight:900;color:{c_text};text-align:center;">
-                {title}
-            </div>
-            {"<div style='font-size:1.4rem;color:#94a3b8;text-align:center;'>" + subtitle + "</div>" if subtitle else ""}
-            {("<div style='background:" + c_bg + ";border:1px solid " + c_border + ";"
-               "border-radius:1rem;padding:1.2rem 2rem;max-width:700px;width:100%;'>"
-               + details_html + "</div>") if details else ""}
-            {batch_html}
-        </div>
-        """,
+        f"<div style='display:flex;flex-direction:column;align-items:center;"
+        f"justify-content:center;min-height:70vh;gap:1.5rem;'>"
+        f"<div style='font-size:5rem;'>{icon}</div>"
+        f"<div style='font-size:3rem;font-weight:900;color:{c_text};text-align:center;'>{title}</div>"
+        f"{subtitle_html}{details_block}{batch_html}"
+        f"</div>",
         unsafe_allow_html=True,
     )
 
