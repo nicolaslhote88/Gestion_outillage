@@ -130,6 +130,19 @@ def _run_write_many(statements: list[tuple], _retries: int = 5) -> None:
     )
 
 
+def _s(v) -> str:
+    """Convertit n'importe quelle valeur DuckDB/pandas en str sans lever d'exception.
+
+    Problème : DuckDB récent retourne pd.NA (pandas NA) pour les VARCHAR nuls.
+    bool(pd.NA) lève TypeError, donc les patterns 'v or ""' explosent silencieusement.
+    Cette fonction évite toute évaluation booléenne : on passe direct à str().
+    """
+    if v is None:
+        return ""
+    s = str(v)
+    return "" if s in ("nan", "NaT", "<NA>", "None", "nat") else s
+
+
 # ─── Transport kiosque (JSON file) ───────────────────────────
 
 def _write_kiosk_state(command_type: str, data: Dict[str, Any]) -> None:
@@ -1060,12 +1073,13 @@ def display_equipment(
             """,
             [body.equipment_id],
         )
+        # pd.notna() évite bool(pd.NA) → TypeError sur les VARCHAR nuls DuckDB
         media_files = [
-            {"file_id": str(r["final_drive_file_id"]), "role": str(r["image_role"] or "")}
+            {"file_id": _s(r["final_drive_file_id"]), "role": _s(r["image_role"])}
             for _, r in media_df.iterrows()
-            if r["final_drive_file_id"] and str(r["final_drive_file_id"]) not in ("None", "nan")
+            if pd.notna(r["final_drive_file_id"]) and _s(r["final_drive_file_id"]) not in ("", "None", "nan")
         ]
-    except RuntimeError:
+    except Exception:
         media_files = []
 
     # Prêts actifs
@@ -1080,29 +1094,29 @@ def display_equipment(
             [body.equipment_id],
         )
         loans = loans_df.to_dict("records")
-    except RuntimeError:
+    except Exception:
         loans = []
 
     row = eq_df.iloc[0]
-    specs_raw = row.get("technical_specs_json")
+    specs_raw = _s(row.get("technical_specs_json"))
     try:
-        specs = json.loads(specs_raw) if specs_raw and str(specs_raw) not in ("None", "nan") else {}
+        specs = json.loads(specs_raw) if specs_raw else {}
     except Exception:
         specs = {}
 
     eq_data = {
-        "equipment_id":   str(row.get("equipment_id")   or ""),
-        "label":          str(row.get("label")          or ""),
-        "brand":          str(row.get("brand")          or ""),
-        "model":          str(row.get("model")          or ""),
-        "serial_number":  str(row.get("serial_number")  or ""),
-        "subtype":        str(row.get("subtype")        or ""),
-        "condition_label":str(row.get("condition_label")or ""),
-        "location_hint":  str(row.get("location_hint")  or ""),
-        "notes":          str(row.get("notes")          or ""),
+        "equipment_id":    _s(row.get("equipment_id")),
+        "label":           _s(row.get("label")),
+        "brand":           _s(row.get("brand")),
+        "model":           _s(row.get("model")),
+        "serial_number":   _s(row.get("serial_number")),
+        "subtype":         _s(row.get("subtype")),
+        "condition_label": _s(row.get("condition_label")),
+        "location_hint":   _s(row.get("location_hint")),
+        "notes":           _s(row.get("notes")),
         "technical_specs": specs,
-        "media_files":    media_files,   # toutes les photos
-        "loans":          loans,
+        "media_files":     media_files,
+        "loans":           loans,
     }
 
     # Écrit dans le fichier JSON (transport sans DuckDB pour le kiosque)
@@ -1203,9 +1217,9 @@ def display_kit(
 
     kit_row = kit_df.iloc[0]
     kit_data = {
-        "kit_id":      str(kit_row.get("kit_id")      or ""),
-        "name":        str(kit_row.get("name")        or ""),
-        "description": str(kit_row.get("description") or ""),
+        "kit_id":      _s(kit_row.get("kit_id")),
+        "name":        _s(kit_row.get("name")),
+        "description": _s(kit_row.get("description")),
         "item_count":  len(items),
         "items":       items,
     }
