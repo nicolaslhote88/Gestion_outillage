@@ -7,3 +7,5 @@ google-auth>=2.0.0
 google-api-python-client>=2.0.0
 fpdf2>=2.7.0
 mcp[cli]>=1.0.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
