@@ -140,24 +140,34 @@ def _run_query(sql: str, params=None) -> pd.DataFrame:
 
 
 def _rows(sql: str, params=None) -> List[dict]:
-    """Retourne une liste de dicts Python natifs (pas de numpy/pandas types, NULL → None)."""
+    """Retourne une liste de dicts Python natifs (pas de numpy/pandas types, NULL → None).
+
+    DuckDB récent retourne pd.NA pour les VARCHAR nuls (pas None ni numpy.nan).
+    pd.isna() est le seul test fiable qui couvre : pd.NA, pd.NaT, numpy.nan,
+    numpy.float64(nan), float('nan') — sans lever d'exception.
+    """
     df = _run_query(sql, params)
     if df.empty:
         return []
-    # Remplace pandas NA/NaN/NaT par None avant conversion
-    df = df.where(df.notna(), other=None)
-    records = df.to_dict(orient="records")
 
     def _native(v: Any) -> Any:
         if v is None:
             return None
-        if hasattr(v, "item"):          # numpy scalar (int64, float64, bool_, …)
+        # pd.isna couvre : pd.NA, pd.NaT, numpy.nan, float('nan'), numpy.float64(nan)
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        # numpy scalar (int64, float64, bool_, …) → type Python natif
+        if hasattr(v, "item"):
             return v.item()
-        if hasattr(v, "isoformat"):     # pandas Timestamp, datetime
+        # Timestamp pandas/datetime → ISO 8601 string
+        if hasattr(v, "isoformat"):
             return v.isoformat()
         return v
 
-    return [{k: _native(val) for k, val in row.items()} for row in records]
+    return [{k: _native(val) for k, val in row.items()} for row in df.to_dict(orient="records")]
 
 
 def _run_write(sql: str, params=None, _retries: int = 5) -> None:
