@@ -141,6 +141,54 @@ html, body, [class*="css"] {
 .badge-accessory  { background: #3b1e5f; color: #c4b5fd; border: 1px solid #5b21b6; }
 .badge-consumable { background: #1a3b2f; color: #6ee7b7; border: 1px solid #065f46; }
 
+/* ── Arbre de dépendances ── */
+.dep-section {
+    border-left: 3px solid #334155;
+    padding: 4px 0 4px 14px;
+    margin: 6px 0 14px 4px;
+}
+.dep-section-header {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid #1e293b;
+}
+.dep-card {
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: border-color 0.15s;
+}
+.dep-card:hover { border-color: #3b82f6; }
+.dep-thumb-wrap {
+    width: 44px; height: 44px;
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+    background: #1e293b;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.2rem;
+}
+.dep-thumb-wrap img { width: 44px; height: 44px; object-fit: cover; }
+.dep-info { flex: 1; min-width: 0; }
+.dep-label {
+    font-weight: 600;
+    font-size: 0.86rem;
+    color: #f1f5f9;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dep-sub  { font-size: 0.76rem; color: #94a3b8; margin-top: 2px; }
+.dep-empty { color: #475569; font-size: 0.82rem; font-style: italic; padding: 6px 0; }
+
 /* ── Section title ── */
 .section-title {
     font-size: 1.4rem;
@@ -766,6 +814,97 @@ def entity_type_badge(entity_type: str) -> str:
     }
     cls, label = mapping.get(entity_type, ("badge-gray", entity_type or "?"))
     return f'<span class="badge {cls}">{label}</span>'
+
+
+_ENTITY_EMOJI = {"equipment": "🔧", "accessory": "🔋", "consumable": "⚙"}
+_ENTITY_OPEN_FN_KEY = "equipment"   # sentinel; actual fns passed at call site
+
+
+def _render_relation_cards(
+    section_title: str,
+    df,               # pd.DataFrame avec les entités liées
+    entity_type: str, # type des entités dans df
+    id_col: str,      # colonne PK dans df
+    file_id_col: str, # colonne Drive file_id dans df
+    open_fn,          # callable(entity_id) → ouvre la fiche
+    key_prefix: str,  # préfixe unique pour les clés Streamlit
+    sub_fn=None,      # callable(row) → str de sous-titre optionnel
+):
+    """
+    Rend une section de l'arbre de dépendances :
+    - En-tête avec titre + compteur
+    - Pour chaque entité : [miniature Drive | badge type + label + sous-titre | Voir →]
+    - Chaque ligne est cliquable via le bouton Voir →
+    """
+    emoji = _ENTITY_EMOJI.get(entity_type, "🔗")
+    count = len(df) if df is not None and not df.empty else 0
+
+    # ── En-tête de section ─────────────────────────────────────
+    st.markdown(
+        f'<div class="dep-section-header">'
+        f'{emoji} {section_title}'
+        f'<span style="margin-left:8px;background:#334155;color:#94a3b8;'
+        f'border-radius:20px;padding:1px 8px;font-size:0.72rem">{count}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if df is None or df.empty:
+        st.markdown('<div class="dep-empty">Aucun élément lié.</div>', unsafe_allow_html=True)
+        return
+
+    badge_html = entity_type_badge(entity_type)
+
+    for _, row in df.iterrows():
+        entity_id = str(row.get(id_col, ""))
+        label     = null_str(row.get("label"), "Sans nom")
+        brand     = null_str(row.get("brand"), "")
+        model_r   = null_str(row.get("model") or row.get("reference"), "")
+        file_id   = null_str(row.get(file_id_col), "")
+        sub       = sub_fn(row) if sub_fn else None
+
+        # Sous-titre : brand · model ou custom
+        sub_parts = [p for p in [brand, model_r] if p and p != "—"]
+        subtitle  = sub if sub else " · ".join(sub_parts)
+
+        # Miniature (base64 inline) ou placeholder emoji
+        thumb_html = ""
+        if file_id and file_id != "—":
+            try:
+                raw = get_drive_thumb(file_id, max_px=96, quality=70)
+                if raw:
+                    import base64 as _b64
+                    b64 = _b64.b64encode(raw).decode()
+                    thumb_html = f'<img src="data:image/jpeg;base64,{b64}" style="width:44px;height:44px;object-fit:cover;border-radius:6px;">'
+            except Exception:
+                pass
+        if not thumb_html:
+            thumb_html = (
+                f'<div class="dep-thumb-wrap">'
+                f'<span style="font-size:1.3rem">{emoji}</span></div>'
+            )
+
+        # Carte HTML (visuel seul — le bouton Streamlit reste natif)
+        card_html = (
+            f'<div class="dep-card">'
+            f'<div class="dep-thumb-wrap">{thumb_html}</div>'
+            f'<div class="dep-info">'
+            f'  {badge_html}'
+            f'  <div class="dep-label">{label}</div>'
+            f'  {f\'<div class="dep-sub">{subtitle}</div>\' if subtitle else ""}'
+            f'</div>'
+            f'</div>'
+        )
+
+        # Layout : carte visuelle à gauche, bouton Streamlit à droite
+        card_col, btn_col = st.columns([5, 1], gap="small")
+        with card_col:
+            st.markdown(card_html, unsafe_allow_html=True)
+        with btn_col:
+            if st.button("Voir →", key=f"dep_{key_prefix}_{entity_id}",
+                         use_container_width=True,
+                         help=f"Ouvrir la fiche {label}"):
+                open_fn(entity_id)
 
 
 def null_str(value, fallback: str = "—") -> str:
@@ -1825,6 +1964,66 @@ def show_equipment_modal(equipment_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
+    # ── Arbre de dépendances relationnel (v4.0 links) ─────────
+    st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
+    _acc_df = run_query("""
+        SELECT a.accessory_id, a.label, a.brand, a.model,
+               a.drive_file_id, a.stock_qty, lc.note
+        FROM links_compatibility lc
+        JOIN accessories a ON a.accessory_id = lc.accessory_id
+        WHERE lc.equipment_id = ?
+        ORDER BY a.label
+    """, [equipment_id])
+
+    _con_df = run_query("""
+        SELECT c.consumable_id, c.label, c.brand, c.reference,
+               c.drive_file_id, c.stock_qty, c.unit, lc.qty_per_use, lc.note
+        FROM links_consumables lc
+        JOIN consumables c ON c.consumable_id = lc.consumable_id
+        WHERE lc.equipment_id = ?
+        ORDER BY c.label
+    """, [equipment_id])
+
+    if _acc_df.empty and _con_df.empty:
+        st.info("Aucune liaison accessoire/consommable enregistrée pour cet équipement.")
+    else:
+        dep_acc_col, dep_con_col = st.columns(2, gap="large")
+
+        with dep_acc_col:
+            st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+            _render_relation_cards(
+                section_title="Accessoires compatibles",
+                df=_acc_df if not _acc_df.empty else None,
+                entity_type="accessory",
+                id_col="accessory_id",
+                file_id_col="drive_file_id",
+                open_fn=show_accessory_modal,
+                key_prefix=f"eq_acc_{equipment_id}",
+                sub_fn=lambda r: (
+                    f"{null_str(r.get('brand'), '')} · {null_str(r.get('model'), '')} — stock : {int(r.get('stock_qty') or 0)}"
+                ).strip(" · "),
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with dep_con_col:
+            st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+            _render_relation_cards(
+                section_title="Consommables associés",
+                df=_con_df if not _con_df.empty else None,
+                entity_type="consumable",
+                id_col="consumable_id",
+                file_id_col="drive_file_id",
+                open_fn=show_consumable_modal,
+                key_prefix=f"eq_con_{equipment_id}",
+                sub_fn=lambda r: (
+                    f"{null_str(r.get('brand'), '')} — "
+                    f"{r.get('qty_per_use') or 1} {null_str(r.get('unit'), 'pcs')} / usage"
+                ).strip(" — "),
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
     # ── Disponibilité & Suivi ──────────────────────────────────
     st.markdown("---")
     st.subheader("Disponibilité & Suivi")
@@ -2064,30 +2263,43 @@ def show_accessory_modal(accessory_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
-    # ── Équipements compatibles ────────────────────────────────
+    # ── Équipements compatibles — arbre visuel ─────────────────
     st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
     compat_df = run_query("""
-        SELECT e.equipment_id, e.label, e.brand, e.model, e.condition_label, lc.note
+        SELECT e.equipment_id, e.label, e.brand, e.model,
+               e.condition_label, lc.note,
+               (SELECT em.final_drive_file_id
+                FROM equipment_media em
+                WHERE em.equipment_id = e.equipment_id
+                ORDER BY CASE em.image_role
+                    WHEN 'overview'  THEN 1
+                    WHEN 'nameplate' THEN 2
+                    ELSE 3
+                END LIMIT 1) AS drive_file_id
         FROM links_compatibility lc
         JOIN equipment e ON e.equipment_id = lc.equipment_id
         WHERE lc.accessory_id = ?
         ORDER BY e.label
     """, [accessory_id])
 
-    if not compat_df.empty:
-        st.subheader(f"🔧 Équipements compatibles ({len(compat_df)})")
-        for _, eq in compat_df.iterrows():
-            eq_label = null_str(eq.get("label"))
-            eq_brand = null_str(eq.get("brand"), "")
-            eq_model = null_str(eq.get("model"), "")
-            lc_note  = null_str(eq.get("note"), "")
-            note_str = f" — *{lc_note}*" if lc_note and lc_note != "—" else ""
-            st.markdown(f"&nbsp;&nbsp;🔧 **{eq_label}** · {eq_brand} {eq_model}{note_str}")
-            if st.button("Ouvrir", key=f"acc_open_eq_{eq['equipment_id']}_{accessory_id}",
-                         use_container_width=False):
-                show_equipment_modal(eq["equipment_id"])
-    else:
-        st.info("Aucun équipement lié à cet accessoire.")
+    st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+    _render_relation_cards(
+        section_title="Équipements compatibles",
+        df=compat_df if not compat_df.empty else None,
+        entity_type="equipment",
+        id_col="equipment_id",
+        file_id_col="drive_file_id",
+        open_fn=show_equipment_modal,
+        key_prefix=f"acc_eq_{accessory_id}",
+        sub_fn=lambda r: " · ".join(filter(
+            lambda x: x and x != "—",
+            [null_str(r.get("brand"), ""), null_str(r.get("model"), ""),
+             null_str(r.get("condition_label"), "")],
+        )),
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
@@ -2176,26 +2388,45 @@ def show_consumable_modal(consumable_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
-    # ── Équipements utilisant ce consommable ──────────────────
+    # ── Équipements utilisant ce consommable — arbre visuel ───
     st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
     compat_df = run_query("""
-        SELECT e.equipment_id, e.label, e.brand, e.model, lc.qty_per_use, lc.note
+        SELECT e.equipment_id, e.label, e.brand, e.model,
+               e.condition_label, lc.qty_per_use, lc.note,
+               (SELECT em.final_drive_file_id
+                FROM equipment_media em
+                WHERE em.equipment_id = e.equipment_id
+                ORDER BY CASE em.image_role
+                    WHEN 'overview'  THEN 1
+                    WHEN 'nameplate' THEN 2
+                    ELSE 3
+                END LIMIT 1) AS drive_file_id
         FROM links_consumables lc
         JOIN equipment e ON e.equipment_id = lc.equipment_id
         WHERE lc.consumable_id = ?
         ORDER BY e.label
     """, [consumable_id])
 
-    if not compat_df.empty:
-        st.subheader(f"🔧 Équipements utilisant ce consommable ({len(compat_df)})")
-        for _, eq in compat_df.iterrows():
-            eq_label = null_str(eq.get("label"))
-            eq_brand = null_str(eq.get("brand"), "")
-            qty_use  = eq.get("qty_per_use")
-            qty_str  = f" — {qty_use} {unit} / usage" if qty_use else ""
-            st.markdown(f"&nbsp;&nbsp;⚙ **{eq_label}** · {eq_brand}{qty_str}")
-    else:
-        st.info("Aucun équipement lié à ce consommable.")
+    _unit_label = null_str(row.get("unit"), "pcs")
+    st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+    _render_relation_cards(
+        section_title="Équipements qui utilisent ce consommable",
+        df=compat_df if not compat_df.empty else None,
+        entity_type="equipment",
+        id_col="equipment_id",
+        file_id_col="drive_file_id",
+        open_fn=show_equipment_modal,
+        key_prefix=f"con_eq_{consumable_id}",
+        sub_fn=lambda r: " · ".join(filter(
+            lambda x: x and x != "—",
+            [null_str(r.get("brand"), ""), null_str(r.get("model"), ""),
+             (f"{r.get('qty_per_use') or 1} {_unit_label} / usage"
+              if r.get("qty_per_use") else "")],
+        )),
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
