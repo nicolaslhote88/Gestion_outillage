@@ -3289,12 +3289,14 @@ def _coerce_equipment_summary(row: dict) -> dict:
         "model": row.get("model"),
         "category": row.get("category"),
         "subtype": row.get("subtype"),
+        "condition_label": row.get("condition_label"),
+        "location_hint": row.get("location_hint") or row.get("location"),
         "status": row.get("status"),
-        "location": row.get("location"),
-        "drive_file_id": row.get("drive_file_id"),
-        "archived": bool(row.get("archived", False)),
-        "migration_status": row.get("migration_status"),
+        "archived": bool(row.get("archived") or False),
+        "migration_status": row.get("migration_status") or "NOT_REVIEWED",
+        "photo_count": int(row.get("photo_count") or 0),
         "created_at": str(row["created_at"]) if row.get("created_at") else None,
+        "updated_at": str(row["updated_at"]) if row.get("updated_at") else None,
     }
 
 
