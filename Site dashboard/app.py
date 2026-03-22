@@ -905,7 +905,13 @@ def _render_relation_cards(
             if st.button("Voir →", key=f"dep_{key_prefix}_{entity_id}",
                          use_container_width=True,
                          help=f"Ouvrir la fiche {label}"):
-                open_fn(entity_id)
+                # Streamlit interdit les dialogs imbriqués — on programme
+                # l'ouverture via session_state et on relance le script.
+                st.session_state["_pending_modal"] = {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                }
+                st.rerun()
 
 
 def null_str(value, fallback: str = "—") -> str:
@@ -4686,6 +4692,20 @@ def main():
     if "loan_basket" not in st.session_state:
         st.session_state["loan_basket"] = {}
     init_db_tables()
+
+    # ── Dispatch modal différé (navigation depuis l'arbre de dépendances) ──
+    # Les dialogs Streamlit ne peuvent pas être imbriqués. Quand l'utilisateur
+    # clique "Voir →" depuis une fiche, on stocke la cible et on rerun.
+    # Ici on ouvre le bon modal AVANT de rendre la page.
+    _pm = st.session_state.pop("_pending_modal", None)
+    if _pm:
+        _etype, _eid = _pm.get("entity_type"), _pm.get("entity_id")
+        if _etype == "equipment":
+            show_equipment_modal(_eid)
+        elif _etype == "accessory":
+            show_accessory_modal(_eid)
+        elif _etype == "consumable":
+            show_consumable_modal(_eid)
 
     # ── Mode kiosque ──────────────────────────────────────────
     params = st.query_params
