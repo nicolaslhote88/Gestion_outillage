@@ -317,6 +317,8 @@ _ADMIN_PAGES = [
     "⚠ Centre de Validation",
     "📦 Suivi des Mouvements",
     "🧰 Gestion des Kits",
+    "🔩 Accessoires & Consommables",
+    "🏗 Préparation Chantier",
     "📊 Dashboard",
     "🔒 Journal des Accès",
 ]
@@ -324,6 +326,7 @@ _USER_PAGES = [
     "🏭 Parc Matériel",
     "📦 Suivi des Mouvements",
     "🧰 Gestion des Kits",
+    "🏗 Préparation Chantier",
     "📊 Dashboard",
 ]
 
@@ -411,6 +414,127 @@ def init_db_tables() -> None:
             end_date     TIMESTAMP NOT NULL,
             status       VARCHAR DEFAULT 'PENDING',
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ── v4.0 Modèle Relationnel ────────────────────────────
+    run_write("ALTER TABLE equipment ADD COLUMN IF NOT EXISTS ai_metadata VARCHAR")
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS accessories (
+            accessory_id  VARCHAR PRIMARY KEY,
+            label         VARCHAR NOT NULL,
+            brand         VARCHAR,
+            model         VARCHAR,
+            category      VARCHAR,
+            description   VARCHAR,
+            stock_qty     INTEGER DEFAULT 0,
+            location_hint VARCHAR,
+            drive_file_id VARCHAR,
+            notes         VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS consumables (
+            consumable_id   VARCHAR PRIMARY KEY,
+            label           VARCHAR NOT NULL,
+            brand           VARCHAR,
+            reference       VARCHAR,
+            category        VARCHAR,
+            description     VARCHAR,
+            unit            VARCHAR DEFAULT 'pcs',
+            stock_qty       DOUBLE DEFAULT 0,
+            stock_min_alert DOUBLE DEFAULT 0,
+            location_hint   VARCHAR,
+            drive_file_id   VARCHAR,
+            notes           VARCHAR,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS links_compatibility (
+            link_id      VARCHAR PRIMARY KEY,
+            equipment_id VARCHAR NOT NULL,
+            accessory_id VARCHAR NOT NULL,
+            note         VARCHAR,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (equipment_id, accessory_id)
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS links_consumables (
+            link_id       VARCHAR PRIMARY KEY,
+            equipment_id  VARCHAR NOT NULL,
+            consumable_id VARCHAR NOT NULL,
+            qty_per_use   DOUBLE DEFAULT 1,
+            note          VARCHAR,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (equipment_id, consumable_id)
+        )
+    """)
+
+    # ── v4.1 Gouvernance — colonnes sur equipment ──────────────
+    for col_sql in [
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMP",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migrated_by VARCHAR",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS classification_confidence DOUBLE",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Gouvernance — colonnes sur accessories ────────────
+    for col_sql in [
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS ai_metadata VARCHAR",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Gouvernance — colonnes sur consumables ────────────
+    for col_sql in [
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS ai_metadata VARCHAR",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Tables de traçabilité migration ──────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS legacy_mappings (
+            mapping_id              VARCHAR PRIMARY KEY,
+            legacy_equipment_id     VARCHAR NOT NULL,
+            canonical_equipment_id  VARCHAR,
+            derived_accessory_ids   VARCHAR,
+            derived_consumable_ids  VARCHAR,
+            notes                   VARCHAR,
+            created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (legacy_equipment_id)
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS migration_logs (
+            log_id              VARCHAR PRIMARY KEY,
+            operation           VARCHAR NOT NULL,
+            operator            VARCHAR NOT NULL DEFAULT 'openclaw',
+            source_entity_type  VARCHAR,
+            source_entity_id    VARCHAR,
+            target_entities     VARCHAR,
+            details             VARCHAR,
+            dry_run             BOOLEAN DEFAULT FALSE,
+            status              VARCHAR DEFAULT 'COMPLETED',
+            error_message       VARCHAR,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -2802,6 +2926,393 @@ def render_gestion_kits() -> None:
 #  SIDEBAR PRINCIPALE — Navigation
 # ─────────────────────────────────────────────────────────────
 
+def render_accessoires_consommables() -> None:
+    """Page d'administration des accessoires et consommables (v4.0)."""
+    st.markdown(
+        "<div class='section-title'>🔩 Accessoires & Consommables</div>"
+        "<div class='section-subtitle'>Gérez le catalogue relationnel : batteries, forets, abrasifs…</div>",
+        unsafe_allow_html=True,
+    )
+
+    tab_acc, tab_con, tab_links = st.tabs([
+        "🔋 Accessoires", "⚙ Consommables", "🔗 Liaisons"
+    ])
+
+    # ── Onglet Accessoires ─────────────────────────────────────
+    with tab_acc:
+        st.subheader("Catalogue des accessoires")
+
+        acc_df = run_query("""
+            SELECT accessory_id, label, brand, model, category,
+                   stock_qty, location_hint, created_at
+            FROM accessories ORDER BY label
+        """)
+        if not acc_df.empty:
+            st.dataframe(
+                acc_df.rename(columns={
+                    "accessory_id": "ID", "label": "Désignation", "brand": "Marque",
+                    "model": "Modèle", "category": "Catégorie",
+                    "stock_qty": "Stock", "location_hint": "Emplacement", "created_at": "Ajouté le",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Aucun accessoire enregistré. Utilisez le formulaire ci-dessous pour en ajouter.")
+
+        with st.expander("➕ Ajouter un accessoire"):
+            c1, c2 = st.columns(2)
+            acc_label    = c1.text_input("Désignation *", key="acc_label", placeholder="ex: Batterie 18V 5Ah")
+            acc_brand    = c2.text_input("Marque", key="acc_brand")
+            acc_model    = c1.text_input("Modèle", key="acc_model")
+            acc_category = c2.text_input("Catégorie", key="acc_cat", placeholder="ex: Batterie, Chargeur, Lame…")
+            acc_stock    = c1.number_input("Stock disponible", min_value=0, value=0, step=1, key="acc_stock")
+            acc_location = c2.text_input("Emplacement", key="acc_loc")
+            acc_notes    = st.text_area("Notes", key="acc_notes", height=60)
+            if st.button("✅ Ajouter l'accessoire", key="btn_add_acc"):
+                if not acc_label.strip():
+                    st.error("La désignation est obligatoire.")
+                else:
+                    ok = run_write(
+                        """INSERT INTO accessories
+                           (accessory_id, label, brand, model, category,
+                            stock_qty, location_hint, notes)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [str(uuid.uuid4()), acc_label.strip(), acc_brand or None,
+                         acc_model or None, acc_category or None,
+                         int(acc_stock), acc_location or None, acc_notes or None],
+                    )
+                    if ok:
+                        st.success(f"✅ Accessoire '{acc_label.strip()}' ajouté.")
+                        st.rerun()
+
+    # ── Onglet Consommables ────────────────────────────────────
+    with tab_con:
+        st.subheader("Catalogue des consommables")
+
+        con_df = run_query("""
+            SELECT consumable_id, label, brand, reference, category, unit,
+                   stock_qty, stock_min_alert, location_hint
+            FROM consumables ORDER BY label
+        """)
+        if not con_df.empty:
+            con_display = con_df.copy()
+            con_display["alerte"] = con_display.apply(
+                lambda r: "⚠ Stock bas" if r["stock_qty"] <= r["stock_min_alert"] else "✅ OK",
+                axis=1,
+            )
+            st.dataframe(
+                con_display.rename(columns={
+                    "consumable_id": "ID", "label": "Désignation", "brand": "Marque",
+                    "reference": "Référence", "category": "Catégorie", "unit": "Unité",
+                    "stock_qty": "Stock", "stock_min_alert": "Seuil alerte",
+                    "location_hint": "Emplacement", "alerte": "État",
+                }).drop(columns=["consumable_id"], errors="ignore"),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Aucun consommable enregistré.")
+
+        with st.expander("➕ Ajouter un consommable"):
+            c1, c2 = st.columns(2)
+            con_label    = c1.text_input("Désignation *", key="con_label", placeholder="ex: Foret SDS-Plus Ø10")
+            con_brand    = c2.text_input("Marque", key="con_brand")
+            con_ref      = c1.text_input("Référence fabricant", key="con_ref")
+            con_category = c2.text_input("Catégorie", key="con_cat", placeholder="ex: Foret, Abrasif, Visserie…")
+            con_unit     = c1.selectbox("Unité", ["pcs", "ml", "L", "g", "kg", "m", "feuilles"], key="con_unit")
+            con_stock    = c2.number_input("Stock actuel", min_value=0.0, value=0.0, step=1.0, key="con_stock")
+            con_alert    = c1.number_input("Seuil alerte", min_value=0.0, value=0.0, step=1.0, key="con_alert")
+            con_location = c2.text_input("Emplacement", key="con_loc")
+            con_notes    = st.text_area("Notes", key="con_notes", height=60)
+            if st.button("✅ Ajouter le consommable", key="btn_add_con"):
+                if not con_label.strip():
+                    st.error("La désignation est obligatoire.")
+                else:
+                    ok = run_write(
+                        """INSERT INTO consumables
+                           (consumable_id, label, brand, reference, category, unit,
+                            stock_qty, stock_min_alert, location_hint, notes)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [str(uuid.uuid4()), con_label.strip(), con_brand or None,
+                         con_ref or None, con_category or None, con_unit,
+                         float(con_stock), float(con_alert), con_location or None, con_notes or None],
+                    )
+                    if ok:
+                        st.success(f"✅ Consommable '{con_label.strip()}' ajouté.")
+                        st.rerun()
+
+    # ── Onglet Liaisons ────────────────────────────────────────
+    with tab_links:
+        st.subheader("Liaisons équipements ↔ accessoires / consommables")
+
+        col_la, col_lc = st.columns(2)
+
+        with col_la:
+            st.markdown("**🔋 Accessoires compatibles**")
+            compat_df = run_query("""
+                SELECT lc.link_id, e.label AS equipement, a.label AS accessoire,
+                       a.stock_qty AS stock, lc.note
+                FROM links_compatibility lc
+                JOIN equipment e ON e.equipment_id = lc.equipment_id
+                JOIN accessories a ON a.accessory_id = lc.accessory_id
+                ORDER BY e.label, a.label
+            """)
+            if not compat_df.empty:
+                st.dataframe(compat_df.drop(columns=["link_id"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Aucune liaison accessoire.")
+
+            with st.expander("➕ Lier un accessoire"):
+                equip_options = run_query("SELECT equipment_id, label FROM equipment ORDER BY label")
+                acc_options   = run_query("SELECT accessory_id, label FROM accessories ORDER BY label")
+                if equip_options.empty or acc_options.empty:
+                    st.warning("Ajoutez d'abord des équipements et des accessoires.")
+                else:
+                    sel_eq  = st.selectbox("Équipement", equip_options["equipment_id"].tolist(),
+                                           format_func=lambda x: equip_options.set_index("equipment_id").loc[x, "label"],
+                                           key="link_acc_eq")
+                    sel_acc = st.selectbox("Accessoire", acc_options["accessory_id"].tolist(),
+                                           format_func=lambda x: acc_options.set_index("accessory_id").loc[x, "label"],
+                                           key="link_acc_acc")
+                    link_note = st.text_input("Note (optionnelle)", key="link_acc_note")
+                    if st.button("🔗 Lier", key="btn_link_acc"):
+                        ok = run_write(
+                            """INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, note)
+                               VALUES (?, ?, ?, ?)
+                               ON CONFLICT (equipment_id, accessory_id) DO NOTHING""",
+                            [str(uuid.uuid4()), sel_eq, sel_acc, link_note or None],
+                        )
+                        if ok:
+                            st.success("✅ Liaison créée.")
+                            st.rerun()
+
+        with col_lc:
+            st.markdown("**⚙ Consommables nécessaires**")
+            cons_df = run_query("""
+                SELECT lcons.link_id, e.label AS equipement, c.label AS consommable,
+                       c.stock_qty AS stock, c.stock_min_alert AS seuil,
+                       lcons.qty_per_use AS qte_usage, lcons.note
+                FROM links_consumables lcons
+                JOIN equipment e ON e.equipment_id = lcons.equipment_id
+                JOIN consumables c ON c.consumable_id = lcons.consumable_id
+                ORDER BY e.label, c.label
+            """)
+            if not cons_df.empty:
+                st.dataframe(cons_df.drop(columns=["link_id"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Aucune liaison consommable.")
+
+            with st.expander("➕ Lier un consommable"):
+                equip_options2 = run_query("SELECT equipment_id, label FROM equipment ORDER BY label")
+                con_options    = run_query("SELECT consumable_id, label FROM consumables ORDER BY label")
+                if equip_options2.empty or con_options.empty:
+                    st.warning("Ajoutez d'abord des équipements et des consommables.")
+                else:
+                    sel_eq2  = st.selectbox("Équipement", equip_options2["equipment_id"].tolist(),
+                                            format_func=lambda x: equip_options2.set_index("equipment_id").loc[x, "label"],
+                                            key="link_con_eq")
+                    sel_con  = st.selectbox("Consommable", con_options["consumable_id"].tolist(),
+                                            format_func=lambda x: con_options.set_index("consumable_id").loc[x, "label"],
+                                            key="link_con_con")
+                    qty_use  = st.number_input("Quantité / usage", min_value=0.0, value=1.0, step=0.5, key="link_con_qty")
+                    link_note2 = st.text_input("Note (optionnelle)", key="link_con_note")
+                    if st.button("🔗 Lier", key="btn_link_con"):
+                        ok = run_write(
+                            """INSERT INTO links_consumables
+                               (link_id, equipment_id, consumable_id, qty_per_use, note)
+                               VALUES (?, ?, ?, ?, ?)
+                               ON CONFLICT (equipment_id, consumable_id) DO NOTHING""",
+                            [str(uuid.uuid4()), sel_eq2, sel_con, float(qty_use), link_note2 or None],
+                        )
+                        if ok:
+                            st.success("✅ Liaison consommable créée.")
+                            st.rerun()
+
+
+def render_preparation_chantier() -> None:
+    """Vue 'Préparation Chantier' — checklist interactive avec moteur de recommandation (v4.0)."""
+    st.markdown(
+        "<div class='section-title'>🏗 Préparation Chantier</div>"
+        "<div class='section-subtitle'>"
+        "Sélectionnez les équipements prévus — SIGA génère la checklist accessoires & consommables."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Sélection des équipements pour le chantier ─────────────
+    equip_df = run_query("""
+        SELECT e.equipment_id, e.label, e.brand, e.model, e.subtype, e.location_hint,
+               CASE WHEN m.equipment_id IS NULL THEN 'Disponible' ELSE '⚠ Sorti' END AS dispo
+        FROM equipment e
+        LEFT JOIN (
+            SELECT DISTINCT equipment_id FROM equipment_movements WHERE actual_return_date IS NULL
+        ) m ON m.equipment_id = e.equipment_id
+        WHERE e.status = 'validated'
+        ORDER BY e.label
+    """)
+
+    if equip_df.empty:
+        st.warning("Aucun équipement validé dans le catalogue.")
+        return
+
+    col_sel, col_checklist = st.columns([2, 3], gap="large")
+
+    with col_sel:
+        st.markdown("**Équipements pour ce chantier**")
+        selected_ids = st.multiselect(
+            "Sélectionnez les outils",
+            options=equip_df["equipment_id"].tolist(),
+            format_func=lambda x: equip_df.set_index("equipment_id").loc[x, "label"],
+            key="chantier_equipment_ids",
+        )
+
+        if selected_ids:
+            st.markdown("---")
+            st.markdown(f"**{len(selected_ids)} outil(s) sélectionné(s) :**")
+            for eid in selected_ids:
+                row = equip_df.set_index("equipment_id").loc[eid]
+                dispo_color = "#22c55e" if row["dispo"] == "Disponible" else "#f59e0b"
+                st.markdown(
+                    f"<div style='background:#1e293b;border-radius:8px;padding:8px 12px;"
+                    f"margin-bottom:6px;border-left:3px solid {dispo_color};'>"
+                    f"<b style='color:#f1f5f9;font-size:0.9rem;'>{row['label']}</b><br>"
+                    f"<span style='color:#64748b;font-size:0.78rem;'>{row['dispo']}"
+                    f" — {row.get('location_hint', '') or ''}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+    with col_checklist:
+        if not selected_ids:
+            st.info("Sélectionnez des équipements à gauche pour générer la checklist.")
+            return
+
+        st.markdown("**Checklist Chantier — Accessoires & Consommables**")
+
+        # Récupère toutes les liaisons pour les équipements sélectionnés
+        ids_ph = ", ".join(["?"] * len(selected_ids))
+
+        acc_df = run_query(
+            f"""
+            SELECT DISTINCT a.accessory_id, a.label, a.brand, a.model,
+                   a.stock_qty, a.location_hint,
+                   GROUP_CONCAT(e.label, ' / ') AS utilisable_avec
+            FROM links_compatibility lc
+            JOIN accessories a ON a.accessory_id = lc.accessory_id
+            JOIN equipment e ON e.equipment_id = lc.equipment_id
+            WHERE lc.equipment_id IN ({ids_ph})
+            GROUP BY a.accessory_id, a.label, a.brand, a.model, a.stock_qty, a.location_hint
+            ORDER BY a.label
+            """,
+            selected_ids,
+        )
+
+        con_df = run_query(
+            f"""
+            SELECT DISTINCT c.consumable_id, c.label, c.brand, c.reference,
+                   c.unit, c.stock_qty, c.stock_min_alert, c.location_hint,
+                   SUM(lcons.qty_per_use) AS qte_totale,
+                   GROUP_CONCAT(e.label, ' / ') AS utilisable_avec
+            FROM links_consumables lcons
+            JOIN consumables c ON c.consumable_id = lcons.consumable_id
+            JOIN equipment e ON e.equipment_id = lcons.equipment_id
+            WHERE lcons.equipment_id IN ({ids_ph})
+            GROUP BY c.consumable_id, c.label, c.brand, c.reference,
+                     c.unit, c.stock_qty, c.stock_min_alert, c.location_hint
+            ORDER BY c.label
+            """,
+            selected_ids,
+        )
+
+        # Section Accessoires
+        st.markdown("#### 🔋 Accessoires compatibles")
+        if acc_df.empty:
+            st.caption("Aucun accessoire lié aux équipements sélectionnés.")
+        else:
+            for _, row in acc_df.iterrows():
+                stk = int(row.get("stock_qty") or 0)
+                stk_color = "#22c55e" if stk > 0 else "#ef4444"
+                stk_label = f"✅ {stk} en stock" if stk > 0 else "❌ Rupture de stock"
+                bm = f"{row.get('brand', '') or ''} {row.get('model', '') or ''}".strip()
+                st.markdown(
+                    f"<div style='background:#1e293b;border-radius:10px;padding:10px 14px;"
+                    f"margin-bottom:8px;border-left:3px solid {stk_color};'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                    f"<div>"
+                    f"<b style='color:#f1f5f9;'>{row['label']}</b>"
+                    f"{'<span style=\"color:#64748b;font-size:0.8rem;\"> — ' + bm + '</span>' if bm else ''}<br>"
+                    f"<span style='color:#64748b;font-size:0.78rem;'>Utilisable avec : {row.get('utilisable_avec', '')}</span><br>"
+                    f"<span style='color:#64748b;font-size:0.78rem;'>📍 {row.get('location_hint', '') or 'Emplacement non renseigné'}</span>"
+                    f"</div>"
+                    f"<span style='color:{stk_color};font-weight:700;font-size:0.9rem;'>{stk_label}</span>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("#### ⚙ Consommables à prévoir")
+        if con_df.empty:
+            st.caption("Aucun consommable lié aux équipements sélectionnés.")
+        else:
+            alerts = []
+            for _, row in con_df.iterrows():
+                stk   = float(row.get("stock_qty") or 0)
+                alert = float(row.get("stock_min_alert") or 0)
+                qte   = float(row.get("qte_totale") or 1)
+                unit  = row.get("unit") or "pcs"
+
+                if stk <= alert:
+                    status_icon  = "❌"
+                    status_color = "#ef4444"
+                    status_txt   = f"Stock insuffisant ({stk} {unit})"
+                    alerts.append(row["label"])
+                elif stk < qte:
+                    status_icon  = "⚠"
+                    status_color = "#f59e0b"
+                    status_txt   = f"Stock limité ({stk} {unit} — besoin : {qte} {unit})"
+                else:
+                    status_icon  = "✅"
+                    status_color = "#22c55e"
+                    status_txt   = f"OK ({stk} {unit})"
+
+                ref = row.get("reference") or ""
+                st.markdown(
+                    f"<div style='background:#1e293b;border-radius:10px;padding:10px 14px;"
+                    f"margin-bottom:8px;border-left:3px solid {status_color};'>"
+                    f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                    f"<div>"
+                    f"<b style='color:#f1f5f9;'>{row['label']}</b>"
+                    f"{'<span style=\"color:#64748b;font-size:0.8rem;\"> — Réf: ' + ref + '</span>' if ref else ''}<br>"
+                    f"<span style='color:#64748b;font-size:0.78rem;'>Utilisable avec : {row.get('utilisable_avec', '')}</span><br>"
+                    f"<span style='color:#64748b;font-size:0.78rem;'>📍 {row.get('location_hint', '') or 'Emplacement non renseigné'}</span>"
+                    f"</div>"
+                    f"<span style='color:{status_color};font-weight:700;font-size:0.9rem;'>{status_icon} {status_txt}</span>"
+                    f"</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+            if alerts:
+                st.warning(
+                    f"⚠ **Attention** : {len(alerts)} consommable(s) en rupture ou stock insuffisant : "
+                    + ", ".join(f"**{a}**" for a in alerts)
+                )
+
+        # Résumé final
+        st.markdown("---")
+        total_acc = len(acc_df) if not acc_df.empty else 0
+        total_con = len(con_df) if not con_df.empty else 0
+        acc_ok    = len([r for _, r in acc_df.iterrows() if int(r.get("stock_qty") or 0) > 0]) if not acc_df.empty else 0
+        con_ok    = len([r for _, r in con_df.iterrows()
+                         if float(r.get("stock_qty") or 0) > float(r.get("stock_min_alert") or 0)]) if not con_df.empty else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Équipements", len(selected_ids))
+        m2.metric("Accessoires", f"{acc_ok}/{total_acc}", delta="disponibles")
+        m3.metric("Consommables", f"{con_ok}/{total_con}", delta="en stock")
+        m4.metric("Alertes", (total_acc - acc_ok) + (total_con - con_ok),
+                  delta_color="inverse")
+
+
 def render_sidebar():
     with st.sidebar:
         st.markdown(
@@ -3106,6 +3617,8 @@ def render_kiosk_equipment(data: dict) -> None:
     accessories    = data.get("accessories")     or []
     consumables    = data.get("consumables")     or []
     associated     = data.get("associated_items") or []
+    accessories_rel = data.get("accessories_rel") or []   # v4.0 liaisons relationnelles
+    consumables_rel = data.get("consumables_rel") or []   # v4.0 liaisons relationnelles
     media             = data.get("media_files") or []   # liste {file_id, role}
     loans_raw         = data.get("loans") or []
     next_reservation  = data.get("next_reservation")    # dict ou None
@@ -3261,6 +3774,61 @@ def render_kiosk_equipment(data: dict) -> None:
                     )
                 items_html += "</div>"
                 st.markdown(items_html, unsafe_allow_html=True)
+
+        # ── v4.0 Accessoires compatibles (base relationnelle) ──
+        if accessories_rel:
+            acc_html = (
+                "<hr class='kiosk-sep'>"
+                "<div class='kiosk-spec-label' style='margin-bottom:0.5rem;font-size:0.85rem;"
+                "text-transform:uppercase;letter-spacing:0.05em;color:#38bdf8;'>"
+                "🔋 Accessoires compatibles</div>"
+                "<div style='display:flex;flex-direction:column;gap:0.4rem;'>"
+            )
+            for acc in accessories_rel:
+                acc_label = acc.get("label") or "?"
+                bm = f"{acc.get('brand', '') or ''} {acc.get('model', '') or ''}".strip()
+                stk = int(acc.get("stock_qty") or 0)
+                stk_color = "#22c55e" if stk > 0 else "#ef4444"
+                stk_txt   = f"{stk} en stock" if stk > 0 else "Rupture"
+                acc_html += (
+                    f"<div style='background:#0f172a;border-radius:0.5rem;padding:0.4rem 0.8rem;"
+                    f"border-left:3px solid {stk_color};'>"
+                    f"<span style='color:#f1f5f9;font-weight:600;'>{acc_label}</span>"
+                    f"{'<span style=\"color:#64748b;font-size:0.85rem;\"> — ' + bm + '</span>' if bm else ''} "
+                    f"<span style='color:{stk_color};font-size:0.85rem;float:right;'>{stk_txt}</span>"
+                    f"</div>"
+                )
+            acc_html += "</div>"
+            st.markdown(acc_html, unsafe_allow_html=True)
+
+        # ── v4.0 Consommables à prévoir (base relationnelle) ───
+        if consumables_rel:
+            con_html = (
+                "<hr class='kiosk-sep'>"
+                "<div class='kiosk-spec-label' style='margin-bottom:0.5rem;font-size:0.85rem;"
+                "text-transform:uppercase;letter-spacing:0.05em;color:#f59e0b;'>"
+                "⚙ Consommables à prévoir</div>"
+                "<div style='display:flex;flex-direction:column;gap:0.4rem;'>"
+            )
+            for con in consumables_rel:
+                con_label  = con.get("label") or "?"
+                stk        = float(con.get("stock_qty") or 0)
+                stk_alert  = float(con.get("stock_min_alert") or 0)
+                stock_ok   = con.get("stock_ok", stk > stk_alert)
+                unit       = con.get("unit") or "pcs"
+                stk_color  = "#22c55e" if stock_ok else "#ef4444"
+                stk_txt    = f"{stk} {unit}" if stock_ok else f"⚠ {stk} {unit} — Stock bas"
+                ref        = con.get("reference") or ""
+                con_html += (
+                    f"<div style='background:#0f172a;border-radius:0.5rem;padding:0.4rem 0.8rem;"
+                    f"border-left:3px solid {stk_color};'>"
+                    f"<span style='color:#f1f5f9;font-weight:600;'>{con_label}</span>"
+                    f"{'<span style=\"color:#64748b;font-size:0.85rem;\"> — Réf: ' + ref + '</span>' if ref else ''} "
+                    f"<span style='color:{stk_color};font-size:0.85rem;float:right;'>{stk_txt}</span>"
+                    f"</div>"
+                )
+            con_html += "</div>"
+            st.markdown(con_html, unsafe_allow_html=True)
 
         if notes:
             st.markdown(
@@ -3573,6 +4141,10 @@ def main():
         render_suivi_mouvements()
     elif page == "🧰 Gestion des Kits":
         render_gestion_kits()
+    elif page == "🔩 Accessoires & Consommables":
+        render_accessoires_consommables()
+    elif page == "🏗 Préparation Chantier":
+        render_preparation_chantier()
     elif page == "📊 Dashboard":
         render_dashboard()
     elif page == "🔒 Journal des Accès":
