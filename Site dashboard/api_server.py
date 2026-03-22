@@ -35,6 +35,33 @@ Opérations :
   POST /api/links/consumables                → lier un consommable à un équipement
   DELETE /api/links/consumables/{link_id}    → supprimer une liaison consommable
 
+  — v4.1 Migration & gouvernance ——————————————————————————————
+  GET  /api/equipment                        → listing avec filtres + pagination
+  GET  /api/equipment/{id}                   → fiche complète (photos, gouvernance)
+  PATCH /api/equipment/{id}                  → mise à jour partielle
+  POST /api/equipment/{id}/archive           → soft-delete
+  POST /api/equipment/{id}/unarchive         → restaurer
+  GET  /api/accessories/{id}                 → fiche complète accessoire
+  PATCH /api/accessories/{id}               → mise à jour accessoire
+  DELETE /api/accessories/{id}              → archiver (hard=true pour supprimer)
+  GET  /api/consumables/{id}                → fiche complète consommable
+  PATCH /api/consumables/{id}              → mise à jour consommable
+  DELETE /api/consumables/{id}             → archiver (hard=true pour supprimer)
+  GET  /api/equipment/{id}/photos           → liste des photos
+  PUT  /api/equipment/{id}/photos           → remplacer les photos
+  GET  /api/drive/folder/{folder_id}        → lister un dossier Drive
+  GET  /api/drive/files/{file_id}           → métadonnées fichier Drive
+  POST /api/drive/folder                    → créer un dossier Drive
+  POST /api/drive/files/{file_id}/move      → déplacer un fichier Drive
+  POST /api/drive/files/{file_id}/copy      → copier un fichier Drive
+  PATCH /api/drive/files/{file_id}/rename   → renommer un fichier Drive
+  POST /api/media/reassign                  → réassigner une photo entre entités
+  POST /api/admin/migrations/reclassify     → migration atomique (dry_run supporté)
+  GET  /api/admin/migrations/logs           → journal d'audit
+  GET  /api/admin/migrations/legacy-mappings/{id} → traçabilité legacy → canonical
+  GET  /api/admin/export                    → export bulk inventaire
+  GET  /api/admin/duplicates                → détection doublons
+
 Auth : Bearer token statique (header Authorization: Bearer <token>)
        Défini par la variable d'environnement SIGA_API_TOKEN.
        Par défaut : "siga-secret-token-change-me" (à surcharger en prod).
@@ -60,6 +87,18 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
+
+# Drive (optionnel — dégradé gracieux si credentials absents)
+try:
+    from google.oauth2 import service_account as _sa
+    from googleapiclient.discovery import build as _gdrive_build
+    from googleapiclient.errors import HttpError as _DriveHttpError
+    _DRIVE_AVAILABLE = True
+except ImportError:
+    _DRIVE_AVAILABLE = False
+
+# Chemin service account partagé avec app.py
+GDRIVE_SA_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/secrets/service_account.json")
 
 # ─── Configuration ────────────────────────────────────────────
 DB_PATH    = "/files/duckdb/siga_v1.duckdb"
@@ -178,6 +217,141 @@ def _write_kiosk_state(command_type: str, data: Dict[str, Any]) -> None:
         encoding="utf-8",
     )
     tmp.replace(KIOSK_STATE_FILE)
+
+
+# ─── Drive helpers (v4.1) ────────────────────────────────────
+
+def _gdrive_service(write: bool = False):
+    """Retourne un service Google Drive, ou None si credentials absents."""
+    if not _DRIVE_AVAILABLE:
+        return None
+    sa_path = Path(GDRIVE_SA_PATH)
+    if not sa_path.exists():
+        return None
+    try:
+        scopes = (["https://www.googleapis.com/auth/drive"] if write
+                  else ["https://www.googleapis.com/auth/drive.readonly"])
+        creds = _sa.Credentials.from_service_account_file(str(sa_path), scopes=scopes)
+        return _gdrive_build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+
+def _drive_list_folder(folder_id: str) -> List[Dict]:
+    """Liste les fichiers d'un dossier Drive. Retourne [] si Drive indisponible."""
+    svc = _gdrive_service(write=False)
+    if svc is None:
+        return []
+    try:
+        results = []
+        page_token = None
+        while True:
+            kwargs: Dict[str, Any] = {
+                "q": f"'{folder_id}' in parents and trashed = false",
+                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents)",
+                "pageSize": 200,
+                "supportsAllDrives": True,
+                "includeItemsFromAllDrives": True,
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = svc.files().list(**kwargs).execute()
+            results.extend(resp.get("files", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return results
+    except Exception:
+        return []
+
+
+def _drive_get_file_meta(file_id: str) -> Optional[Dict]:
+    """Récupère les métadonnées d'un fichier Drive."""
+    svc = _gdrive_service(write=False)
+    if svc is None:
+        return None
+    try:
+        return svc.files().get(
+            fileId=file_id,
+            fields="id, name, mimeType, size, createdTime, modifiedTime, parents, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+    except Exception:
+        return None
+
+
+def _drive_create_folder(name: str, parent_id: Optional[str] = None) -> Optional[str]:
+    """Crée un dossier Drive. Retourne le folder_id créé, ou None."""
+    svc = _gdrive_service(write=True)
+    if svc is None:
+        return None
+    try:
+        meta: Dict[str, Any] = {
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        if parent_id:
+            meta["parents"] = [parent_id]
+        f = svc.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
+        return f.get("id")
+    except Exception:
+        return None
+
+
+def _drive_move_file(file_id: str, new_parent_id: str) -> bool:
+    """Déplace un fichier Drive vers un nouveau dossier."""
+    svc = _gdrive_service(write=True)
+    if svc is None:
+        return False
+    try:
+        meta = _gdrive_service(write=False).files().get(
+            fileId=file_id, fields="parents", supportsAllDrives=True
+        ).execute()
+        old_parents = ",".join(meta.get("parents", []))
+        svc.files().update(
+            fileId=file_id,
+            addParents=new_parent_id,
+            removeParents=old_parents,
+            fields="id, parents",
+            supportsAllDrives=True,
+        ).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _drive_copy_file(file_id: str, new_parent_id: str, new_name: Optional[str] = None) -> Optional[str]:
+    """Copie un fichier Drive. Retourne le nouvel ID, ou None."""
+    svc = _gdrive_service(write=True)
+    if svc is None:
+        return None
+    try:
+        body: Dict[str, Any] = {}
+        if new_parent_id:
+            body["parents"] = [new_parent_id]
+        if new_name:
+            body["name"] = new_name
+        result = svc.files().copy(
+            fileId=file_id, body=body, fields="id", supportsAllDrives=True
+        ).execute()
+        return result.get("id")
+    except Exception:
+        return None
+
+
+def _drive_rename_file(file_id: str, new_name: str) -> bool:
+    """Renomme un fichier Drive."""
+    svc = _gdrive_service(write=True)
+    if svc is None:
+        return False
+    try:
+        svc.files().update(
+            fileId=file_id, body={"name": new_name},
+            fields="id, name", supportsAllDrives=True
+        ).execute()
+        return True
+    except Exception:
+        return False
 
 
 # ─── Scoring fuzzy ────────────────────────────────────────────
@@ -526,6 +700,409 @@ class AccessoryListResponse(BaseModel):
 class ConsumableListResponse(BaseModel):
     count: int
     consumables: List[ConsumableItem]
+
+
+# — v4.1 Equipment listing & full detail ──────────────────────
+
+class EquipmentPhotoRef(BaseModel):
+    photo_id: str                    # equipment_media primary key (media_id)
+    file_id: Optional[str] = None   # final_drive_file_id
+    folder_id: Optional[str] = None # final_drive_folder_id
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    role: Optional[str] = None       # overview | nameplate | detail | …
+    sort_order: int = 0
+    is_primary: bool = False
+    web_view_link: Optional[str] = None
+
+
+class EquipmentFullResponse(BaseModel):
+    equipment_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    category: Optional[str] = None
+    subtype: Optional[str] = None
+    condition_label: Optional[str] = None
+    location_hint: Optional[str] = None
+    ownership_mode: Optional[str] = None
+    purchase_price: Optional[float] = None
+    purchase_currency: Optional[str] = None
+    notes: Optional[str] = None
+    technical_specs: Optional[Dict] = None
+    business_context: Optional[Dict] = None
+    ai_metadata: Optional[Dict] = None
+    status: Optional[str] = None
+    review_required: bool = False
+    review_reasons: Optional[List] = None
+    archived: bool = False
+    migration_status: str = "NOT_REVIEWED"
+    legacy_source_id: Optional[str] = None
+    migrated_at: Optional[str] = None
+    migrated_by: Optional[str] = None
+    classification_confidence: Optional[float] = None
+    photo_count: int = 0
+    photos: List[EquipmentPhotoRef] = []
+    drive_folder_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class EquipmentSummary(BaseModel):
+    equipment_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    subtype: Optional[str] = None
+    condition_label: Optional[str] = None
+    location_hint: Optional[str] = None
+    status: Optional[str] = None
+    archived: bool = False
+    migration_status: str = "NOT_REVIEWED"
+    photo_count: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class EquipmentListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
+    items: List[EquipmentSummary]
+
+
+class EquipmentUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    serial_number: Optional[str] = None
+    category: Optional[str] = None
+    subtype: Optional[str] = None
+    condition_label: Optional[str] = None
+    location_hint: Optional[str] = None
+    ownership_mode: Optional[str] = None
+    purchase_price: Optional[float] = None
+    purchase_currency: Optional[str] = None
+    notes: Optional[str] = None
+    technical_specs_json: Optional[str] = None   # JSON string
+    business_context_json: Optional[str] = None  # JSON string
+    ai_metadata: Optional[str] = None            # JSON string
+    status: Optional[str] = None
+    review_required: Optional[bool] = None
+    archived: Optional[bool] = None
+    migration_status: Optional[str] = None
+    legacy_source_id: Optional[str] = None
+    migrated_by: Optional[str] = None
+    classification_confidence: Optional[float] = None
+
+
+class ArchiveResponse(BaseModel):
+    ok: bool
+    equipment_id: str
+    message: str
+
+
+# — v4.1 Photo management ─────────────────────────────────────
+
+class PhotoRefInput(BaseModel):
+    file_id: str
+    folder_id: Optional[str] = None
+    filename: Optional[str] = None
+    mime_type: Optional[str] = None
+    role: str = "overview"
+    sort_order: int = 0
+    is_primary: bool = False
+
+
+class PhotoUpdateRequest(BaseModel):
+    photos: List[PhotoRefInput]   # remplace entièrement la liste des photos
+
+
+class PhotoListResponse(BaseModel):
+    equipment_id: str
+    count: int
+    photos: List[EquipmentPhotoRef]
+
+
+# — v4.1 Accessories / Consumables CRUD complet ───────────────
+
+class AccessoryFullResponse(BaseModel):
+    accessory_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    stock_qty: int = 0
+    location_hint: Optional[str] = None
+    drive_file_id: Optional[str] = None
+    notes: Optional[str] = None
+    ai_metadata: Optional[Dict] = None
+    archived: bool = False
+    migration_status: str = "NOT_REVIEWED"
+    legacy_source_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class AccessoryUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    stock_qty: Optional[int] = None
+    location_hint: Optional[str] = None
+    drive_file_id: Optional[str] = None
+    notes: Optional[str] = None
+    ai_metadata: Optional[str] = None   # JSON string
+    archived: Optional[bool] = None
+    migration_status: Optional[str] = None
+    legacy_source_id: Optional[str] = None
+
+
+class ConsumableFullResponse(BaseModel):
+    consumable_id: str
+    label: str
+    brand: Optional[str] = None
+    reference: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    unit: str = "pcs"
+    stock_qty: float = 0
+    stock_min_alert: float = 0
+    location_hint: Optional[str] = None
+    drive_file_id: Optional[str] = None
+    notes: Optional[str] = None
+    ai_metadata: Optional[Dict] = None
+    archived: bool = False
+    migration_status: str = "NOT_REVIEWED"
+    legacy_source_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class ConsumableUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    brand: Optional[str] = None
+    reference: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    unit: Optional[str] = None
+    stock_qty: Optional[float] = None
+    stock_min_alert: Optional[float] = None
+    location_hint: Optional[str] = None
+    drive_file_id: Optional[str] = None
+    notes: Optional[str] = None
+    ai_metadata: Optional[str] = None   # JSON string
+    archived: Optional[bool] = None
+    migration_status: Optional[str] = None
+    legacy_source_id: Optional[str] = None
+
+
+# — v4.1 Drive bridge ─────────────────────────────────────────
+
+class DriveFileInfo(BaseModel):
+    file_id: str
+    name: str
+    mime_type: str
+    size: Optional[int] = None
+    created_time: Optional[str] = None
+    modified_time: Optional[str] = None
+    parents: List[str] = []
+    web_view_link: Optional[str] = None
+    is_folder: bool = False
+
+
+class DriveFolderContents(BaseModel):
+    folder_id: str
+    count: int
+    files: List[DriveFileInfo]
+
+
+class DriveCreateFolderRequest(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+
+
+class DriveCreateFolderResponse(BaseModel):
+    ok: bool
+    folder_id: Optional[str]
+    message: str
+
+
+class DriveMoveRequest(BaseModel):
+    new_parent_id: str
+
+
+class DriveCopyRequest(BaseModel):
+    new_parent_id: str
+    new_name: Optional[str] = None
+
+
+class DriveFileOpResponse(BaseModel):
+    ok: bool
+    file_id: Optional[str] = None
+    message: str
+
+
+class DriveRenameRequest(BaseModel):
+    new_name: str
+
+
+# — v4.1 Réassignation photo ──────────────────────────────────
+
+class MediaReassignRequest(BaseModel):
+    source_entity_type: str = "equipment"
+    source_entity_id: str
+    target_entity_type: str          # "equipment" | "accessory" | "consumable"
+    target_entity_id: str
+    photo_id: str                    # media_id dans equipment_media
+    mode: str = "move"               # "move" | "copy"
+
+
+class MediaReassignResponse(BaseModel):
+    ok: bool
+    photo_id: str
+    new_file_id: Optional[str] = None
+    message: str
+
+
+# — v4.1 Migration orchestrée ─────────────────────────────────
+
+class ReclassifyTargetEquipment(BaseModel):
+    label: Optional[str] = None
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    subtype: Optional[str] = None
+    notes: Optional[str] = None
+    ai_metadata: Optional[str] = None
+
+
+class ReclassifyNewAccessory(BaseModel):
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    stock_qty: int = 0
+    notes: Optional[str] = None
+    drive_file_id: Optional[str] = None   # photo à associer
+
+
+class ReclassifyNewConsumable(BaseModel):
+    label: str
+    brand: Optional[str] = None
+    reference: Optional[str] = None
+    category: Optional[str] = None
+    unit: str = "pcs"
+    stock_qty: float = 0
+    stock_min_alert: float = 0
+    notes: Optional[str] = None
+    drive_file_id: Optional[str] = None
+
+
+class LinkTarget(BaseModel):
+    accessory_id: str
+    note: Optional[str] = None
+
+
+class ConsumableLinkTarget(BaseModel):
+    consumable_id: str
+    qty_per_use: float = 1
+    note: Optional[str] = None
+
+
+class PhotoMapping(BaseModel):
+    photo_id: str                    # media_id de la source
+    target_entity_type: str          # "equipment" | "accessory" | "consumable"
+    target_index: int = 0            # index dans la liste d'accessories/consumables créés
+    mode: str = "keep"               # "keep" | "move" | "copy"
+
+
+class ReclassifyRequest(BaseModel):
+    source_equipment_id: str
+    action: str = "split_record"     # "split_record" | "reclassify_as_accessory" | "reclassify_as_consumable"
+    target_equipment: Optional[ReclassifyTargetEquipment] = None
+    new_accessories: List[ReclassifyNewAccessory] = []
+    new_consumables: List[ReclassifyNewConsumable] = []
+    link_existing_accessories: List[LinkTarget] = []
+    link_existing_consumables: List[ConsumableLinkTarget] = []
+    photo_mapping: List[PhotoMapping] = []
+    source_record_policy: str = "archive"   # "archive" | "keep"
+    operator: str = "openclaw"
+    notes: Optional[str] = None
+
+
+class ReclassifyPlan(BaseModel):
+    source_equipment_id: str
+    action: str
+    equipment_updates: Dict = {}
+    accessories_to_create: int = 0
+    consumables_to_create: int = 0
+    links_to_create: int = 0
+    photos_to_process: int = 0
+    source_will_be_archived: bool = True
+
+
+class ReclassifyResult(BaseModel):
+    ok: bool
+    dry_run: bool
+    log_id: Optional[str] = None
+    plan: Optional[ReclassifyPlan] = None
+    created_accessory_ids: List[str] = []
+    created_consumable_ids: List[str] = []
+    links_created: int = 0
+    source_archived: bool = False
+    legacy_mapping_id: Optional[str] = None
+    message: str
+
+
+# — v4.1 Migration logs & Admin ───────────────────────────────
+
+class MigrationLogEntry(BaseModel):
+    log_id: str
+    operation: str
+    operator: str
+    source_entity_type: Optional[str] = None
+    source_entity_id: Optional[str] = None
+    target_entities: Optional[Dict] = None
+    details: Optional[Dict] = None
+    dry_run: bool = False
+    status: str = "COMPLETED"
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class MigrationLogsResponse(BaseModel):
+    count: int
+    logs: List[MigrationLogEntry]
+
+
+class DuplicateGroup(BaseModel):
+    entity_type: str
+    ids: List[str]
+    labels: List[str]
+    similarity_score: float
+    reason: str
+
+
+class DuplicatesResponse(BaseModel):
+    count: int
+    groups: List[DuplicateGroup]
+
+
+class LegacyMappingResponse(BaseModel):
+    mapping_id: str
+    legacy_equipment_id: str
+    canonical_equipment_id: Optional[str] = None
+    derived_accessory_ids: List[str] = []
+    derived_consumable_ids: List[str] = []
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 # ─── App FastAPI ──────────────────────────────────────────────
@@ -2611,6 +3188,1003 @@ def delete_link_consumable(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return {"ok": True, "link_id": link_id, "message": "Liaison consommable supprimée."}
+
+
+# ─── v4.1 : Listing & détail équipement ──────────────────────
+
+@app.get("/api/equipment", tags=["v4.1 Équipement"], summary="Listing équipements avec filtres")
+def list_equipment(
+    q: Optional[str] = None,
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    status: Optional[str] = None,
+    archived: Optional[bool] = None,
+    migration_status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Liste tous les équipements avec filtres optionnels et pagination."""
+    _require_token(_creds)
+    conditions = []
+    params: List[Any] = []
+
+    if q:
+        conditions.append("(LOWER(label) LIKE ? OR LOWER(brand) LIKE ? OR LOWER(model) LIKE ?)")
+        like = f"%{q.lower()}%"
+        params += [like, like, like]
+    if category:
+        conditions.append("LOWER(category) = ?")
+        params.append(category.lower())
+    if brand:
+        conditions.append("LOWER(brand) = ?")
+        params.append(brand.lower())
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if archived is not None:
+        conditions.append("archived = ?")
+        params.append(archived)
+    else:
+        # Par défaut on masque les archivés
+        conditions.append("(archived IS NULL OR archived = FALSE)")
+    if migration_status:
+        conditions.append("migration_status = ?")
+        params.append(migration_status)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    offset = (page - 1) * page_size
+
+    count_rows = _run_query(f"SELECT COUNT(*) as cnt FROM equipment {where}", params)
+    total = int(count_rows[0]["cnt"]) if count_rows else 0
+
+    rows = _run_query(
+        f"SELECT * FROM equipment {where} ORDER BY label LIMIT ? OFFSET ?",
+        params + [page_size, offset],
+    )
+    items = [dict(r) for r in rows]
+    return EquipmentListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[EquipmentSummary(**_coerce_equipment_summary(i)) for i in items],
+    )
+
+
+def _coerce_equipment_summary(row: dict) -> dict:
+    """Normalise un dict DB → EquipmentSummary (champs optionnels manquants)."""
+    return {
+        "equipment_id": row.get("equipment_id", ""),
+        "label": row.get("label", ""),
+        "brand": row.get("brand"),
+        "model": row.get("model"),
+        "category": row.get("category"),
+        "subtype": row.get("subtype"),
+        "status": row.get("status"),
+        "location": row.get("location"),
+        "drive_file_id": row.get("drive_file_id"),
+        "archived": bool(row.get("archived", False)),
+        "migration_status": row.get("migration_status"),
+        "created_at": str(row["created_at"]) if row.get("created_at") else None,
+    }
+
+
+@app.get("/api/equipment/{equipment_id}", tags=["v4.1 Équipement"], summary="Fiche complète équipement")
+def get_equipment_full(
+    equipment_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Retourne la fiche complète d'un équipement : métadonnées, photos, gouvernance."""
+    _require_token(_creds)
+    rows = _run_query("SELECT * FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+    row = dict(rows[0])
+
+    # Photos
+    photos: List[EquipmentPhotoRef] = []
+    try:
+        photo_rows = _run_query(
+            "SELECT * FROM equipment_media WHERE equipment_id = ? ORDER BY image_index",
+            [equipment_id],
+        )
+        for p in photo_rows:
+            photos.append(EquipmentPhotoRef(
+                media_id=p["media_id"],
+                final_drive_file_id=p.get("final_drive_file_id"),
+                image_role=p.get("image_role", "overview"),
+                image_index=int(p.get("image_index", 0)),
+                source_drive_file_id=p.get("source_drive_file_id"),
+                notes=p.get("notes"),
+            ))
+    except Exception:
+        pass  # table may not have all columns yet
+
+    # ai_metadata
+    ai_meta = None
+    if row.get("ai_metadata"):
+        try:
+            ai_meta = json.loads(row["ai_metadata"])
+        except Exception:
+            ai_meta = {"raw": row["ai_metadata"]}
+
+    return EquipmentFullResponse(
+        equipment_id=row["equipment_id"],
+        label=row.get("label", ""),
+        brand=row.get("brand"),
+        model=row.get("model"),
+        serial_number=row.get("serial_number"),
+        category=row.get("category"),
+        subtype=row.get("subtype"),
+        status=row.get("status"),
+        location=row.get("location"),
+        purchase_date=str(row["purchase_date"]) if row.get("purchase_date") else None,
+        drive_file_id=row.get("drive_file_id"),
+        notes=row.get("notes"),
+        ai_metadata=ai_meta,
+        archived=bool(row.get("archived", False)),
+        migration_status=row.get("migration_status", "NOT_REVIEWED"),
+        legacy_source_id=row.get("legacy_source_id"),
+        migrated_at=str(row["migrated_at"]) if row.get("migrated_at") else None,
+        migrated_by=row.get("migrated_by"),
+        classification_confidence=row.get("classification_confidence"),
+        photos=photos,
+        created_at=str(row["created_at"]) if row.get("created_at") else None,
+        updated_at=str(row["updated_at"]) if row.get("updated_at") else None,
+    )
+
+
+@app.patch("/api/equipment/{equipment_id}", tags=["v4.1 Équipement"], summary="Mettre à jour un équipement")
+def patch_equipment(
+    equipment_id: str,
+    body: EquipmentUpdateRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Met à jour les champs fournis (PATCH sémantique — seuls les champs non-null sont modifiés)."""
+    _require_token(_creds)
+    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+
+    updates: Dict[str, Any] = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        if field == "ai_metadata" and isinstance(value, dict):
+            updates[field] = json.dumps(value, ensure_ascii=False)
+        else:
+            updates[field] = value
+
+    if not updates:
+        return {"ok": True, "equipment_id": equipment_id, "message": "Aucun champ à modifier."}
+
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    params = list(updates.values()) + [equipment_id]
+    try:
+        _run_write(f"UPDATE equipment SET {set_clause} WHERE equipment_id = ?", params)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "equipment_id": equipment_id, "updated_fields": list(updates.keys())}
+
+
+@app.post("/api/equipment/{equipment_id}/archive", tags=["v4.1 Équipement"], summary="Archiver un équipement")
+def archive_equipment(
+    equipment_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Soft-delete : marque archived=TRUE et migration_status=ARCHIVED."""
+    _require_token(_creds)
+    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+    try:
+        _run_write(
+            "UPDATE equipment SET archived = TRUE, migration_status = 'ARCHIVED', updated_at = ? WHERE equipment_id = ?",
+            [datetime.utcnow().isoformat(), equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return ArchiveResponse(ok=True, equipment_id=equipment_id, archived=True, message="Équipement archivé.")
+
+
+@app.post("/api/equipment/{equipment_id}/unarchive", tags=["v4.1 Équipement"], summary="Désarchiver un équipement")
+def unarchive_equipment(
+    equipment_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Restaure un équipement archivé (archived=FALSE, migration_status=REVIEWED)."""
+    _require_token(_creds)
+    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+    try:
+        _run_write(
+            "UPDATE equipment SET archived = FALSE, migration_status = 'REVIEWED', updated_at = ? WHERE equipment_id = ?",
+            [datetime.utcnow().isoformat(), equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return ArchiveResponse(ok=True, equipment_id=equipment_id, archived=False, message="Équipement désarchivé.")
+
+
+# ─── v4.1 : Accessoires CRUD complet ─────────────────────────
+
+@app.get("/api/accessories/{accessory_id}", tags=["v4.1 Accessoires"], summary="Fiche complète accessoire")
+def get_accessory_full(
+    accessory_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+    row = dict(rows[0])
+    ai_meta = None
+    if row.get("ai_metadata"):
+        try:
+            ai_meta = json.loads(row["ai_metadata"])
+        except Exception:
+            ai_meta = {"raw": row["ai_metadata"]}
+    return AccessoryFullResponse(
+        accessory_id=row["accessory_id"],
+        label=row.get("label", ""),
+        brand=row.get("brand"),
+        model=row.get("model"),
+        category=row.get("category"),
+        description=row.get("description"),
+        stock_qty=int(row.get("stock_qty", 0)),
+        location_hint=row.get("location_hint"),
+        drive_file_id=row.get("drive_file_id"),
+        notes=row.get("notes"),
+        ai_metadata=ai_meta,
+        archived=bool(row.get("archived", False)),
+        migration_status=row.get("migration_status", "NOT_REVIEWED"),
+        legacy_source_id=row.get("legacy_source_id"),
+        created_at=str(row["created_at"]) if row.get("created_at") else None,
+        updated_at=str(row["updated_at"]) if row.get("updated_at") else None,
+    )
+
+
+@app.patch("/api/accessories/{accessory_id}", tags=["v4.1 Accessoires"], summary="Mettre à jour un accessoire")
+def patch_accessory(
+    accessory_id: str,
+    body: AccessoryUpdateRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+
+    updates: Dict[str, Any] = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        if field == "ai_metadata" and isinstance(value, dict):
+            updates[field] = json.dumps(value, ensure_ascii=False)
+        else:
+            updates[field] = value
+
+    if not updates:
+        return {"ok": True, "accessory_id": accessory_id, "message": "Aucun champ à modifier."}
+
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    params = list(updates.values()) + [accessory_id]
+    try:
+        _run_write(f"UPDATE accessories SET {set_clause} WHERE accessory_id = ?", params)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "accessory_id": accessory_id, "updated_fields": list(updates.keys())}
+
+
+@app.delete("/api/accessories/{accessory_id}", tags=["v4.1 Accessoires"], summary="Archiver/supprimer un accessoire")
+def delete_accessory(
+    accessory_id: str,
+    hard: bool = False,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
+    _require_token(_creds)
+    rows = _run_query("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+    try:
+        if hard:
+            _run_write("DELETE FROM links_compatibility WHERE accessory_id = ?", [accessory_id])
+            _run_write("DELETE FROM accessories WHERE accessory_id = ?", [accessory_id])
+            return {"ok": True, "accessory_id": accessory_id, "message": "Accessoire supprimé définitivement."}
+        else:
+            _run_write(
+                "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
+                [datetime.utcnow().isoformat(), accessory_id],
+            )
+            return {"ok": True, "accessory_id": accessory_id, "message": "Accessoire archivé."}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+# ─── v4.1 : Consommables CRUD complet ────────────────────────
+
+@app.get("/api/consumables/{consumable_id}", tags=["v4.1 Consommables"], summary="Fiche complète consommable")
+def get_consumable_full(
+    consumable_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+    row = dict(rows[0])
+    ai_meta = None
+    if row.get("ai_metadata"):
+        try:
+            ai_meta = json.loads(row["ai_metadata"])
+        except Exception:
+            ai_meta = {"raw": row["ai_metadata"]}
+    return ConsumableFullResponse(
+        consumable_id=row["consumable_id"],
+        label=row.get("label", ""),
+        brand=row.get("brand"),
+        reference=row.get("reference"),
+        category=row.get("category"),
+        description=row.get("description"),
+        unit=row.get("unit", "pcs"),
+        stock_qty=float(row.get("stock_qty", 0)),
+        stock_min_alert=float(row.get("stock_min_alert", 0)),
+        location_hint=row.get("location_hint"),
+        drive_file_id=row.get("drive_file_id"),
+        notes=row.get("notes"),
+        ai_metadata=ai_meta,
+        archived=bool(row.get("archived", False)),
+        migration_status=row.get("migration_status", "NOT_REVIEWED"),
+        legacy_source_id=row.get("legacy_source_id"),
+        created_at=str(row["created_at"]) if row.get("created_at") else None,
+        updated_at=str(row["updated_at"]) if row.get("updated_at") else None,
+    )
+
+
+@app.patch("/api/consumables/{consumable_id}", tags=["v4.1 Consommables"], summary="Mettre à jour un consommable")
+def patch_consumable(
+    consumable_id: str,
+    body: ConsumableUpdateRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+
+    updates: Dict[str, Any] = {}
+    for field, value in body.model_dump(exclude_none=True).items():
+        if field == "ai_metadata" and isinstance(value, dict):
+            updates[field] = json.dumps(value, ensure_ascii=False)
+        else:
+            updates[field] = value
+
+    if not updates:
+        return {"ok": True, "consumable_id": consumable_id, "message": "Aucun champ à modifier."}
+
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    params = list(updates.values()) + [consumable_id]
+    try:
+        _run_write(f"UPDATE consumables SET {set_clause} WHERE consumable_id = ?", params)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "consumable_id": consumable_id, "updated_fields": list(updates.keys())}
+
+
+@app.delete("/api/consumables/{consumable_id}", tags=["v4.1 Consommables"], summary="Archiver/supprimer un consommable")
+def delete_consumable(
+    consumable_id: str,
+    hard: bool = False,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
+    _require_token(_creds)
+    rows = _run_query("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+    try:
+        if hard:
+            _run_write("DELETE FROM links_consumables WHERE consumable_id = ?", [consumable_id])
+            _run_write("DELETE FROM consumables WHERE consumable_id = ?", [consumable_id])
+            return {"ok": True, "consumable_id": consumable_id, "message": "Consommable supprimé définitivement."}
+        else:
+            _run_write(
+                "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
+                [datetime.utcnow().isoformat(), consumable_id],
+            )
+            return {"ok": True, "consumable_id": consumable_id, "message": "Consommable archivé."}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+# ─── v4.1 : Gestion des photos équipement ────────────────────
+
+@app.get("/api/equipment/{equipment_id}/photos", tags=["v4.1 Photos"], summary="Lister les photos d'un équipement")
+def get_equipment_photos(
+    equipment_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+
+    photo_rows = _run_query(
+        "SELECT * FROM equipment_media WHERE equipment_id = ? ORDER BY image_index",
+        [equipment_id],
+    )
+    photos = [
+        EquipmentPhotoRef(
+            media_id=p["media_id"],
+            final_drive_file_id=p.get("final_drive_file_id"),
+            image_role=p.get("image_role", "overview"),
+            image_index=int(p.get("image_index", 0)),
+            source_drive_file_id=p.get("source_drive_file_id"),
+            notes=p.get("notes"),
+        )
+        for p in photo_rows
+    ]
+    return PhotoListResponse(equipment_id=equipment_id, photos=photos, count=len(photos))
+
+
+@app.put("/api/equipment/{equipment_id}/photos", tags=["v4.1 Photos"], summary="Remplacer les références photo")
+def put_equipment_photos(
+    equipment_id: str,
+    body: PhotoUpdateRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Remplace entièrement la liste de photos d'un équipement."""
+    _require_token(_creds)
+    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+
+    try:
+        _run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
+        for i, photo in enumerate(body.photos):
+            media_id = photo.media_id or str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO equipment_media
+                   (media_id, equipment_id, final_drive_file_id, image_role, image_index, source_drive_file_id, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (media_id) DO UPDATE SET
+                       final_drive_file_id = EXCLUDED.final_drive_file_id,
+                       image_role = EXCLUDED.image_role,
+                       image_index = EXCLUDED.image_index""",
+                [
+                    media_id,
+                    equipment_id,
+                    photo.final_drive_file_id,
+                    photo.image_role or "overview",
+                    photo.image_index if photo.image_index is not None else i,
+                    photo.source_drive_file_id,
+                    photo.notes,
+                ],
+            )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {"ok": True, "equipment_id": equipment_id, "photos_count": len(body.photos)}
+
+
+# ─── v4.1 : Bridge Google Drive ──────────────────────────────
+
+@app.get("/api/drive/folder/{folder_id}", tags=["v4.1 Drive"], summary="Lister le contenu d'un dossier Drive")
+def drive_list_folder(
+    folder_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    files = _drive_list_folder(folder_id)
+    return DriveFolderContents(folder_id=folder_id, files=files, count=len(files))
+
+
+@app.get("/api/drive/files/{file_id}", tags=["v4.1 Drive"], summary="Métadonnées d'un fichier Drive")
+def drive_get_file(
+    file_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    meta = _drive_get_file_meta(file_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail=f"Fichier Drive {file_id} introuvable.")
+    return meta
+
+
+@app.post("/api/drive/folder", tags=["v4.1 Drive"], summary="Créer un dossier Drive")
+def drive_create_folder(
+    body: DriveCreateFolderRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    folder_id = _drive_create_folder(body.name, body.parent_id)
+    if folder_id is None:
+        raise HTTPException(status_code=500, detail="Impossible de créer le dossier Drive.")
+    return DriveCreateFolderResponse(ok=True, folder_id=folder_id, message=f"Dossier '{body.name}' créé.")
+
+
+@app.post("/api/drive/files/{file_id}/move", tags=["v4.1 Drive"], summary="Déplacer un fichier Drive")
+def drive_move_file(
+    file_id: str,
+    body: DriveMoveRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    ok = _drive_move_file(file_id, body.new_parent_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Déplacement Drive échoué.")
+    return DriveFileOpResponse(ok=True, file_id=file_id, message="Fichier déplacé.")
+
+
+@app.post("/api/drive/files/{file_id}/copy", tags=["v4.1 Drive"], summary="Copier un fichier Drive")
+def drive_copy_file(
+    file_id: str,
+    body: DriveCopyRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    new_id = _drive_copy_file(file_id, body.new_parent_id, body.new_name)
+    if new_id is None:
+        raise HTTPException(status_code=500, detail="Copie Drive échouée.")
+    return DriveFileOpResponse(ok=True, file_id=new_id, message="Fichier copié.")
+
+
+@app.patch("/api/drive/files/{file_id}/rename", tags=["v4.1 Drive"], summary="Renommer un fichier Drive")
+def drive_rename_file(
+    file_id: str,
+    body: DriveRenameRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+    ok = _drive_rename_file(file_id, body.new_name)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Renommage Drive échoué.")
+    return DriveFileOpResponse(ok=True, file_id=file_id, message=f"Fichier renommé en '{body.new_name}'.")
+
+
+# ─── v4.1 : Réassignation photo ──────────────────────────────
+
+@app.post("/api/media/reassign", tags=["v4.1 Photos"], summary="Réassigner une photo vers une autre entité")
+def media_reassign(
+    body: MediaReassignRequest,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Déplace ou copie une photo entre entités. Supporte equipment→equipment, equipment→accessory, equipment→consumable."""
+    _require_token(_creds)
+
+    # Vérifier la photo source
+    src_rows = _run_query(
+        "SELECT * FROM equipment_media WHERE media_id = ? AND equipment_id = ?",
+        [body.photo_id, body.source_entity_id],
+    )
+    if not src_rows:
+        raise HTTPException(status_code=404, detail=f"Photo {body.photo_id} introuvable sur {body.source_entity_id}.")
+
+    src = dict(src_rows[0])
+    final_file_id = src.get("final_drive_file_id")
+    new_file_id = final_file_id
+
+    # Copie Drive si demandée
+    if body.mode == "copy" and _DRIVE_AVAILABLE and final_file_id:
+        new_file_id = _drive_copy_file(final_file_id, None)  # copie sans déplacement de dossier
+
+    try:
+        if body.target_entity_type == "equipment":
+            # Créer / mettre à jour dans equipment_media
+            new_media_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO equipment_media (media_id, equipment_id, final_drive_file_id, image_role, image_index)
+                   VALUES (?, ?, ?, ?, 0)""",
+                [new_media_id, body.target_entity_id, new_file_id or final_file_id,
+                 src.get("image_role", "overview")],
+            )
+        elif body.target_entity_type in ("accessory", "consumable"):
+            table = "accessories" if body.target_entity_type == "accessory" else "consumables"
+            id_col = "accessory_id" if body.target_entity_type == "accessory" else "consumable_id"
+            _run_write(
+                f"UPDATE {table} SET drive_file_id = ?, updated_at = ? WHERE {id_col} = ?",
+                [new_file_id or final_file_id, datetime.utcnow().isoformat(), body.target_entity_id],
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Type d'entité cible inconnu : {body.target_entity_type}")
+
+        # Supprimer la source si mode=move
+        if body.mode == "move":
+            _run_write("DELETE FROM equipment_media WHERE media_id = ?", [body.photo_id])
+
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return MediaReassignResponse(
+        ok=True,
+        photo_id=body.photo_id,
+        new_file_id=new_file_id,
+        message=f"Photo {body.mode}ée vers {body.target_entity_type}/{body.target_entity_id}.",
+    )
+
+
+# ─── v4.1 : Migration orchestrée ─────────────────────────────
+
+@app.post("/api/admin/migrations/reclassify", tags=["v4.1 Migration"], summary="Reclassifier / scinder un équipement")
+def reclassify_equipment(
+    body: ReclassifyRequest,
+    dry_run: bool = False,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """
+    Opération de migration atomique. Avec ?dry_run=true retourne un plan sans modifier la base.
+    Actions supportées :
+      - split_record : conserve l'équipement et crée accessoires/consommables associés
+      - reclassify_as_accessory : transforme l'équipement en accessoire
+      - reclassify_as_consumable : transforme l'équipement en consommable
+    """
+    _require_token(_creds)
+
+    # Vérifier la source
+    src_rows = _run_query("SELECT * FROM equipment WHERE equipment_id = ?", [body.source_equipment_id])
+    if not src_rows:
+        raise HTTPException(status_code=404, detail=f"Équipement source {body.source_equipment_id} introuvable.")
+    src = dict(src_rows[0])
+
+    plan = ReclassifyPlan(
+        source_equipment_id=body.source_equipment_id,
+        action=body.action,
+        equipment_updates=body.target_equipment.model_dump(exclude_none=True) if body.target_equipment else {},
+        accessories_to_create=len(body.new_accessories),
+        consumables_to_create=len(body.new_consumables),
+        links_to_create=len(body.link_existing_accessories) + len(body.link_existing_consumables),
+        photos_to_process=len(body.photo_mapping),
+        source_will_be_archived=body.source_record_policy == "archive",
+    )
+
+    if dry_run:
+        return ReclassifyResult(
+            ok=True,
+            dry_run=True,
+            plan=plan,
+            message="Plan de migration calculé (dry_run=true — aucune modification effectuée).",
+        )
+
+    log_id = str(uuid.uuid4())
+    created_accessory_ids: List[str] = []
+    created_consumable_ids: List[str] = []
+    links_created = 0
+    now = datetime.utcnow().isoformat()
+
+    try:
+        # 1. Mettre à jour l'équipement source si target_equipment fourni
+        if body.target_equipment:
+            updates = body.target_equipment.model_dump(exclude_none=True)
+            if "ai_metadata" in updates and isinstance(updates["ai_metadata"], dict):
+                updates["ai_metadata"] = json.dumps(updates["ai_metadata"], ensure_ascii=False)
+            updates["updated_at"] = now
+            updates["migration_status"] = "MIGRATED"
+            updates["migrated_at"] = now
+            updates["migrated_by"] = body.operator
+            set_clause = ", ".join(f"{k} = ?" for k in updates)
+            _run_write(
+                f"UPDATE equipment SET {set_clause} WHERE equipment_id = ?",
+                list(updates.values()) + [body.source_equipment_id],
+            )
+
+        # 2. Créer les nouveaux accessoires
+        for acc in body.new_accessories:
+            acc_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO accessories (accessory_id, label, brand, model, category, stock_qty, notes,
+                   drive_file_id, created_at, updated_at, migration_status, legacy_source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
+                [acc_id, acc.label, acc.brand, acc.model, acc.category,
+                 acc.stock_qty, acc.notes, acc.drive_file_id, now, now, body.source_equipment_id],
+            )
+            created_accessory_ids.append(acc_id)
+            # Lier automatiquement à l'équipement source si split_record
+            if body.action == "split_record":
+                link_id = str(uuid.uuid4())
+                _run_write(
+                    "INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    [link_id, body.source_equipment_id, acc_id, now],
+                )
+                links_created += 1
+
+        # 3. Créer les nouveaux consommables
+        for con in body.new_consumables:
+            con_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO consumables (consumable_id, label, brand, reference, category, unit,
+                   stock_qty, stock_min_alert, notes, drive_file_id, created_at, updated_at,
+                   migration_status, legacy_source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
+                [con_id, con.label, con.brand, con.reference, con.category, con.unit,
+                 con.stock_qty, con.stock_min_alert, con.notes, con.drive_file_id,
+                 now, now, body.source_equipment_id],
+            )
+            created_consumable_ids.append(con_id)
+            if body.action == "split_record":
+                link_id = str(uuid.uuid4())
+                _run_write(
+                    "INSERT INTO links_consumables (link_id, equipment_id, consumable_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    [link_id, body.source_equipment_id, con_id, now],
+                )
+                links_created += 1
+
+        # 4. Liens vers accessoires/consommables existants
+        for lt in body.link_existing_accessories:
+            link_id = str(uuid.uuid4())
+            _run_write(
+                "INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, note, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                [link_id, body.source_equipment_id, lt.accessory_id, lt.note, now],
+            )
+            links_created += 1
+
+        for lt in body.link_existing_consumables:
+            link_id = str(uuid.uuid4())
+            _run_write(
+                "INSERT INTO links_consumables (link_id, equipment_id, consumable_id, qty_per_use, note, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                [link_id, body.source_equipment_id, lt.consumable_id, lt.qty_per_use, lt.note, now],
+            )
+            links_created += 1
+
+        # 5. Archiver la source si demandé
+        source_archived = False
+        if body.source_record_policy == "archive":
+            _run_write(
+                "UPDATE equipment SET archived = TRUE, migration_status = 'ARCHIVED', updated_at = ? WHERE equipment_id = ?",
+                [now, body.source_equipment_id],
+            )
+            source_archived = True
+
+        # 6. Enregistrer dans legacy_mappings
+        mapping_id = str(uuid.uuid4())
+        _run_write(
+            """INSERT INTO legacy_mappings
+               (mapping_id, legacy_equipment_id, canonical_equipment_id, derived_accessory_ids,
+                derived_consumable_ids, notes, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (legacy_equipment_id) DO NOTHING""",
+            [
+                mapping_id,
+                body.source_equipment_id,
+                body.source_equipment_id if body.action == "split_record" else None,
+                json.dumps(created_accessory_ids),
+                json.dumps(created_consumable_ids),
+                body.notes,
+                now,
+            ],
+        )
+
+        # 7. Journal d'audit
+        _run_write(
+            """INSERT INTO migration_logs
+               (log_id, operation, operator, source_entity_type, source_entity_id,
+                target_entities, details, dry_run, status, created_at)
+               VALUES (?, ?, ?, 'equipment', ?, ?, ?, FALSE, 'COMPLETED', ?)""",
+            [
+                log_id,
+                body.action,
+                body.operator,
+                body.source_equipment_id,
+                json.dumps({
+                    "accessory_ids": created_accessory_ids,
+                    "consumable_ids": created_consumable_ids,
+                    "links_created": links_created,
+                }),
+                json.dumps({"source_archived": source_archived, "notes": body.notes}),
+                now,
+            ],
+        )
+
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return ReclassifyResult(
+        ok=True,
+        dry_run=False,
+        log_id=log_id,
+        plan=plan,
+        created_accessory_ids=created_accessory_ids,
+        created_consumable_ids=created_consumable_ids,
+        links_created=links_created,
+        source_archived=source_archived,
+        legacy_mapping_id=mapping_id,
+        message=f"Migration '{body.action}' effectuée avec succès.",
+    )
+
+
+@app.get("/api/admin/migrations/logs", tags=["v4.1 Migration"], summary="Journal d'audit des migrations")
+def get_migration_logs(
+    operator: Optional[str] = None,
+    operation: Optional[str] = None,
+    source_entity_id: Optional[str] = None,
+    limit: int = 100,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    conditions = []
+    params: List[Any] = []
+    if operator:
+        conditions.append("operator = ?")
+        params.append(operator)
+    if operation:
+        conditions.append("operation = ?")
+        params.append(operation)
+    if source_entity_id:
+        conditions.append("source_entity_id = ?")
+        params.append(source_entity_id)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    rows = _run_query(
+        f"SELECT * FROM migration_logs {where} ORDER BY created_at DESC LIMIT ?",
+        params + [limit],
+    )
+    logs = []
+    for r in rows:
+        entry = dict(r)
+        try:
+            entry["target_entities"] = json.loads(entry["target_entities"]) if entry.get("target_entities") else None
+        except Exception:
+            pass
+        try:
+            entry["details"] = json.loads(entry["details"]) if entry.get("details") else None
+        except Exception:
+            pass
+        logs.append(MigrationLogEntry(
+            log_id=entry["log_id"],
+            operation=entry["operation"],
+            operator=entry["operator"],
+            source_entity_type=entry.get("source_entity_type"),
+            source_entity_id=entry.get("source_entity_id"),
+            target_entities=entry.get("target_entities"),
+            details=entry.get("details"),
+            dry_run=bool(entry.get("dry_run", False)),
+            status=entry.get("status", "COMPLETED"),
+            error_message=entry.get("error_message"),
+            created_at=str(entry["created_at"]) if entry.get("created_at") else None,
+        ))
+    return MigrationLogsResponse(count=len(logs), logs=logs)
+
+
+@app.get(
+    "/api/admin/migrations/legacy-mappings/{equipment_id}",
+    tags=["v4.1 Migration"],
+    summary="Traçabilité legacy → canonical pour un équipement",
+)
+def get_legacy_mapping(
+    equipment_id: str,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    _require_token(_creds)
+    rows = _run_query(
+        "SELECT * FROM legacy_mappings WHERE legacy_equipment_id = ?",
+        [equipment_id],
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Aucun mapping legacy pour {equipment_id}.")
+    row = dict(rows[0])
+    derived_acc = json.loads(row["derived_accessory_ids"]) if row.get("derived_accessory_ids") else []
+    derived_con = json.loads(row["derived_consumable_ids"]) if row.get("derived_consumable_ids") else []
+    return LegacyMappingResponse(
+        mapping_id=row["mapping_id"],
+        legacy_equipment_id=row["legacy_equipment_id"],
+        canonical_equipment_id=row.get("canonical_equipment_id"),
+        derived_accessory_ids=derived_acc,
+        derived_consumable_ids=derived_con,
+        notes=row.get("notes"),
+        created_at=str(row["created_at"]) if row.get("created_at") else None,
+    )
+
+
+# ─── v4.1 : Admin export & doublons ──────────────────────────
+
+@app.get("/api/admin/export", tags=["v4.1 Admin"], summary="Export bulk de tout l'inventaire")
+def admin_export(
+    include_archived: bool = False,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Exporte l'intégralité de l'inventaire (équipements, accessoires, consommables, liens)."""
+    _require_token(_creds)
+    arch_filter = "" if include_archived else "WHERE (archived IS NULL OR archived = FALSE)"
+
+    equipment = [dict(r) for r in _run_query(f"SELECT * FROM equipment {arch_filter} ORDER BY label")]
+    accessories = [dict(r) for r in _run_query(f"SELECT * FROM accessories {arch_filter} ORDER BY label")]
+    consumables = [dict(r) for r in _run_query(f"SELECT * FROM consumables {arch_filter} ORDER BY label")]
+    links_compat = [dict(r) for r in _run_query("SELECT * FROM links_compatibility ORDER BY created_at")]
+    links_cons = [dict(r) for r in _run_query("SELECT * FROM links_consumables ORDER BY created_at")]
+
+    # Convertir les timestamps en strings pour la sérialisation JSON
+    def _serialize(rows: List[dict]) -> List[dict]:
+        result = []
+        for row in rows:
+            serialized = {}
+            for k, v in row.items():
+                serialized[k] = str(v) if hasattr(v, 'isoformat') else v
+            result.append(serialized)
+        return result
+
+    return {
+        "exported_at": datetime.utcnow().isoformat(),
+        "include_archived": include_archived,
+        "counts": {
+            "equipment": len(equipment),
+            "accessories": len(accessories),
+            "consumables": len(consumables),
+            "links_compatibility": len(links_compat),
+            "links_consumables": len(links_cons),
+        },
+        "equipment": _serialize(equipment),
+        "accessories": _serialize(accessories),
+        "consumables": _serialize(consumables),
+        "links_compatibility": _serialize(links_compat),
+        "links_consumables": _serialize(links_cons),
+    }
+
+
+@app.get("/api/admin/duplicates", tags=["v4.1 Admin"], summary="Détection de doublons potentiels")
+def admin_duplicates(
+    threshold: float = 0.85,
+    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+):
+    """Détecte les doublons potentiels en comparant label+brand+model par type d'entité."""
+    _require_token(_creds)
+
+    def _detect_duplicates(rows: List[dict], entity_type: str, id_col: str) -> List[DuplicateGroup]:
+        groups: List[DuplicateGroup] = []
+        items = [(r[id_col], f"{r.get('label', '')} {r.get('brand', '')} {r.get('model', '')}".lower().strip()) for r in rows]
+        seen: set = set()
+        for i in range(len(items)):
+            if items[i][0] in seen:
+                continue
+            cluster_ids = [items[i][0]]
+            cluster_labels = [rows[i].get("label", "")]
+            max_score = 0.0
+            for j in range(i + 1, len(items)):
+                if items[j][0] in seen:
+                    continue
+                score = SequenceMatcher(None, items[i][1], items[j][1]).ratio()
+                if score >= threshold:
+                    cluster_ids.append(items[j][0])
+                    cluster_labels.append(rows[j].get("label", ""))
+                    seen.add(items[j][0])
+                    max_score = max(max_score, score)
+            if len(cluster_ids) > 1:
+                seen.add(items[i][0])
+                groups.append(DuplicateGroup(
+                    entity_type=entity_type,
+                    ids=cluster_ids,
+                    labels=cluster_labels,
+                    similarity_score=round(max_score, 3),
+                    reason="label/brand/model similaires",
+                ))
+        return groups
+
+    eq_rows = [dict(r) for r in _run_query(
+        "SELECT equipment_id, label, brand, model FROM equipment WHERE (archived IS NULL OR archived = FALSE)"
+    )]
+    acc_rows = [dict(r) for r in _run_query(
+        "SELECT accessory_id, label, brand, model FROM accessories WHERE (archived IS NULL OR archived = FALSE)"
+    )]
+    con_rows = [dict(r) for r in _run_query(
+        "SELECT consumable_id, label, brand FROM consumables WHERE (archived IS NULL OR archived = FALSE)"
+    )]
+
+    groups: List[DuplicateGroup] = []
+    groups.extend(_detect_duplicates(eq_rows, "equipment", "equipment_id"))
+    groups.extend(_detect_duplicates(acc_rows, "accessory", "accessory_id"))
+    groups.extend(_detect_duplicates(con_rows, "consumable", "consumable_id"))
+
+    return DuplicatesResponse(count=len(groups), groups=groups)
 
 
 # ─── Health check (sans auth) ─────────────────────────────────
