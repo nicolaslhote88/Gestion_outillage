@@ -510,6 +510,48 @@ def init_db_tables() -> None:
     """)
 
     run_write("""
+        CREATE TABLE IF NOT EXISTS accessory_media (
+            media_id            VARCHAR PRIMARY KEY,
+            accessory_id        VARCHAR NOT NULL,
+            final_drive_file_id VARCHAR,
+            image_role          VARCHAR DEFAULT 'overview',
+            image_index         INTEGER DEFAULT 0,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS consumable_media (
+            media_id            VARCHAR PRIMARY KEY,
+            consumable_id       VARCHAR NOT NULL,
+            final_drive_file_id VARCHAR,
+            image_role          VARCHAR DEFAULT 'overview',
+            image_index         INTEGER DEFAULT 0,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ── Migration : drive_file_id existant → *_media ───────────
+    # Insère uniquement les fiches qui n'ont pas encore de ligne dans la table media.
+    run_write("""
+        INSERT INTO accessory_media (media_id, accessory_id, final_drive_file_id, image_role, image_index)
+        SELECT gen_random_uuid()::VARCHAR, accessory_id, drive_file_id, 'overview', 0
+        FROM accessories
+        WHERE drive_file_id IS NOT NULL
+          AND drive_file_id NOT IN ('', 'None', 'nan')
+          AND accessory_id NOT IN (SELECT accessory_id FROM accessory_media)
+    """)
+
+    run_write("""
+        INSERT INTO consumable_media (media_id, consumable_id, final_drive_file_id, image_role, image_index)
+        SELECT gen_random_uuid()::VARCHAR, consumable_id, drive_file_id, 'overview', 0
+        FROM consumables
+        WHERE drive_file_id IS NOT NULL
+          AND drive_file_id NOT IN ('', 'None', 'nan')
+          AND consumable_id NOT IN (SELECT consumable_id FROM consumable_media)
+    """)
+
+    run_write("""
         CREATE TABLE IF NOT EXISTS links_compatibility (
             link_id      VARCHAR PRIMARY KEY,
             equipment_id VARCHAR NOT NULL,
@@ -2231,16 +2273,61 @@ def show_accessory_modal(accessory_id: str):
     st.markdown("---")
     left_col, right_col = st.columns([1, 1])
 
-    # ── Photo ─────────────────────────────────────────────────
+    # ── Galerie multi-photos ───────────────────────────────────
     with left_col:
-        fid = null_str(row.get("drive_file_id"), "")
-        if fid and fid != "—":
-            try:
-                st.image(get_drive_thumb(fid, max_px=800, quality=80), use_container_width=True)
-                if st.button("🔍 Agrandir", key=f"zoom_acc_{accessory_id}"):
-                    st.session_state[f"acc_zoom_{accessory_id}"] = True
-            except Exception:
-                st.warning(f"⚠️ Image inaccessible (Drive ID : `{fid}`)")
+        media_df = run_query("""
+            SELECT media_id, final_drive_file_id, image_role, image_index
+            FROM accessory_media
+            WHERE accessory_id = ?
+            ORDER BY CASE image_role WHEN 'overview' THEN 1 ELSE 2 END, image_index
+        """, [accessory_id])
+
+        zoom_key = f"acc_zoom_{accessory_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
+
+        if not media_df.empty:
+            if zoomed_fid:
+                try:
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
+                except Exception:
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                if st.button("✖ Fermer l'agrandissement",
+                             key=f"acc_zoom_close_{accessory_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"acc_zoom_main_{accessory_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
+
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=400, quality=75),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"acc_zoom_{accessory_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ (`{fid2}`)")
         else:
             st.markdown(
                 '<div style="background:#1e293b;border-radius:8px;height:160px;'
@@ -2249,6 +2336,44 @@ def show_accessory_modal(accessory_id: str):
                 unsafe_allow_html=True,
             )
             st.caption("Aucune image disponible")
+
+        # ── Ajouter une photo (Drive file ID) ─────────────────
+        with st.expander("➕ Ajouter une photo"):
+            new_fid = st.text_input("Google Drive file ID", key=f"acc_new_fid_{accessory_id}",
+                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                    key=f"acc_new_role_{accessory_id}")
+            if st.button("💾 Ajouter", key=f"acc_add_photo_{accessory_id}"):
+                nfid = new_fid.strip() if new_fid else ""
+                if not nfid:
+                    st.error("Entrez un Drive file ID.")
+                else:
+                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                    ok = run_write("""
+                        INSERT INTO accessory_media
+                            (media_id, accessory_id, final_drive_file_id, image_role, image_index)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [str(uuid.uuid4()), accessory_id, nfid, new_role, next_idx])
+                    if ok:
+                        st.success("Photo ajoutée.")
+                        st.rerun()
+
+        # ── Supprimer une photo ────────────────────────────────
+        if not media_df.empty:
+            with st.expander("🗑 Supprimer une photo"):
+                del_options = {
+                    f"Photo {i+1} ({null_str(r.get('image_role'))}) — {r.get('final_drive_file_id','')[:20]}…":
+                        r.get("media_id")
+                    for i, (_, r) in enumerate(media_df.iterrows())
+                }
+                del_label = st.selectbox("Choisir la photo à supprimer",
+                                         list(del_options.keys()),
+                                         key=f"acc_del_sel_{accessory_id}")
+                if st.button("🗑 Supprimer", key=f"acc_del_photo_{accessory_id}",
+                             type="primary"):
+                    run_write("DELETE FROM accessory_media WHERE media_id = ?",
+                              [del_options[del_label]])
+                    st.rerun()
 
     # ── Identification ────────────────────────────────────────
     with right_col:
@@ -2339,14 +2464,61 @@ def show_consumable_modal(consumable_id: str):
     st.markdown("---")
     left_col, right_col = st.columns([1, 1])
 
-    # ── Photo ─────────────────────────────────────────────────
+    # ── Galerie multi-photos ───────────────────────────────────
     with left_col:
-        fid = null_str(row.get("drive_file_id"), "")
-        if fid and fid != "—":
-            try:
-                st.image(get_drive_thumb(fid, max_px=800, quality=80), use_container_width=True)
-            except Exception:
-                st.warning(f"⚠️ Image inaccessible (Drive ID : `{fid}`)")
+        media_df = run_query("""
+            SELECT media_id, final_drive_file_id, image_role, image_index
+            FROM consumable_media
+            WHERE consumable_id = ?
+            ORDER BY CASE image_role WHEN 'overview' THEN 1 ELSE 2 END, image_index
+        """, [consumable_id])
+
+        zoom_key = f"con_zoom_{consumable_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
+
+        if not media_df.empty:
+            if zoomed_fid:
+                try:
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
+                except Exception:
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                if st.button("✖ Fermer l'agrandissement",
+                             key=f"con_zoom_close_{consumable_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"con_zoom_main_{consumable_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
+
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=400, quality=75),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"con_zoom_{consumable_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ (`{fid2}`)")
         else:
             st.markdown(
                 '<div style="background:#1e293b;border-radius:8px;height:160px;'
@@ -2355,6 +2527,44 @@ def show_consumable_modal(consumable_id: str):
                 unsafe_allow_html=True,
             )
             st.caption("Aucune image disponible")
+
+        # ── Ajouter une photo (Drive file ID) ─────────────────
+        with st.expander("➕ Ajouter une photo"):
+            new_fid = st.text_input("Google Drive file ID", key=f"con_new_fid_{consumable_id}",
+                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                    key=f"con_new_role_{consumable_id}")
+            if st.button("💾 Ajouter", key=f"con_add_photo_{consumable_id}"):
+                nfid = new_fid.strip() if new_fid else ""
+                if not nfid:
+                    st.error("Entrez un Drive file ID.")
+                else:
+                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                    ok = run_write("""
+                        INSERT INTO consumable_media
+                            (media_id, consumable_id, final_drive_file_id, image_role, image_index)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [str(uuid.uuid4()), consumable_id, nfid, new_role, next_idx])
+                    if ok:
+                        st.success("Photo ajoutée.")
+                        st.rerun()
+
+        # ── Supprimer une photo ────────────────────────────────
+        if not media_df.empty:
+            with st.expander("🗑 Supprimer une photo"):
+                del_options = {
+                    f"Photo {i+1} ({null_str(r.get('image_role'))}) — {r.get('final_drive_file_id','')[:20]}…":
+                        r.get("media_id")
+                    for i, (_, r) in enumerate(media_df.iterrows())
+                }
+                del_label = st.selectbox("Choisir la photo à supprimer",
+                                         list(del_options.keys()),
+                                         key=f"con_del_sel_{consumable_id}")
+                if st.button("🗑 Supprimer", key=f"con_del_photo_{consumable_id}",
+                             type="primary"):
+                    run_write("DELETE FROM consumable_media WHERE media_id = ?",
+                              [del_options[del_label]])
+                    st.rerun()
 
     # ── Identification & Stock ────────────────────────────────
     with right_col:
