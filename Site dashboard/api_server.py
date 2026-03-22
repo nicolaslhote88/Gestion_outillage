@@ -140,9 +140,24 @@ def _run_query(sql: str, params=None) -> pd.DataFrame:
 
 
 def _rows(sql: str, params=None) -> List[dict]:
-    """Variante de _run_query qui retourne une liste de dict — compatible avec les patterns v4.1."""
+    """Retourne une liste de dicts Python natifs (pas de numpy/pandas types, NULL → None)."""
     df = _run_query(sql, params)
-    return df.to_dict(orient="records")
+    if df.empty:
+        return []
+    # Remplace pandas NA/NaN/NaT par None avant conversion
+    df = df.where(df.notna(), other=None)
+    records = df.to_dict(orient="records")
+
+    def _native(v: Any) -> Any:
+        if v is None:
+            return None
+        if hasattr(v, "item"):          # numpy scalar (int64, float64, bool_, …)
+            return v.item()
+        if hasattr(v, "isoformat"):     # pandas Timestamp, datetime
+            return v.isoformat()
+        return v
+
+    return [{k: _native(val) for k, val in row.items()} for row in records]
 
 
 def _run_write(sql: str, params=None, _retries: int = 5) -> None:
@@ -4074,16 +4089,6 @@ def admin_export(
     links_compat = _rows("SELECT * FROM links_compatibility ORDER BY created_at")
     links_cons = _rows("SELECT * FROM links_consumables ORDER BY created_at")
 
-    # Convertir les timestamps en strings pour la sérialisation JSON
-    def _serialize(rows: List[dict]) -> List[dict]:
-        result = []
-        for row in rows:
-            serialized = {}
-            for k, v in row.items():
-                serialized[k] = str(v) if hasattr(v, 'isoformat') else v
-            result.append(serialized)
-        return result
-
     return {
         "exported_at": datetime.utcnow().isoformat(),
         "include_archived": include_archived,
@@ -4094,11 +4099,11 @@ def admin_export(
             "links_compatibility": len(links_compat),
             "links_consumables": len(links_cons),
         },
-        "equipment": _serialize(equipment),
-        "accessories": _serialize(accessories),
-        "consumables": _serialize(consumables),
-        "links_compatibility": _serialize(links_compat),
-        "links_consumables": _serialize(links_cons),
+        "equipment": equipment,
+        "accessories": accessories,
+        "consumables": consumables,
+        "links_compatibility": links_compat,
+        "links_consumables": links_cons,
     }
 
 
