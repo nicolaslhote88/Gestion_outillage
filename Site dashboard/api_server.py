@@ -3276,6 +3276,7 @@ def list_equipment(
         total=total,
         page=page,
         page_size=page_size,
+        has_more=(offset + page_size) < total,
         items=[EquipmentSummary(**_coerce_equipment_summary(i)) for i in items],
     )
 
