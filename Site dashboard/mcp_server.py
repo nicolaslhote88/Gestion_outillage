@@ -116,12 +116,13 @@ def _df_to_json(df: pd.DataFrame) -> str:
 mcp = FastMCP(
     name="SIGA",
     instructions=(
-        "Tu interagis avec le système SIGA de gestion d'outillage industriel. "
+        "Tu interagis avec le système SIGA v4.0 de gestion d'outillage industriel. "
         "Tu peux : rechercher des équipements, consulter leur disponibilité, "
         "enregistrer des sorties et retours (individuels ou groupés), "
         "préparer des chantiers via les kits/paniers, "
         "piloter l'affichage de l'écran kiosque atelier, "
-        "et gérer les réservations de matériel.\n\n"
+        "gérer les réservations de matériel, "
+        "et gérer les liaisons relationnelles (accessoires/consommables).\n\n"
         "Types de mouvement valides : LOAN (prêt), RENTAL (location), MAINTENANCE.\n"
         "Les dates doivent être au format YYYY-MM-DD ou YYYY-MM-DDTHH:MM.\n\n"
         "Workflow réservation : quand un utilisateur demande de réserver un outil :\n"
@@ -129,7 +130,16 @@ mcp = FastMCP(
         "2. Normaliser les dates (ex: 'mardi prochain' -> date ISO).\n"
         "3. Vérifier les conflits via check_reservation_conflicts.\n"
         "4. Si pas de conflit : appeler create_reservation et confirmer.\n"
-        "5. Si conflit : expliquer précisément le problème à l'utilisateur."
+        "5. Si conflit : expliquer précisément le problème à l'utilisateur.\n\n"
+        "Workflow ingestion v4.0 : quand un nouvel équipement est ajouté :\n"
+        "1. Appeler suggest_links_for_equipment(equipment_id) immédiatement.\n"
+        "2. Proposer à l'opérateur de lier les accessoires/consommables suggérés.\n"
+        "3. Si accepté, appeler link_accessory_to_equipment ou link_consumable_to_equipment.\n\n"
+        "Workflow préparation chantier :\n"
+        "1. Identifier les équipements nécessaires via search_equipment.\n"
+        "2. Appeler prepare_chantier_checklist(equipment_ids=[...]).\n"
+        "3. Annoncer les alertes (ruptures de stock, consommables manquants).\n"
+        "4. Proposer de créer un kit si l'ensemble est récurrent."
     ),
 )
 
@@ -1247,6 +1257,420 @@ def cancel_reservation(res_id: str) -> str:
 
     _run_write("UPDATE reservations SET status = 'CANCELLED' WHERE res_id = ?", [res_id])
     return json.dumps({"ok": True, "res_id": res_id, "message": "Réservation annulée avec succès."}, ensure_ascii=False)
+
+
+# ════════════════════════════════════════════════════════════
+# OUTILS v4.0 — BASE RELATIONNELLE (Famille équipement)
+# ════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def get_equipment_family(equipment_id: str) -> str:
+    """
+    Retourne l'écosystème complet d'un équipement : accessoires compatibles
+    et consommables nécessaires, avec l'état du stock pour chaque élément.
+
+    Utilise pour répondre à des questions comme :
+    - "Qu'est-ce qu'il me faut pour utiliser ce perforateur ?"
+    - "La ponceuse a-t-elle tous ses consommables en stock ?"
+
+    Args:
+        equipment_id: Identifiant unique de l'équipement.
+
+    Returns:
+        JSON avec la liste des accessoires et consommables liés,
+        incluant stock_ok (bool) pour chaque consommable.
+    """
+    eq_df = _run_query(
+        "SELECT equipment_id, label FROM equipment WHERE equipment_id = ? LIMIT 1",
+        [equipment_id],
+    )
+    if eq_df.empty:
+        return json.dumps({"error": "equipment_not_found", "equipment_id": equipment_id})
+
+    label = str(eq_df.iloc[0]["label"] or "")
+
+    acc_df = _run_query(
+        """
+        SELECT a.accessory_id, a.label, a.brand, a.model, a.category,
+               a.stock_qty, a.location_hint, lc.link_id, lc.note
+        FROM links_compatibility lc
+        JOIN accessories a ON a.accessory_id = lc.accessory_id
+        WHERE lc.equipment_id = ?
+        ORDER BY a.label
+        """,
+        [equipment_id],
+    )
+
+    con_df = _run_query(
+        """
+        SELECT c.consumable_id, c.label, c.brand, c.reference, c.category,
+               c.unit, c.stock_qty, c.stock_min_alert, c.location_hint,
+               lcons.link_id, lcons.qty_per_use, lcons.note
+        FROM links_consumables lcons
+        JOIN consumables c ON c.consumable_id = lcons.consumable_id
+        WHERE lcons.equipment_id = ?
+        ORDER BY c.label
+        """,
+        [equipment_id],
+    )
+
+    accessories = []
+    for _, row in acc_df.iterrows():
+        accessories.append({
+            "accessory_id":  str(row["accessory_id"]),
+            "label":         str(row["label"] or ""),
+            "brand":         str(row["brand"]) if pd.notna(row.get("brand")) else None,
+            "model":         str(row["model"]) if pd.notna(row.get("model")) else None,
+            "stock_qty":     int(row.get("stock_qty") or 0),
+            "location_hint": str(row["location_hint"]) if pd.notna(row.get("location_hint")) else None,
+            "note":          str(row["note"]) if pd.notna(row.get("note")) else None,
+        })
+
+    consumables = []
+    for _, row in con_df.iterrows():
+        stk   = float(row.get("stock_qty") or 0)
+        alert = float(row.get("stock_min_alert") or 0)
+        consumables.append({
+            "consumable_id":   str(row["consumable_id"]),
+            "label":           str(row["label"] or ""),
+            "brand":           str(row["brand"]) if pd.notna(row.get("brand")) else None,
+            "reference":       str(row["reference"]) if pd.notna(row.get("reference")) else None,
+            "unit":            str(row.get("unit") or "pcs"),
+            "stock_qty":       stk,
+            "stock_min_alert": alert,
+            "qty_per_use":     float(row.get("qty_per_use") or 1),
+            "stock_ok":        stk > alert,
+            "location_hint":   str(row["location_hint"]) if pd.notna(row.get("location_hint")) else None,
+            "note":            str(row["note"]) if pd.notna(row.get("note")) else None,
+        })
+
+    return json.dumps({
+        "equipment_id": equipment_id,
+        "label":        label,
+        "accessories":  accessories,
+        "consumables":  consumables,
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def suggest_links_for_equipment(equipment_id: str) -> str:
+    """
+    Intelligence d'ingestion : suggère des liaisons accessoires/consommables
+    pour un équipement nouvellement ajouté, basées sur ce qui est déjà en stock.
+
+    Utiliser immédiatement après l'ajout d'un nouvel équipement pour proposer
+    à l'opérateur de créer des liaisons pertinentes.
+
+    Exemple de réponse : "J'ai ajouté ce perforateur. Il y a des forets SDS-Plus
+    en stock — voulez-vous les lier à cet équipement ?"
+
+    Args:
+        equipment_id: Identifiant de l'équipement nouvellement ajouté.
+
+    Returns:
+        JSON avec les suggestions d'accessoires et consommables potentiellement
+        compatibles, basées sur la catégorie et le sous-type de l'équipement.
+    """
+    eq_df = _run_query(
+        "SELECT equipment_id, label, subtype, category FROM equipment WHERE equipment_id = ? LIMIT 1",
+        [equipment_id],
+    )
+    if eq_df.empty:
+        return json.dumps({"error": "equipment_not_found", "equipment_id": equipment_id})
+
+    row    = eq_df.iloc[0]
+    label  = str(row["label"] or "")
+    subtype = str(row.get("subtype") or "").lower()
+    category = str(row.get("category") or "").lower()
+
+    # Accessoires déjà liés (à exclure)
+    linked_acc_df = _run_query(
+        "SELECT accessory_id FROM links_compatibility WHERE equipment_id = ?",
+        [equipment_id],
+    )
+    linked_acc_ids = set(linked_acc_df["accessory_id"].tolist()) if not linked_acc_df.empty else set()
+
+    # Consommables déjà liés (à exclure)
+    linked_con_df = _run_query(
+        "SELECT consumable_id FROM links_consumables WHERE equipment_id = ?",
+        [equipment_id],
+    )
+    linked_con_ids = set(linked_con_df["consumable_id"].tolist()) if not linked_con_df.empty else set()
+
+    # Tous les accessoires disponibles (non encore liés)
+    all_acc_df = _run_query(
+        "SELECT accessory_id, label, brand, model, category, stock_qty FROM accessories ORDER BY label"
+    )
+    # Tous les consommables disponibles (non encore liés)
+    all_con_df = _run_query(
+        "SELECT consumable_id, label, brand, reference, category, unit, stock_qty FROM consumables ORDER BY label"
+    )
+
+    # Filtrage des suggestions (non liées)
+    suggested_acc = []
+    if not all_acc_df.empty:
+        for _, a in all_acc_df.iterrows():
+            if str(a["accessory_id"]) not in linked_acc_ids:
+                suggested_acc.append({
+                    "accessory_id": str(a["accessory_id"]),
+                    "label":        str(a["label"] or ""),
+                    "brand":        str(a["brand"]) if pd.notna(a.get("brand")) else None,
+                    "model":        str(a["model"]) if pd.notna(a.get("model")) else None,
+                    "stock_qty":    int(a.get("stock_qty") or 0),
+                })
+
+    suggested_con = []
+    if not all_con_df.empty:
+        for _, c in all_con_df.iterrows():
+            if str(c["consumable_id"]) not in linked_con_ids:
+                suggested_con.append({
+                    "consumable_id": str(c["consumable_id"]),
+                    "label":         str(c["label"] or ""),
+                    "brand":         str(c["brand"]) if pd.notna(c.get("brand")) else None,
+                    "reference":     str(c["reference"]) if pd.notna(c.get("reference")) else None,
+                    "unit":          str(c.get("unit") or "pcs"),
+                    "stock_qty":     float(c.get("stock_qty") or 0),
+                })
+
+    message = (
+        f"Équipement '{label}' (type: {subtype or category or 'inconnu'}) ajouté. "
+        f"{len(suggested_acc)} accessoire(s) et {len(suggested_con)} consommable(s) "
+        f"disponibles en stock — souhaitez-vous créer des liaisons ?"
+    )
+
+    return json.dumps({
+        "equipment_id":       equipment_id,
+        "label":              label,
+        "message":            message,
+        "suggested_accessories":  suggested_acc,
+        "suggested_consumables":  suggested_con,
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def link_accessory_to_equipment(
+    equipment_id: str,
+    accessory_id: str,
+    note: Optional[str] = None,
+) -> str:
+    """
+    Crée une liaison Many-to-Many entre un équipement et un accessoire compatible.
+
+    Exemple : une batterie 18V peut être liée à 10 outils différents sans duplication.
+    Si la liaison existe déjà, elle est ignorée silencieusement.
+
+    Args:
+        equipment_id: Identifiant de l'équipement.
+        accessory_id: Identifiant de l'accessoire.
+        note: Note optionnelle sur la compatibilité (ex: "uniquement avec adaptateur").
+
+    Returns:
+        JSON confirmant la création de la liaison.
+    """
+    eq_df = _run_query(
+        "SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1", [equipment_id]
+    )
+    if eq_df.empty:
+        return json.dumps({"ok": False, "error": f"Équipement introuvable : {equipment_id}"})
+
+    acc_df = _run_query(
+        "SELECT label FROM accessories WHERE accessory_id = ? LIMIT 1", [accessory_id]
+    )
+    if acc_df.empty:
+        return json.dumps({"ok": False, "error": f"Accessoire introuvable : {accessory_id}"})
+
+    link_id = str(uuid.uuid4())
+    _run_write(
+        """
+        INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, note)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT (equipment_id, accessory_id) DO NOTHING
+        """,
+        [link_id, equipment_id, accessory_id, note],
+    )
+
+    eq_label  = str(eq_df.iloc[0]["label"] or "")
+    acc_label = str(acc_df.iloc[0]["label"] or "")
+    return json.dumps({
+        "ok":      True,
+        "link_id": link_id,
+        "message": f"'{acc_label}' lié à '{eq_label}' comme accessoire compatible.",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def link_consumable_to_equipment(
+    equipment_id: str,
+    consumable_id: str,
+    qty_per_use: float = 1.0,
+    note: Optional[str] = None,
+) -> str:
+    """
+    Crée une liaison Many-to-Many entre un équipement et un consommable nécessaire.
+
+    Exemple : lier des forets SDS-Plus Ø10 à un perforateur Bosch GBH.
+    `qty_per_use` indique la quantité typiquement consommée par session de travail.
+
+    Args:
+        equipment_id:  Identifiant de l'équipement.
+        consumable_id: Identifiant du consommable.
+        qty_per_use:   Quantité par usage (défaut : 1).
+        note:          Note optionnelle (ex: "forets pour béton uniquement").
+
+    Returns:
+        JSON confirmant la création de la liaison.
+    """
+    eq_df = _run_query(
+        "SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1", [equipment_id]
+    )
+    if eq_df.empty:
+        return json.dumps({"ok": False, "error": f"Équipement introuvable : {equipment_id}"})
+
+    con_df = _run_query(
+        "SELECT label FROM consumables WHERE consumable_id = ? LIMIT 1", [consumable_id]
+    )
+    if con_df.empty:
+        return json.dumps({"ok": False, "error": f"Consommable introuvable : {consumable_id}"})
+
+    link_id = str(uuid.uuid4())
+    _run_write(
+        """
+        INSERT INTO links_consumables
+            (link_id, equipment_id, consumable_id, qty_per_use, note)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (equipment_id, consumable_id) DO NOTHING
+        """,
+        [link_id, equipment_id, consumable_id, qty_per_use, note],
+    )
+
+    eq_label  = str(eq_df.iloc[0]["label"] or "")
+    con_label = str(con_df.iloc[0]["label"] or "")
+    return json.dumps({
+        "ok":      True,
+        "link_id": link_id,
+        "message": f"'{con_label}' lié à '{eq_label}' (qty/usage : {qty_per_use}).",
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+def prepare_chantier_checklist(equipment_ids: list[str]) -> str:
+    """
+    Génère la checklist complète pour préparer un chantier.
+
+    Pour chaque équipement fourni, retourne :
+    - Les accessoires compatibles (batteries, adaptateurs…) avec leur stock
+    - Les consommables nécessaires (forets, abrasifs…) avec état du stock
+    - Les alertes pour les éléments manquants ou en stock insuffisant
+
+    C'est le moteur de recommandation qui alimente la "Vue Préparation Chantier".
+
+    Exemple : "Le kit SDB est prêt. Attention, la batterie 5Ah est sur le chargeur.
+    Il vous manque du papier de verre grain 120."
+
+    Args:
+        equipment_ids: Liste des equipment_id prévus pour le chantier.
+
+    Returns:
+        JSON avec la checklist structurée et les alertes.
+    """
+    if not equipment_ids:
+        return json.dumps({"ok": False, "error": "equipment_ids ne peut pas être vide."})
+
+    # Récupère les infos des équipements
+    ids_ph = ", ".join(["?"] * len(equipment_ids))
+    eq_df = _run_query(
+        f"SELECT equipment_id, label FROM equipment WHERE equipment_id IN ({ids_ph})",
+        equipment_ids,
+    )
+    found_labels = {str(r["equipment_id"]): str(r["label"] or "") for _, r in eq_df.iterrows()}
+
+    # Accessoires uniques pour l'ensemble du chantier
+    acc_df = _run_query(
+        f"""
+        SELECT DISTINCT a.accessory_id, a.label, a.brand, a.model,
+               a.stock_qty, a.location_hint
+        FROM links_compatibility lc
+        JOIN accessories a ON a.accessory_id = lc.accessory_id
+        WHERE lc.equipment_id IN ({ids_ph})
+        ORDER BY a.label
+        """,
+        equipment_ids,
+    )
+
+    # Consommables agrégés (somme des qty_per_use)
+    con_df = _run_query(
+        f"""
+        SELECT c.consumable_id, c.label, c.brand, c.reference, c.unit,
+               c.stock_qty, c.stock_min_alert, c.location_hint,
+               SUM(lcons.qty_per_use) AS qte_totale
+        FROM links_consumables lcons
+        JOIN consumables c ON c.consumable_id = lcons.consumable_id
+        WHERE lcons.equipment_id IN ({ids_ph})
+        GROUP BY c.consumable_id, c.label, c.brand, c.reference, c.unit,
+                 c.stock_qty, c.stock_min_alert, c.location_hint
+        ORDER BY c.label
+        """,
+        equipment_ids,
+    )
+
+    accessories = []
+    alerts = []
+
+    for _, row in acc_df.iterrows():
+        stk = int(row.get("stock_qty") or 0)
+        item = {
+            "accessory_id":  str(row["accessory_id"]),
+            "label":         str(row["label"] or ""),
+            "brand":         str(row["brand"]) if pd.notna(row.get("brand")) else None,
+            "stock_qty":     stk,
+            "location_hint": str(row["location_hint"]) if pd.notna(row.get("location_hint")) else None,
+            "stock_ok":      stk > 0,
+        }
+        accessories.append(item)
+        if stk == 0:
+            alerts.append(f"Accessoire '{row['label']}' : rupture de stock.")
+
+    consumables = []
+    for _, row in con_df.iterrows():
+        stk   = float(row.get("stock_qty") or 0)
+        alert = float(row.get("stock_min_alert") or 0)
+        qte   = float(row.get("qte_totale") or 1)
+        unit  = str(row.get("unit") or "pcs")
+        stock_ok = stk > alert
+        item = {
+            "consumable_id": str(row["consumable_id"]),
+            "label":         str(row["label"] or ""),
+            "brand":         str(row["brand"]) if pd.notna(row.get("brand")) else None,
+            "reference":     str(row["reference"]) if pd.notna(row.get("reference")) else None,
+            "unit":          unit,
+            "stock_qty":     stk,
+            "qte_requise":   qte,
+            "stock_min_alert": alert,
+            "stock_ok":      stock_ok,
+            "location_hint": str(row["location_hint"]) if pd.notna(row.get("location_hint")) else None,
+        }
+        consumables.append(item)
+        if not stock_ok:
+            alerts.append(f"Consommable '{row['label']}' : stock bas ({stk} {unit}, seuil {alert} {unit}).")
+        elif stk < qte:
+            alerts.append(f"Consommable '{row['label']}' : stock insuffisant pour ce chantier "
+                          f"({stk} {unit} disponible, {qte} {unit} nécessaires).")
+
+    summary = (
+        f"Chantier avec {len(equipment_ids)} outil(s). "
+        f"{len(accessories)} accessoire(s), {len(consumables)} consommable(s). "
+        + (f"{len(alerts)} alerte(s) : " + " | ".join(alerts) if alerts else "Tout est prêt !")
+    )
+
+    return json.dumps({
+        "ok":           True,
+        "equipment_ids": equipment_ids,
+        "equipment_labels": found_labels,
+        "accessories":  accessories,
+        "consumables":  consumables,
+        "alerts":       alerts,
+        "summary":      summary,
+    }, ensure_ascii=False)
 
 
 # ─── Lancement ────────────────────────────────────────────────

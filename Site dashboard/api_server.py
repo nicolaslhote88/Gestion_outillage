@@ -5,6 +5,7 @@ Interface JSON simple pour le skill OpenClaw (chat principal + WhatsApp).
 Opérations :
   GET  /api/equipment/search?q=<texte>       → recherche fuzzy avec score
   GET  /api/equipment/{id}/status            → disponibilité d'un équipement
+  GET  /api/equipment/{id}/family            → accessoires + consommables liés (v4.0)
   POST /api/display/show                     → envoie une commande au kiosque atelier
   POST /api/movements/checkout               → sortie individuelle ou groupée
   POST /api/movements/checkin                → entrée individuelle, groupée ou par batch
@@ -23,6 +24,16 @@ Opérations :
   GET  /api/reservations/conflicts           → vérifier la disponibilité d'un équipement
   GET  /api/reservations/active              → lister les réservations à venir
   DELETE /api/reservations/{res_id}          → annuler une réservation
+
+  — v4.0 Relationnel ——————————————————————————————————————————
+  GET  /api/accessories                      → catalogue accessoires
+  POST /api/accessories                      → créer un accessoire
+  GET  /api/consumables                      → catalogue consommables
+  POST /api/consumables                      → créer un consommable
+  POST /api/links/compatibility              → lier un accessoire à un équipement
+  DELETE /api/links/compatibility/{link_id}  → supprimer une liaison accessoire
+  POST /api/links/consumables                → lier un consommable à un équipement
+  DELETE /api/links/consumables/{link_id}    → supprimer une liaison consommable
 
 Auth : Bearer token statique (header Authorization: Bearer <token>)
        Défini par la variable d'environnement SIGA_API_TOKEN.
@@ -427,12 +438,102 @@ class ActiveReservationsResponse(BaseModel):
     reservations: List[ReservationItem]
 
 
+# — v4.0 Accessoires & Consommables ──────────────────────────
+
+class AccessoryCreateRequest(BaseModel):
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    stock_qty: int = 0
+    location_hint: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ConsumableCreateRequest(BaseModel):
+    label: str
+    brand: Optional[str] = None
+    reference: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    unit: str = "pcs"
+    stock_qty: float = 0
+    stock_min_alert: float = 0
+    location_hint: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class AccessoryItem(BaseModel):
+    accessory_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None
+    category: Optional[str] = None
+    stock_qty: int = 0
+    location_hint: Optional[str] = None
+    link_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+class ConsumableItem(BaseModel):
+    consumable_id: str
+    label: str
+    brand: Optional[str] = None
+    reference: Optional[str] = None
+    category: Optional[str] = None
+    unit: str = "pcs"
+    stock_qty: float = 0
+    stock_min_alert: float = 0
+    location_hint: Optional[str] = None
+    link_id: Optional[str] = None
+    qty_per_use: float = 1
+    note: Optional[str] = None
+    stock_ok: bool = True   # True si stock_qty >= stock_min_alert
+
+
+class EquipmentFamilyResponse(BaseModel):
+    equipment_id: str
+    label: str
+    accessories: List[AccessoryItem]
+    consumables: List[ConsumableItem]
+
+
+class LinkCompatibilityRequest(BaseModel):
+    equipment_id: str
+    accessory_id: str
+    note: Optional[str] = None
+
+
+class LinkConsumableRequest(BaseModel):
+    equipment_id: str
+    consumable_id: str
+    qty_per_use: float = 1
+    note: Optional[str] = None
+
+
+class LinkCreateResponse(BaseModel):
+    ok: bool
+    link_id: str
+    message: str
+
+
+class AccessoryListResponse(BaseModel):
+    count: int
+    accessories: List[AccessoryItem]
+
+
+class ConsumableListResponse(BaseModel):
+    count: int
+    consumables: List[ConsumableItem]
+
+
 # ─── App FastAPI ──────────────────────────────────────────────
 
 app = FastAPI(
     title="SIGA API",
     description="API HTTP métier pour le pilotage de SIGA par OpenClaw.",
-    version="3.0.0",
+    version="4.0.0",
     docs_url="/api/docs",
     redoc_url=None,
 )
@@ -1196,6 +1297,44 @@ def display_equipment(
     except Exception:
         next_reservation = None
 
+    # Accessoires liés (base relationnelle v4.0)
+    try:
+        acc_rel_df = _run_query(
+            """
+            SELECT a.accessory_id, a.label, a.brand, a.model,
+                   a.stock_qty, a.location_hint, lc.link_id, lc.note
+            FROM links_compatibility lc
+            JOIN accessories a ON a.accessory_id = lc.accessory_id
+            WHERE lc.equipment_id = ?
+            ORDER BY a.label
+            """,
+            [body.equipment_id],
+        )
+        accessories_rel = acc_rel_df.to_dict("records") if not acc_rel_df.empty else []
+    except Exception:
+        accessories_rel = []
+
+    # Consommables liés (base relationnelle v4.0)
+    try:
+        con_rel_df = _run_query(
+            """
+            SELECT c.consumable_id, c.label, c.brand, c.reference,
+                   c.unit, c.stock_qty, c.stock_min_alert, c.location_hint,
+                   lcons.link_id, lcons.qty_per_use, lcons.note
+            FROM links_consumables lcons
+            JOIN consumables c ON c.consumable_id = lcons.consumable_id
+            WHERE lcons.equipment_id = ?
+            ORDER BY c.label
+            """,
+            [body.equipment_id],
+        )
+        consumables_rel = [
+            {**r, "stock_ok": float(r.get("stock_qty") or 0) > float(r.get("stock_min_alert") or 0)}
+            for r in (con_rel_df.to_dict("records") if not con_rel_df.empty else [])
+        ]
+    except Exception:
+        consumables_rel = []
+
     eq_data = {
         "equipment_id":    _s(row.get("equipment_id")),
         "label":           _s(row.get("label")),
@@ -1210,9 +1349,13 @@ def display_equipment(
         "purchase_price":  purchase_price_str,
         "notes":           _s(row.get("notes")),
         "technical_specs": specs,
+        # Données ingestion (business_context_json) — rétrocompatibilité
         "accessories":     biz.get("accessories") or biz.get("accessoires") or [],
         "consumables":     biz.get("consumables") or biz.get("consommables") or [],
         "associated_items": biz.get("associated_items") or biz.get("elements_associes") or [],
+        # Liaisons relationnelles v4.0
+        "accessories_rel": accessories_rel,
+        "consumables_rel": consumables_rel,
         "media_files":     media_files,
         "loans":           loans,
         "next_reservation": next_reservation,
@@ -2035,6 +2178,439 @@ def cancel_reservation(
         raise HTTPException(status_code=503, detail=str(e))
 
     return {"ok": True, "res_id": res_id, "message": "Réservation annulée avec succès."}
+
+
+# ════════════════════════════════════════════════════════════
+# v4.0 — ACCESSOIRES & CONSOMMABLES
+# ════════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/accessories",
+    response_model=AccessoryListResponse,
+    summary="Catalogue complet des accessoires",
+    tags=["Relationnel v4"],
+)
+def list_accessories(
+    q: Optional[str] = None,
+    _: None = Security(_require_token),
+) -> AccessoryListResponse:
+    """Retourne tous les accessoires (batteries, adaptateurs, lames…), avec filtre texte optionnel."""
+    sql = "SELECT accessory_id, label, brand, model, category, stock_qty, location_hint FROM accessories"
+    params = None
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        sql += " WHERE LOWER(label) LIKE LOWER(?) OR LOWER(brand) LIKE LOWER(?) OR LOWER(model) LIKE LOWER(?)"
+        params = [like, like, like]
+    sql += " ORDER BY label"
+    try:
+        df = _run_query(sql, params)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    items = [
+        AccessoryItem(
+            accessory_id=_s(row["accessory_id"]),
+            label=_s(row["label"]),
+            brand=_s(row.get("brand")) or None,
+            model=_s(row.get("model")) or None,
+            category=_s(row.get("category")) or None,
+            stock_qty=int(row.get("stock_qty") or 0),
+            location_hint=_s(row.get("location_hint")) or None,
+        )
+        for _, row in df.iterrows()
+    ]
+    return AccessoryListResponse(count=len(items), accessories=items)
+
+
+@app.post(
+    "/api/accessories",
+    response_model=LinkCreateResponse,
+    status_code=201,
+    summary="Créer un accessoire dans le catalogue",
+    tags=["Relationnel v4"],
+    responses={503: {"model": ErrorResponse}},
+)
+def create_accessory(
+    body: AccessoryCreateRequest,
+    _: None = Security(_require_token),
+) -> LinkCreateResponse:
+    """Ajoute un accessoire (batterie, adaptateur, chargeur…) au catalogue SIGA."""
+    if not body.label or not body.label.strip():
+        raise HTTPException(status_code=400, detail="label est obligatoire.")
+    acc_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """
+            INSERT INTO accessories
+                (accessory_id, label, brand, model, category, description,
+                 stock_qty, location_hint, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [acc_id, body.label.strip(), body.brand, body.model,
+             body.category, body.description, body.stock_qty,
+             body.location_hint, body.notes],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return LinkCreateResponse(ok=True, link_id=acc_id, message=f"Accessoire '{body.label.strip()}' créé (id={acc_id}).")
+
+
+@app.get(
+    "/api/consumables",
+    response_model=ConsumableListResponse,
+    summary="Catalogue complet des consommables",
+    tags=["Relationnel v4"],
+)
+def list_consumables(
+    q: Optional[str] = None,
+    low_stock: bool = False,
+    _: None = Security(_require_token),
+) -> ConsumableListResponse:
+    """Retourne tous les consommables (forets, abrasifs, visserie…).
+    Paramètre `low_stock=true` pour n'afficher que ceux en alerte de stock."""
+    sql = """
+        SELECT consumable_id, label, brand, reference, category, unit,
+               stock_qty, stock_min_alert, location_hint
+        FROM consumables
+    """
+    conditions = []
+    params: List[Any] = []
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        conditions.append("(LOWER(label) LIKE LOWER(?) OR LOWER(brand) LIKE LOWER(?) OR LOWER(reference) LIKE LOWER(?))")
+        params += [like, like, like]
+    if low_stock:
+        conditions.append("stock_qty <= stock_min_alert")
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+    sql += " ORDER BY label"
+    try:
+        df = _run_query(sql, params or None)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    items = [
+        ConsumableItem(
+            consumable_id=_s(row["consumable_id"]),
+            label=_s(row["label"]),
+            brand=_s(row.get("brand")) or None,
+            reference=_s(row.get("reference")) or None,
+            category=_s(row.get("category")) or None,
+            unit=_s(row.get("unit")) or "pcs",
+            stock_qty=float(row.get("stock_qty") or 0),
+            stock_min_alert=float(row.get("stock_min_alert") or 0),
+            location_hint=_s(row.get("location_hint")) or None,
+            stock_ok=float(row.get("stock_qty") or 0) > float(row.get("stock_min_alert") or 0),
+        )
+        for _, row in df.iterrows()
+    ]
+    return ConsumableListResponse(count=len(items), consumables=items)
+
+
+@app.post(
+    "/api/consumables",
+    response_model=LinkCreateResponse,
+    status_code=201,
+    summary="Créer un consommable dans le catalogue",
+    tags=["Relationnel v4"],
+    responses={503: {"model": ErrorResponse}},
+)
+def create_consumable(
+    body: ConsumableCreateRequest,
+    _: None = Security(_require_token),
+) -> LinkCreateResponse:
+    """Ajoute un consommable (foret, lame de scie, abrasif…) au catalogue SIGA."""
+    if not body.label or not body.label.strip():
+        raise HTTPException(status_code=400, detail="label est obligatoire.")
+    con_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """
+            INSERT INTO consumables
+                (consumable_id, label, brand, reference, category, description,
+                 unit, stock_qty, stock_min_alert, location_hint, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [con_id, body.label.strip(), body.brand, body.reference,
+             body.category, body.description, body.unit,
+             body.stock_qty, body.stock_min_alert, body.location_hint, body.notes],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return LinkCreateResponse(ok=True, link_id=con_id, message=f"Consommable '{body.label.strip()}' créé (id={con_id}).")
+
+
+# ════════════════════════════════════════════════════════════
+# v4.0 — LIAISONS (LINKS)
+# ════════════════════════════════════════════════════════════
+
+@app.get(
+    "/api/equipment/{equipment_id}/family",
+    response_model=EquipmentFamilyResponse,
+    summary="Famille d'un équipement (accessoires + consommables liés)",
+    tags=["Relationnel v4"],
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def get_equipment_family(
+    equipment_id: str,
+    _: None = Security(_require_token),
+) -> EquipmentFamilyResponse:
+    """
+    Retourne l'écosystème complet d'un équipement :
+    - Accessoires compatibles (batteries, adaptateurs…)
+    - Consommables à prévoir (forets, abrasifs…) avec état du stock
+    """
+    try:
+        eq_df = _run_query(
+            "SELECT equipment_id, label FROM equipment WHERE equipment_id = ? LIMIT 1",
+            [equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if eq_df.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorResponse(ok=False, error="equipment_not_found", equipment_id=equipment_id).model_dump(),
+        )
+    label = _s(eq_df.iloc[0]["label"])
+
+    try:
+        acc_df = _run_query(
+            """
+            SELECT a.accessory_id, a.label, a.brand, a.model, a.category,
+                   a.stock_qty, a.location_hint,
+                   lc.link_id, lc.note
+            FROM links_compatibility lc
+            JOIN accessories a ON a.accessory_id = lc.accessory_id
+            WHERE lc.equipment_id = ?
+            ORDER BY a.label
+            """,
+            [equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    accessories = [
+        AccessoryItem(
+            accessory_id=_s(row["accessory_id"]),
+            label=_s(row["label"]),
+            brand=_s(row.get("brand")) or None,
+            model=_s(row.get("model")) or None,
+            category=_s(row.get("category")) or None,
+            stock_qty=int(row.get("stock_qty") or 0),
+            location_hint=_s(row.get("location_hint")) or None,
+            link_id=_s(row.get("link_id")) or None,
+            note=_s(row.get("note")) or None,
+        )
+        for _, row in acc_df.iterrows()
+    ]
+
+    try:
+        con_df = _run_query(
+            """
+            SELECT c.consumable_id, c.label, c.brand, c.reference, c.category,
+                   c.unit, c.stock_qty, c.stock_min_alert, c.location_hint,
+                   lcons.link_id, lcons.qty_per_use, lcons.note
+            FROM links_consumables lcons
+            JOIN consumables c ON c.consumable_id = lcons.consumable_id
+            WHERE lcons.equipment_id = ?
+            ORDER BY c.label
+            """,
+            [equipment_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    consumables = [
+        ConsumableItem(
+            consumable_id=_s(row["consumable_id"]),
+            label=_s(row["label"]),
+            brand=_s(row.get("brand")) or None,
+            reference=_s(row.get("reference")) or None,
+            category=_s(row.get("category")) or None,
+            unit=_s(row.get("unit")) or "pcs",
+            stock_qty=float(row.get("stock_qty") or 0),
+            stock_min_alert=float(row.get("stock_min_alert") or 0),
+            location_hint=_s(row.get("location_hint")) or None,
+            link_id=_s(row.get("link_id")) or None,
+            qty_per_use=float(row.get("qty_per_use") or 1),
+            note=_s(row.get("note")) or None,
+            stock_ok=float(row.get("stock_qty") or 0) > float(row.get("stock_min_alert") or 0),
+        )
+        for _, row in con_df.iterrows()
+    ]
+
+    return EquipmentFamilyResponse(
+        equipment_id=equipment_id,
+        label=label,
+        accessories=accessories,
+        consumables=consumables,
+    )
+
+
+@app.post(
+    "/api/links/compatibility",
+    response_model=LinkCreateResponse,
+    status_code=201,
+    summary="Lier un accessoire à un équipement",
+    tags=["Relationnel v4"],
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+def link_compatibility(
+    body: LinkCompatibilityRequest,
+    _: None = Security(_require_token),
+) -> LinkCreateResponse:
+    """
+    Crée une liaison Many-to-Many entre un équipement et un accessoire.
+
+    Exemple : lier une batterie 18V à un perforateur ET à une visseuse (sans duplication).
+    La liaison est ignorée silencieusement si elle existe déjà (UNIQUE constraint).
+    """
+    try:
+        eq_df = _run_query("SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1", [body.equipment_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if eq_df.empty:
+        raise HTTPException(status_code=404, detail=f"Équipement introuvable : {body.equipment_id}")
+
+    try:
+        acc_df = _run_query("SELECT label FROM accessories WHERE accessory_id = ? LIMIT 1", [body.accessory_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if acc_df.empty:
+        raise HTTPException(status_code=404, detail=f"Accessoire introuvable : {body.accessory_id}")
+
+    link_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """
+            INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, note)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (equipment_id, accessory_id) DO NOTHING
+            """,
+            [link_id, body.equipment_id, body.accessory_id, body.note],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    eq_label  = _s(eq_df.iloc[0]["label"])
+    acc_label = _s(acc_df.iloc[0]["label"])
+    return LinkCreateResponse(
+        ok=True,
+        link_id=link_id,
+        message=f"'{acc_label}' lié à '{eq_label}' comme accessoire compatible.",
+    )
+
+
+@app.delete(
+    "/api/links/compatibility/{link_id}",
+    summary="Supprimer une liaison accessoire ↔ équipement",
+    tags=["Relationnel v4"],
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_link_compatibility(
+    link_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    """Supprime une liaison de compatibilité. L'accessoire et l'équipement ne sont pas supprimés."""
+    try:
+        df = _run_query("SELECT link_id FROM links_compatibility WHERE link_id = ? LIMIT 1", [link_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="link_not_found").model_dump())
+    try:
+        _run_write("DELETE FROM links_compatibility WHERE link_id = ?", [link_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "link_id": link_id, "message": "Liaison supprimée."}
+
+
+@app.post(
+    "/api/links/consumables",
+    response_model=LinkCreateResponse,
+    status_code=201,
+    summary="Lier un consommable à un équipement",
+    tags=["Relationnel v4"],
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+def link_consumable(
+    body: LinkConsumableRequest,
+    _: None = Security(_require_token),
+) -> LinkCreateResponse:
+    """
+    Crée une liaison Many-to-Many entre un équipement et un consommable.
+
+    Exemple : lier des forets SDS-Plus à un perforateur.
+    `qty_per_use` indique la quantité typiquement utilisée par session.
+    """
+    try:
+        eq_df = _run_query("SELECT label FROM equipment WHERE equipment_id = ? LIMIT 1", [body.equipment_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if eq_df.empty:
+        raise HTTPException(status_code=404, detail=f"Équipement introuvable : {body.equipment_id}")
+
+    try:
+        con_df = _run_query("SELECT label FROM consumables WHERE consumable_id = ? LIMIT 1", [body.consumable_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if con_df.empty:
+        raise HTTPException(status_code=404, detail=f"Consommable introuvable : {body.consumable_id}")
+
+    link_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """
+            INSERT INTO links_consumables (link_id, equipment_id, consumable_id, qty_per_use, note)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (equipment_id, consumable_id) DO NOTHING
+            """,
+            [link_id, body.equipment_id, body.consumable_id, body.qty_per_use, body.note],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    eq_label  = _s(eq_df.iloc[0]["label"])
+    con_label = _s(con_df.iloc[0]["label"])
+    return LinkCreateResponse(
+        ok=True,
+        link_id=link_id,
+        message=f"'{con_label}' lié à '{eq_label}' comme consommable nécessaire.",
+    )
+
+
+@app.delete(
+    "/api/links/consumables/{link_id}",
+    summary="Supprimer une liaison consommable ↔ équipement",
+    tags=["Relationnel v4"],
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_link_consumable(
+    link_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    """Supprime une liaison de consommable. Le consommable et l'équipement ne sont pas supprimés."""
+    try:
+        df = _run_query("SELECT link_id FROM links_consumables WHERE link_id = ? LIMIT 1", [link_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if df.empty:
+        raise HTTPException(status_code=404, detail=ErrorResponse(ok=False, error="link_not_found").model_dump())
+    try:
+        _run_write("DELETE FROM links_consumables WHERE link_id = ?", [link_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "link_id": link_id, "message": "Liaison consommable supprimée."}
 
 
 # ─── Health check (sans auth) ─────────────────────────────────
