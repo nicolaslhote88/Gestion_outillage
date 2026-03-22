@@ -136,6 +136,59 @@ html, body, [class*="css"] {
 .badge-blue   { background: #1e3a5f; color: #93c5fd; border: 1px solid #1e40af; }
 .badge-gray   { background: #1e293b; color: #94a3b8; border: 1px solid #475569; }
 
+/* ── Badges type d'entité ── */
+.badge-equipment  { background: #1e3a5f; color: #93c5fd; border: 1px solid #1e40af; }
+.badge-accessory  { background: #3b1e5f; color: #c4b5fd; border: 1px solid #5b21b6; }
+.badge-consumable { background: #1a3b2f; color: #6ee7b7; border: 1px solid #065f46; }
+
+/* ── Arbre de dépendances ── */
+.dep-section {
+    border-left: 3px solid #334155;
+    padding: 4px 0 4px 14px;
+    margin: 6px 0 14px 4px;
+}
+.dep-section-header {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+    padding-bottom: 5px;
+    border-bottom: 1px solid #1e293b;
+}
+.dep-card {
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    transition: border-color 0.15s;
+}
+.dep-card:hover { border-color: #3b82f6; }
+.dep-thumb-wrap {
+    width: 44px; height: 44px;
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+    background: #1e293b;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.2rem;
+}
+.dep-thumb-wrap img { width: 44px; height: 44px; object-fit: cover; }
+.dep-info { flex: 1; min-width: 0; }
+.dep-label {
+    font-weight: 600;
+    font-size: 0.86rem;
+    color: #f1f5f9;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dep-sub  { font-size: 0.76rem; color: #94a3b8; margin-top: 2px; }
+.dep-empty { color: #475569; font-size: 0.82rem; font-style: italic; padding: 6px 0; }
+
 /* ── Section title ── */
 .section-title {
     font-size: 1.4rem;
@@ -457,6 +510,48 @@ def init_db_tables() -> None:
     """)
 
     run_write("""
+        CREATE TABLE IF NOT EXISTS accessory_media (
+            media_id            VARCHAR PRIMARY KEY,
+            accessory_id        VARCHAR NOT NULL,
+            final_drive_file_id VARCHAR,
+            image_role          VARCHAR DEFAULT 'overview',
+            image_index         INTEGER DEFAULT 0,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS consumable_media (
+            media_id            VARCHAR PRIMARY KEY,
+            consumable_id       VARCHAR NOT NULL,
+            final_drive_file_id VARCHAR,
+            image_role          VARCHAR DEFAULT 'overview',
+            image_index         INTEGER DEFAULT 0,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # ── Migration : drive_file_id existant → *_media ───────────
+    # Insère uniquement les fiches qui n'ont pas encore de ligne dans la table media.
+    run_write("""
+        INSERT INTO accessory_media (media_id, accessory_id, final_drive_file_id, image_role, image_index)
+        SELECT gen_random_uuid()::VARCHAR, accessory_id, drive_file_id, 'overview', 0
+        FROM accessories
+        WHERE drive_file_id IS NOT NULL
+          AND drive_file_id NOT IN ('', 'None', 'nan')
+          AND accessory_id NOT IN (SELECT accessory_id FROM accessory_media)
+    """)
+
+    run_write("""
+        INSERT INTO consumable_media (media_id, consumable_id, final_drive_file_id, image_role, image_index)
+        SELECT gen_random_uuid()::VARCHAR, consumable_id, drive_file_id, 'overview', 0
+        FROM consumables
+        WHERE drive_file_id IS NOT NULL
+          AND drive_file_id NOT IN ('', 'None', 'nan')
+          AND consumable_id NOT IN (SELECT consumable_id FROM consumable_media)
+    """)
+
+    run_write("""
         CREATE TABLE IF NOT EXISTS links_compatibility (
             link_id      VARCHAR PRIMARY KEY,
             equipment_id VARCHAR NOT NULL,
@@ -750,6 +845,115 @@ def confidence_badge(confidence) -> str:
     if conf >= 0.60:
         return f'<span class="badge badge-yellow">IA {conf:.0%}</span>'
     return f'<span class="badge badge-red">IA {conf:.0%}</span>'
+
+
+def entity_type_badge(entity_type: str) -> str:
+    """Badge visuel pour le type d'entité (Équipement / Accessoire / Consommable)."""
+    mapping = {
+        "equipment":  ("badge-equipment",  "Équipement"),
+        "accessory":  ("badge-accessory",  "Accessoire"),
+        "consumable": ("badge-consumable", "Consommable"),
+    }
+    cls, label = mapping.get(entity_type, ("badge-gray", entity_type or "?"))
+    return f'<span class="badge {cls}">{label}</span>'
+
+
+_ENTITY_EMOJI = {"equipment": "🔧", "accessory": "🔋", "consumable": "⚙"}
+_ENTITY_OPEN_FN_KEY = "equipment"   # sentinel; actual fns passed at call site
+
+
+def _render_relation_cards(
+    section_title: str,
+    df,               # pd.DataFrame avec les entités liées
+    entity_type: str, # type des entités dans df
+    id_col: str,      # colonne PK dans df
+    file_id_col: str, # colonne Drive file_id dans df
+    open_fn,          # callable(entity_id) → ouvre la fiche
+    key_prefix: str,  # préfixe unique pour les clés Streamlit
+    sub_fn=None,      # callable(row) → str de sous-titre optionnel
+):
+    """
+    Rend une section de l'arbre de dépendances :
+    - En-tête avec titre + compteur
+    - Pour chaque entité : [miniature Drive | badge type + label + sous-titre | Voir →]
+    - Chaque ligne est cliquable via le bouton Voir →
+    """
+    emoji = _ENTITY_EMOJI.get(entity_type, "🔗")
+    count = len(df) if df is not None and not df.empty else 0
+
+    # ── En-tête de section ─────────────────────────────────────
+    st.markdown(
+        f'<div class="dep-section-header">'
+        f'{emoji} {section_title}'
+        f'<span style="margin-left:8px;background:#334155;color:#94a3b8;'
+        f'border-radius:20px;padding:1px 8px;font-size:0.72rem">{count}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if df is None or df.empty:
+        st.markdown('<div class="dep-empty">Aucun élément lié.</div>', unsafe_allow_html=True)
+        return
+
+    badge_html = entity_type_badge(entity_type)
+
+    for _, row in df.iterrows():
+        entity_id = str(row.get(id_col, ""))
+        label     = null_str(row.get("label"), "Sans nom")
+        brand     = null_str(row.get("brand"), "")
+        model_r   = null_str(row.get("model") or row.get("reference"), "")
+        file_id   = null_str(row.get(file_id_col), "")
+        sub       = sub_fn(row) if sub_fn else None
+
+        # Sous-titre : brand · model ou custom
+        sub_parts = [p for p in [brand, model_r] if p and p != "—"]
+        subtitle  = sub if sub else " · ".join(sub_parts)
+
+        # Miniature (base64 inline) ou placeholder emoji
+        thumb_html = ""
+        if file_id and file_id != "—":
+            try:
+                raw = get_drive_thumb(file_id, max_px=96, quality=70)
+                if raw:
+                    import base64 as _b64
+                    b64 = _b64.b64encode(raw).decode()
+                    thumb_html = f'<img src="data:image/jpeg;base64,{b64}" style="width:44px;height:44px;object-fit:cover;border-radius:6px;">'
+            except Exception:
+                pass
+        if not thumb_html:
+            thumb_html = (
+                f'<div class="dep-thumb-wrap">'
+                f'<span style="font-size:1.3rem">{emoji}</span></div>'
+            )
+
+        # Carte HTML (visuel seul — le bouton Streamlit reste natif)
+        sub_html = f'<div class="dep-sub">{subtitle}</div>' if subtitle else ""
+        card_html = (
+            f'<div class="dep-card">'
+            f'<div class="dep-thumb-wrap">{thumb_html}</div>'
+            f'<div class="dep-info">'
+            f'  {badge_html}'
+            f'  <div class="dep-label">{label}</div>'
+            f'  {sub_html}'
+            f'</div>'
+            f'</div>'
+        )
+
+        # Layout : carte visuelle à gauche, bouton Streamlit à droite
+        card_col, btn_col = st.columns([5, 1], gap="small")
+        with card_col:
+            st.markdown(card_html, unsafe_allow_html=True)
+        with btn_col:
+            if st.button("Voir →", key=f"dep_{key_prefix}_{entity_id}",
+                         use_container_width=True,
+                         help=f"Ouvrir la fiche {label}"):
+                # Streamlit interdit les dialogs imbriqués — on programme
+                # l'ouverture via session_state et on relance le script.
+                st.session_state["_pending_modal"] = {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                }
+                st.rerun()
 
 
 def null_str(value, fallback: str = "—") -> str:
@@ -1809,6 +2013,66 @@ def show_equipment_modal(equipment_id: str):
             st.markdown("---")
             st.info(f"📝 {notes}")
 
+    # ── Arbre de dépendances relationnel (v4.0 links) ─────────
+    st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
+    _acc_df = run_query("""
+        SELECT a.accessory_id, a.label, a.brand, a.model,
+               a.drive_file_id, a.stock_qty, lc.note
+        FROM links_compatibility lc
+        JOIN accessories a ON a.accessory_id = lc.accessory_id
+        WHERE lc.equipment_id = ?
+        ORDER BY a.label
+    """, [equipment_id])
+
+    _con_df = run_query("""
+        SELECT c.consumable_id, c.label, c.brand, c.reference,
+               c.drive_file_id, c.stock_qty, c.unit, lc.qty_per_use, lc.note
+        FROM links_consumables lc
+        JOIN consumables c ON c.consumable_id = lc.consumable_id
+        WHERE lc.equipment_id = ?
+        ORDER BY c.label
+    """, [equipment_id])
+
+    if _acc_df.empty and _con_df.empty:
+        st.info("Aucune liaison accessoire/consommable enregistrée pour cet équipement.")
+    else:
+        dep_acc_col, dep_con_col = st.columns(2, gap="large")
+
+        with dep_acc_col:
+            st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+            _render_relation_cards(
+                section_title="Accessoires compatibles",
+                df=_acc_df if not _acc_df.empty else None,
+                entity_type="accessory",
+                id_col="accessory_id",
+                file_id_col="drive_file_id",
+                open_fn=show_accessory_modal,
+                key_prefix=f"eq_acc_{equipment_id}",
+                sub_fn=lambda r: (
+                    f"{null_str(r.get('brand'), '')} · {null_str(r.get('model'), '')} — stock : {int(r.get('stock_qty') or 0)}"
+                ).strip(" · "),
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with dep_con_col:
+            st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+            _render_relation_cards(
+                section_title="Consommables associés",
+                df=_con_df if not _con_df.empty else None,
+                entity_type="consumable",
+                id_col="consumable_id",
+                file_id_col="drive_file_id",
+                open_fn=show_consumable_modal,
+                key_prefix=f"eq_con_{equipment_id}",
+                sub_fn=lambda r: (
+                    f"{null_str(r.get('brand'), '')} — "
+                    f"{r.get('qty_per_use') or 1} {null_str(r.get('unit'), 'pcs')} / usage"
+                ).strip(" — "),
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
     # ── Disponibilité & Suivi ──────────────────────────────────
     st.markdown("---")
     st.subheader("Disponibilité & Suivi")
@@ -1986,238 +2250,753 @@ def show_equipment_modal(equipment_id: str):
         st.caption("🔒 Caractéristiques en lecture seule — contactez l'administrateur pour modifier.")
 
 # ─────────────────────────────────────────────────────────────
+#  MODALE DÉTAIL ACCESSOIRE  (st.dialog — Streamlit ≥ 1.32)
+# ─────────────────────────────────────────────────────────────
+
+@st.dialog("Fiche accessoire", width="large")
+def show_accessory_modal(accessory_id: str):
+    """Fenêtre modale avec le détail complet d'un accessoire."""
+    detail_df = run_query("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
+    if detail_df.empty:
+        st.error("Accessoire introuvable.")
+        return
+    row = detail_df.iloc[0]
+
+    # En-tête
+    header_col, badge_col = st.columns([3, 1])
+    with header_col:
+        st.markdown(f"### {null_str(row.get('label'), 'Accessoire')}")
+        st.markdown(f"_{null_str(row.get('brand'))} — {null_str(row.get('model'))}_")
+    with badge_col:
+        st.markdown(entity_type_badge("accessory"), unsafe_allow_html=True)
+
+    st.markdown("---")
+    left_col, right_col = st.columns([1, 1])
+
+    # ── Galerie multi-photos ───────────────────────────────────
+    with left_col:
+        media_df = run_query("""
+            SELECT media_id, final_drive_file_id, image_role, image_index
+            FROM accessory_media
+            WHERE accessory_id = ?
+            ORDER BY CASE image_role WHEN 'overview' THEN 1 ELSE 2 END, image_index
+        """, [accessory_id])
+
+        zoom_key = f"acc_zoom_{accessory_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
+
+        if not media_df.empty:
+            if zoomed_fid:
+                try:
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
+                except Exception:
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                if st.button("✖ Fermer l'agrandissement",
+                             key=f"acc_zoom_close_{accessory_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"acc_zoom_main_{accessory_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
+
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=400, quality=75),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"acc_zoom_{accessory_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ (`{fid2}`)")
+        else:
+            st.markdown(
+                '<div style="background:#1e293b;border-radius:8px;height:160px;'
+                'display:flex;align-items:center;justify-content:center;'
+                'color:#475569;font-size:2rem;">📷</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Aucune image disponible")
+
+        # ── Ajouter une photo (Drive file ID) ─────────────────
+        with st.expander("➕ Ajouter une photo"):
+            new_fid = st.text_input("Google Drive file ID", key=f"acc_new_fid_{accessory_id}",
+                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                    key=f"acc_new_role_{accessory_id}")
+            if st.button("💾 Ajouter", key=f"acc_add_photo_{accessory_id}"):
+                nfid = new_fid.strip() if new_fid else ""
+                if not nfid:
+                    st.error("Entrez un Drive file ID.")
+                else:
+                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                    ok = run_write("""
+                        INSERT INTO accessory_media
+                            (media_id, accessory_id, final_drive_file_id, image_role, image_index)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [str(uuid.uuid4()), accessory_id, nfid, new_role, next_idx])
+                    if ok:
+                        st.success("Photo ajoutée.")
+                        st.rerun()
+
+        # ── Supprimer une photo ────────────────────────────────
+        if not media_df.empty:
+            with st.expander("🗑 Supprimer une photo"):
+                del_options = {
+                    f"Photo {i+1} ({null_str(r.get('image_role'))}) — {r.get('final_drive_file_id','')[:20]}…":
+                        r.get("media_id")
+                    for i, (_, r) in enumerate(media_df.iterrows())
+                }
+                del_label = st.selectbox("Choisir la photo à supprimer",
+                                         list(del_options.keys()),
+                                         key=f"acc_del_sel_{accessory_id}")
+                if st.button("🗑 Supprimer", key=f"acc_del_photo_{accessory_id}",
+                             type="primary"):
+                    run_write("DELETE FROM accessory_media WHERE media_id = ?",
+                              [del_options[del_label]])
+                    st.rerun()
+
+    # ── Identification ────────────────────────────────────────
+    with right_col:
+        st.markdown("**Identification**")
+        info_data = {
+            "Catégorie"  : null_str(row.get("category")),
+            "Marque"     : null_str(row.get("brand")),
+            "Modèle"     : null_str(row.get("model")),
+            "Emplacement": null_str(row.get("location_hint")),
+            "Stock"      : f"{int(row.get('stock_qty') or 0)} unité(s)",
+            "ID legacy"  : null_str(row.get("legacy_source_id")),
+        }
+        for k, v in info_data.items():
+            if v and v != "—":
+                st.markdown(f"**{k}** : {v}")
+
+        notes = null_str(row.get("notes"))
+        if notes and notes != "—":
+            st.markdown("---")
+            st.info(f"📝 {notes}")
+
+    # ── Équipements compatibles — arbre visuel ─────────────────
+    st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
+    compat_df = run_query("""
+        SELECT e.equipment_id, e.label, e.brand, e.model,
+               e.condition_label, lc.note,
+               (SELECT em.final_drive_file_id
+                FROM equipment_media em
+                WHERE em.equipment_id = e.equipment_id
+                ORDER BY CASE em.image_role
+                    WHEN 'overview'  THEN 1
+                    WHEN 'nameplate' THEN 2
+                    ELSE 3
+                END LIMIT 1) AS drive_file_id
+        FROM links_compatibility lc
+        JOIN equipment e ON e.equipment_id = lc.equipment_id
+        WHERE lc.accessory_id = ?
+        ORDER BY e.label
+    """, [accessory_id])
+
+    st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+    _render_relation_cards(
+        section_title="Équipements compatibles",
+        df=compat_df if not compat_df.empty else None,
+        entity_type="equipment",
+        id_col="equipment_id",
+        file_id_col="drive_file_id",
+        open_fn=show_equipment_modal,
+        key_prefix=f"acc_eq_{accessory_id}",
+        sub_fn=lambda r: " · ".join(filter(
+            lambda x: x and x != "—",
+            [null_str(r.get("brand"), ""), null_str(r.get("model"), ""),
+             null_str(r.get("condition_label"), "")],
+        )),
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Gouvernance ───────────────────────────────────────────
+    st.markdown("---")
+    gov_col1, gov_col2 = st.columns(2)
+    gov_col1.caption(f"Migration : {null_str(row.get('migration_status'))}")
+    gov_col2.caption(f"ID : `{accessory_id}`")
+
+
+# ─────────────────────────────────────────────────────────────
+#  MODALE DÉTAIL CONSOMMABLE  (st.dialog — Streamlit ≥ 1.32)
+# ─────────────────────────────────────────────────────────────
+
+@st.dialog("Fiche consommable", width="large")
+def show_consumable_modal(consumable_id: str):
+    """Fenêtre modale avec le détail complet d'un consommable."""
+    detail_df = run_query("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
+    if detail_df.empty:
+        st.error("Consommable introuvable.")
+        return
+    row = detail_df.iloc[0]
+
+    # En-tête
+    header_col, badge_col = st.columns([3, 1])
+    with header_col:
+        st.markdown(f"### {null_str(row.get('label'), 'Consommable')}")
+        st.markdown(f"_{null_str(row.get('brand'))} — {null_str(row.get('reference'))}_")
+    with badge_col:
+        st.markdown(entity_type_badge("consumable"), unsafe_allow_html=True)
+
+    st.markdown("---")
+    left_col, right_col = st.columns([1, 1])
+
+    # ── Galerie multi-photos ───────────────────────────────────
+    with left_col:
+        media_df = run_query("""
+            SELECT media_id, final_drive_file_id, image_role, image_index
+            FROM consumable_media
+            WHERE consumable_id = ?
+            ORDER BY CASE image_role WHEN 'overview' THEN 1 ELSE 2 END, image_index
+        """, [consumable_id])
+
+        zoom_key = f"con_zoom_{consumable_id}"
+        zoomed_fid = st.session_state.get(zoom_key)
+
+        if not media_df.empty:
+            if zoomed_fid:
+                try:
+                    st.image(get_drive_thumb(zoomed_fid, max_px=1400, quality=90),
+                             use_container_width=True)
+                except Exception:
+                    st.warning(f"⚠️ Image inaccessible (Drive ID : `{zoomed_fid}`)")
+                if st.button("✖ Fermer l'agrandissement",
+                             key=f"con_zoom_close_{consumable_id}",
+                             use_container_width=True):
+                    st.session_state.pop(zoom_key, None)
+            else:
+                st.markdown("**Photos** — *cliquez 🔍 pour agrandir*")
+                main = media_df.iloc[0]
+                fid  = main.get("final_drive_file_id")
+                if fid:
+                    try:
+                        st.image(get_drive_thumb(fid, max_px=800, quality=80),
+                                 use_container_width=True)
+                    except Exception:
+                        st.warning(f"⚠️ Image corrompue ou inaccessible (Drive ID : `{fid}`)")
+                    if st.button("🔍 Agrandir", key=f"con_zoom_main_{consumable_id}",
+                                 use_container_width=True):
+                        st.session_state[zoom_key] = fid
+
+                remaining = media_df.iloc[1:]
+                for chunk_start in range(0, len(remaining), 3):
+                    chunk = remaining.iloc[chunk_start:chunk_start + 3]
+                    cols = st.columns(3)
+                    for j, (_, m) in enumerate(chunk.iterrows()):
+                        fid2 = m.get("final_drive_file_id")
+                        if fid2:
+                            try:
+                                cols[j].image(
+                                    get_drive_thumb(fid2, max_px=400, quality=75),
+                                    use_container_width=True,
+                                    caption=null_str(m.get("image_role")),
+                                )
+                                if cols[j].button("🔍", key=f"con_zoom_{consumable_id}_{fid2}",
+                                                  use_container_width=True):
+                                    st.session_state[zoom_key] = fid2
+                            except Exception:
+                                cols[j].warning(f"⚠️ (`{fid2}`)")
+        else:
+            st.markdown(
+                '<div style="background:#1e293b;border-radius:8px;height:160px;'
+                'display:flex;align-items:center;justify-content:center;'
+                'color:#475569;font-size:2rem;">📷</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Aucune image disponible")
+
+        # ── Ajouter une photo (Drive file ID) ─────────────────
+        with st.expander("➕ Ajouter une photo"):
+            new_fid = st.text_input("Google Drive file ID", key=f"con_new_fid_{consumable_id}",
+                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                    key=f"con_new_role_{consumable_id}")
+            if st.button("💾 Ajouter", key=f"con_add_photo_{consumable_id}"):
+                nfid = new_fid.strip() if new_fid else ""
+                if not nfid:
+                    st.error("Entrez un Drive file ID.")
+                else:
+                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                    ok = run_write("""
+                        INSERT INTO consumable_media
+                            (media_id, consumable_id, final_drive_file_id, image_role, image_index)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [str(uuid.uuid4()), consumable_id, nfid, new_role, next_idx])
+                    if ok:
+                        st.success("Photo ajoutée.")
+                        st.rerun()
+
+        # ── Supprimer une photo ────────────────────────────────
+        if not media_df.empty:
+            with st.expander("🗑 Supprimer une photo"):
+                del_options = {
+                    f"Photo {i+1} ({null_str(r.get('image_role'))}) — {r.get('final_drive_file_id','')[:20]}…":
+                        r.get("media_id")
+                    for i, (_, r) in enumerate(media_df.iterrows())
+                }
+                del_label = st.selectbox("Choisir la photo à supprimer",
+                                         list(del_options.keys()),
+                                         key=f"con_del_sel_{consumable_id}")
+                if st.button("🗑 Supprimer", key=f"con_del_photo_{consumable_id}",
+                             type="primary"):
+                    run_write("DELETE FROM consumable_media WHERE media_id = ?",
+                              [del_options[del_label]])
+                    st.rerun()
+
+    # ── Identification & Stock ────────────────────────────────
+    with right_col:
+        st.markdown("**Identification**")
+        info_data = {
+            "Catégorie"  : null_str(row.get("category")),
+            "Marque"     : null_str(row.get("brand")),
+            "Référence"  : null_str(row.get("reference")),
+            "Unité"      : null_str(row.get("unit")),
+            "Emplacement": null_str(row.get("location_hint")),
+            "ID legacy"  : null_str(row.get("legacy_source_id")),
+        }
+        for k, v in info_data.items():
+            if v and v != "—":
+                st.markdown(f"**{k}** : {v}")
+
+        # Stock avec indicateur visuel
+        stock_qty   = float(row.get("stock_qty")   or 0)
+        stock_alert = float(row.get("stock_min_alert") or 0)
+        unit        = null_str(row.get("unit"), "pcs")
+        st.markdown("---")
+        st.markdown("**Stock**")
+        if stock_qty <= stock_alert:
+            st.markdown(
+                f'<span class="badge badge-red">⚠ Stock bas : {stock_qty} {unit}</span>'
+                f'<br><small style="color:#94a3b8">Seuil : {stock_alert} {unit}</small>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<span class="badge badge-green">✓ {stock_qty} {unit}</span>'
+                f'<br><small style="color:#94a3b8">Seuil alerte : {stock_alert} {unit}</small>',
+                unsafe_allow_html=True,
+            )
+
+        notes = null_str(row.get("notes"))
+        if notes and notes != "—":
+            st.markdown("---")
+            st.info(f"📝 {notes}")
+
+    # ── Équipements utilisant ce consommable — arbre visuel ───
+    st.markdown("---")
+    st.subheader("🔗 Liaisons Parc Matériel")
+
+    compat_df = run_query("""
+        SELECT e.equipment_id, e.label, e.brand, e.model,
+               e.condition_label, lc.qty_per_use, lc.note,
+               (SELECT em.final_drive_file_id
+                FROM equipment_media em
+                WHERE em.equipment_id = e.equipment_id
+                ORDER BY CASE em.image_role
+                    WHEN 'overview'  THEN 1
+                    WHEN 'nameplate' THEN 2
+                    ELSE 3
+                END LIMIT 1) AS drive_file_id
+        FROM links_consumables lc
+        JOIN equipment e ON e.equipment_id = lc.equipment_id
+        WHERE lc.consumable_id = ?
+        ORDER BY e.label
+    """, [consumable_id])
+
+    _unit_label = null_str(row.get("unit"), "pcs")
+    st.markdown('<div class="dep-section">', unsafe_allow_html=True)
+    _render_relation_cards(
+        section_title="Équipements qui utilisent ce consommable",
+        df=compat_df if not compat_df.empty else None,
+        entity_type="equipment",
+        id_col="equipment_id",
+        file_id_col="drive_file_id",
+        open_fn=show_equipment_modal,
+        key_prefix=f"con_eq_{consumable_id}",
+        sub_fn=lambda r: " · ".join(filter(
+            lambda x: x and x != "—",
+            [null_str(r.get("brand"), ""), null_str(r.get("model"), ""),
+             (f"{r.get('qty_per_use') or 1} {_unit_label} / usage"
+              if r.get("qty_per_use") else "")],
+        )),
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Gouvernance ───────────────────────────────────────────
+    st.markdown("---")
+    gov_col1, gov_col2 = st.columns(2)
+    gov_col1.caption(f"Migration : {null_str(row.get('migration_status'))}")
+    gov_col2.caption(f"ID : `{consumable_id}`")
+
+
+# ─────────────────────────────────────────────────────────────
 #  VUE 3 : PARC MATÉRIEL — Galerie & Recherche
 # ─────────────────────────────────────────────────────────────
 
 def render_parc_materiel():
     st.markdown('<p class="section-title">🏭 Parc Matériel</p>', unsafe_allow_html=True)
-    st.markdown('<p class="section-subtitle">Recherchez et consultez l\'ensemble du parc outillage</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="section-subtitle">Catalogue unifié — équipements, accessoires & consommables</p>',
+        unsafe_allow_html=True,
+    )
 
     # ── Filtres sidebar ────────────────────────────────────────
     with st.sidebar:
         st.markdown("---")
         st.markdown("### Filtres")
 
-        # Récupère les valeurs distinctes pour les filtres
-        brands_df    = run_query("SELECT DISTINCT brand FROM equipment WHERE brand IS NOT NULL ORDER BY brand")
-        subtypes_df  = run_query("SELECT DISTINCT subtype FROM equipment WHERE subtype IS NOT NULL ORDER BY subtype")
-        conds_df     = run_query("SELECT DISTINCT condition_label FROM equipment WHERE condition_label IS NOT NULL ORDER BY condition_label")
+        # Type d'entité
+        sel_entity_types = st.multiselect(
+            "Type d'objet",
+            options=["Équipement", "Accessoire", "Consommable"],
+            key="filter_entity_type",
+        )
+        _entity_type_map = {"Équipement": "equipment", "Accessoire": "accessory", "Consommable": "consumable"}
+        sel_types_db = [_entity_type_map[t] for t in sel_entity_types]
 
-        brands_list    = brands_df["brand"].tolist()       if not brands_df.empty else []
-        subtypes_list  = subtypes_df["subtype"].tolist()   if not subtypes_df.empty else []
-        conds_list     = conds_df["condition_label"].tolist() if not conds_df.empty else []
+        # Marques — union des 3 tables
+        brands_df = run_query("""
+            SELECT DISTINCT brand FROM (
+                SELECT brand FROM equipment WHERE brand IS NOT NULL
+                UNION SELECT brand FROM accessories WHERE brand IS NOT NULL
+                UNION SELECT brand FROM consumables  WHERE brand IS NOT NULL
+            ) b ORDER BY brand
+        """)
+        brands_list = brands_df["brand"].tolist() if not brands_df.empty else []
+        sel_brands  = st.multiselect("Marque", brands_list, key="filter_brand")
 
-        sel_brands   = st.multiselect("Marque",  brands_list,   key="filter_brand")
-        sel_subtypes = st.multiselect("Type",    subtypes_list, key="filter_subtype")
-        sel_conds    = st.multiselect("État",    conds_list,    key="filter_cond")
+        # Catégories — union des 3 tables
+        cats_df = run_query("""
+            SELECT DISTINCT cat FROM (
+                SELECT subtype AS cat FROM equipment  WHERE subtype   IS NOT NULL
+                UNION SELECT category   FROM accessories WHERE category  IS NOT NULL
+                UNION SELECT category   FROM consumables  WHERE category  IS NOT NULL
+            ) c ORDER BY cat
+        """)
+        cats_list = cats_df["cat"].tolist() if not cats_df.empty else []
+        sel_cats  = st.multiselect("Catégorie", cats_list, key="filter_cat")
+
+        # État (équipements uniquement)
+        conds_df   = run_query("SELECT DISTINCT condition_label FROM equipment WHERE condition_label IS NOT NULL ORDER BY condition_label")
+        conds_list = conds_df["condition_label"].tolist() if not conds_df.empty else []
+        sel_conds  = st.multiselect("État (équipements)", conds_list, key="filter_cond")
 
         show_review_only = st.checkbox("⚠ À réviser seulement", value=False, key="filter_review")
 
     # ── Barre de recherche ─────────────────────────────────────
     search = st.text_input(
-        "🔍 Recherche libre (nom, marque, modèle, N° série…)",
-        placeholder="Ex: Bosch, meuleuse, perceuse, SN-12345…",
+        "🔍 Recherche libre (nom, marque, modèle, référence…)",
+        placeholder="Ex: DEWALT, batterie, foret, SDS, DC540…",
         key="search_parc",
     )
 
-    # ── Construction de la requête dynamique ───────────────────
+    # ── Requête catalogue unifié ───────────────────────────────
+    _CATALOG_SQL = """
+        SELECT
+            'equipment'                      AS entity_type,
+            e.equipment_id                   AS entity_id,
+            e.label,
+            e.brand,
+            e.model                          AS model_ref,
+            CAST(NULL AS VARCHAR)            AS reference,
+            e.subtype                        AS category,
+            e.condition_label,
+            e.location_hint,
+            e.confidence,
+            COALESCE(e.review_required, FALSE) AS review_required,
+            CAST(NULL AS DOUBLE)             AS stock_qty,
+            CAST(NULL AS DOUBLE)             AS stock_min_alert,
+            e.received_at                    AS sort_date,
+            (SELECT em.final_drive_file_id
+             FROM equipment_media em
+             WHERE em.equipment_id = e.equipment_id
+             ORDER BY CASE em.image_role
+                 WHEN 'overview'  THEN 1
+                 WHEN 'nameplate' THEN 2
+                 ELSE 3
+             END LIMIT 1)                    AS main_file_id
+        FROM equipment e
+        WHERE (e.archived IS NULL OR e.archived = FALSE)
+
+        UNION ALL
+
+        SELECT
+            'accessory'                      AS entity_type,
+            a.accessory_id                   AS entity_id,
+            a.label,
+            a.brand,
+            a.model                          AS model_ref,
+            CAST(NULL AS VARCHAR)            AS reference,
+            a.category,
+            CAST(NULL AS VARCHAR)            AS condition_label,
+            a.location_hint,
+            CAST(NULL AS DOUBLE)             AS confidence,
+            FALSE                            AS review_required,
+            CAST(a.stock_qty AS DOUBLE)      AS stock_qty,
+            CAST(NULL AS DOUBLE)             AS stock_min_alert,
+            a.created_at                     AS sort_date,
+            a.drive_file_id                  AS main_file_id
+        FROM accessories a
+        WHERE (a.archived IS NULL OR a.archived = FALSE)
+
+        UNION ALL
+
+        SELECT
+            'consumable'                     AS entity_type,
+            c.consumable_id                  AS entity_id,
+            c.label,
+            c.brand,
+            CAST(NULL AS VARCHAR)            AS model_ref,
+            c.reference,
+            c.category,
+            CAST(NULL AS VARCHAR)            AS condition_label,
+            c.location_hint,
+            CAST(NULL AS DOUBLE)             AS confidence,
+            FALSE                            AS review_required,
+            c.stock_qty,
+            c.stock_min_alert,
+            c.created_at                     AS sort_date,
+            c.drive_file_id                  AS main_file_id
+        FROM consumables c
+        WHERE (c.archived IS NULL OR c.archived = FALSE)
+    """
+
     conditions = ["1=1"]
     params     = []
 
     if search:
-        conditions.append("""(
-            LOWER(label)         LIKE ?
-            OR LOWER(brand)      LIKE ?
-            OR LOWER(model)      LIKE ?
-            OR LOWER(serial_number) LIKE ?
-            OR LOWER(subtype)    LIKE ?
-            OR LOWER(notes)      LIKE ?
-        )""")
         like_val = f"%{search.lower()}%"
-        params.extend([like_val] * 6)
+        conditions.append("""(
+            LOWER(label)     LIKE ?
+            OR LOWER(brand)  LIKE ?
+            OR LOWER(model_ref) LIKE ?
+            OR LOWER(reference) LIKE ?
+            OR LOWER(category)  LIKE ?
+        )""")
+        params.extend([like_val] * 5)
+
+    if sel_types_db:
+        phs = ", ".join(["?"] * len(sel_types_db))
+        conditions.append(f"entity_type IN ({phs})")
+        params.extend(sel_types_db)
 
     if sel_brands:
-        placeholders = ", ".join(["?"] * len(sel_brands))
-        conditions.append(f"brand IN ({placeholders})")
+        phs = ", ".join(["?"] * len(sel_brands))
+        conditions.append(f"brand IN ({phs})")
         params.extend(sel_brands)
 
-    if sel_subtypes:
-        placeholders = ", ".join(["?"] * len(sel_subtypes))
-        conditions.append(f"subtype IN ({placeholders})")
-        params.extend(sel_subtypes)
+    if sel_cats:
+        phs = ", ".join(["?"] * len(sel_cats))
+        conditions.append(f"category IN ({phs})")
+        params.extend(sel_cats)
 
     if sel_conds:
-        placeholders = ", ".join(["?"] * len(sel_conds))
-        conditions.append(f"condition_label IN ({placeholders})")
+        phs = ", ".join(["?"] * len(sel_conds))
+        conditions.append(f"condition_label IN ({phs})")
         params.extend(sel_conds)
 
     if show_review_only:
-        conditions.append("review_required = true")
+        conditions.append("review_required = TRUE")
 
     where_clause = " AND ".join(conditions)
-    sql = f"""
-        SELECT
-            e.equipment_id, e.label, e.brand, e.model, e.serial_number,
-            e.subtype, e.condition_label, e.confidence, e.review_required,
-            e.location_hint, e.received_at,
-            (
-                SELECT em.final_drive_file_id
-                FROM equipment_media em
-                WHERE em.equipment_id = e.equipment_id
-                ORDER BY
-                    CASE em.image_role
-                        WHEN 'overview'  THEN 1
-                        WHEN 'nameplate' THEN 2
-                        ELSE 3
-                    END
-                LIMIT 1
-            ) AS main_file_id
-        FROM equipment e
+    final_sql = f"""
+        SELECT * FROM ({_CATALOG_SQL}) catalog
         WHERE {where_clause}
-        ORDER BY e.received_at DESC
+        ORDER BY sort_date DESC NULLS LAST
     """
-    results_df = run_query(sql, params if params else None)
+    results_df = run_query(final_sql, params if params else None)
 
     # ── Compteur résultats ─────────────────────────────────────
     nb = len(results_df)
-    if search or sel_brands or sel_subtypes or sel_conds or show_review_only:
-        st.caption(f"{nb} résultat(s) trouvé(s)")
-    else:
-        st.caption(f"{nb} équipement(s) dans le parc")
+    has_filters = bool(search or sel_types_db or sel_brands or sel_cats or sel_conds or show_review_only)
 
-    if results_df.empty:
-        st.info("Aucun équipement ne correspond à votre recherche.")
+    if not results_df.empty:
+        # Compteurs par type
+        type_counts = results_df["entity_type"].value_counts()
+        eq_n  = int(type_counts.get("equipment",  0))
+        acc_n = int(type_counts.get("accessory",  0))
+        con_n = int(type_counts.get("consumable", 0))
+        parts = []
+        if eq_n:  parts.append(f"🔧 {eq_n} équipement(s)")
+        if acc_n: parts.append(f"🔋 {acc_n} accessoire(s)")
+        if con_n: parts.append(f"⚙ {con_n} consommable(s)")
+        st.caption((" · ".join(parts)) + (f" — {nb} total" if has_filters else ""))
+    else:
+        st.info("Aucun objet ne correspond à votre recherche.")
         return
 
-    # ── Pagination : 20 items par page, chargés progressivement ─
+    # ── Pagination ─────────────────────────────────────────────
     PAGE_SIZE = 20
     _page_key = "parc_page"
-    # Réinitialise la pagination quand les filtres changent
-    _filter_sig = f"{search}|{sel_brands}|{sel_subtypes}|{sel_conds}|{show_review_only}"
+    _filter_sig = f"{search}|{sel_types_db}|{sel_brands}|{sel_cats}|{sel_conds}|{show_review_only}"
     if st.session_state.get("_parc_filter_sig") != _filter_sig:
         st.session_state[_page_key] = 1
         st.session_state["_parc_filter_sig"] = _filter_sig
     current_page = st.session_state.get(_page_key, 1)
-    shown = current_page * PAGE_SIZE
-    display_df = results_df.iloc[:shown]
+    shown        = current_page * PAGE_SIZE
+    display_df   = results_df.iloc[:shown]
 
-    # ── Affichage en grille 5 colonnes ─────────────────────────
+    # ── Grille 5 colonnes ──────────────────────────────────────
     COLS = 5
-    rows = [display_df.iloc[i:i+COLS] for i in range(0, len(display_df), COLS)]
+    _NO_PHOTO_HTML = (
+        '<div style="background:#1e293b;border-radius:6px;height:90px;'
+        'display:flex;align-items:center;justify-content:center;'
+        'color:#475569;font-size:1.4rem;">📷</div>'
+    )
 
-    for chunk in rows:
-        cols = st.columns(COLS)
+    for chunk_start in range(0, len(display_df), COLS):
+        chunk = display_df.iloc[chunk_start:chunk_start + COLS]
+        cols  = st.columns(COLS)
         for col_idx, (_, item) in enumerate(chunk.iterrows()):
             with cols[col_idx]:
-                # Photo miniature (800px, JPEG q=80) : affichage petit en carte,
-                # qualité suffisante pour le mode Fullscreen natif Streamlit
+                etype = item.get("entity_type", "equipment")
+                eid   = item.get("entity_id", "")
+
+                # ── Photo miniature ────────────────────────────
                 file_id = item.get("main_file_id")
                 if file_id and str(file_id) not in ("nan", "None", ""):
                     thumb = get_drive_thumb(file_id, max_px=800, quality=80)
                     if thumb:
                         st.image(thumb, use_container_width=True)
                     else:
-                        st.markdown(
-                            '<div style="background:#1e293b;border-radius:6px;height:90px;'
-                            'display:flex;align-items:center;justify-content:center;'
-                            'color:#475569;font-size:1.4rem;">📷</div>',
-                            unsafe_allow_html=True,
-                        )
+                        st.markdown(_NO_PHOTO_HTML, unsafe_allow_html=True)
                 else:
-                    st.markdown(
-                        '<div style="background:#1e293b;border-radius:6px;height:90px;'
-                        'display:flex;align-items:center;justify-content:center;'
-                        'color:#475569;font-size:1.4rem;">📷</div>',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(_NO_PHOTO_HTML, unsafe_allow_html=True)
 
-                # Infos carte (taille réduite)
-                brand = null_str(item.get("brand"))
-                model = null_str(item.get("model"))
-                label = null_str(item.get("label"), "Équipement sans nom")
+                # ── Infos texte ────────────────────────────────
+                label    = null_str(item.get("label"), "Sans nom")
+                brand    = null_str(item.get("brand"), "")
+                model_r  = null_str(item.get("model_ref") or item.get("reference"), "")
 
                 st.markdown(
                     f"**{label}**  \n"
-                    f"<span style='color:#94a3b8;font-size:0.82rem'>{brand} · {model}</span>",
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    condition_badge(item.get("condition_label")) + "&nbsp;" +
-                    confidence_badge(item.get("confidence")),
+                    f"<span style='color:#94a3b8;font-size:0.82rem'>{brand}"
+                    f"{(' · ' + model_r) if model_r and model_r != '—' else ''}</span>",
                     unsafe_allow_html=True,
                 )
 
-                # Boutons action : Détails | 🧺 Kit | 📤 Sortie
-                eid = item["equipment_id"]
-                in_kit  = eid in st.session_state.get("kit_basket",  {})
-                in_loan = eid in st.session_state.get("loan_basket", {})
+                # ── Badges (type + état/stock) ─────────────────
+                badges = entity_type_badge(etype)
+                if etype == "equipment":
+                    badges += "&nbsp;" + condition_badge(item.get("condition_label"))
+                    badges += "&nbsp;" + confidence_badge(item.get("confidence"))
+                elif etype == "consumable":
+                    sq = item.get("stock_qty")
+                    sm = item.get("stock_min_alert")
+                    if sq is not None:
+                        low = (float(sq) <= float(sm or 0))
+                        stock_label = f"⚠ {sq}" if low else f"✓ {sq}"
+                        stock_cls   = "badge-red" if low else "badge-green"
+                        badges += f'&nbsp;<span class="badge {stock_cls}">{stock_label}</span>'
+                elif etype == "accessory":
+                    sq = item.get("stock_qty")
+                    if sq is not None:
+                        badges += f'&nbsp;<span class="badge badge-gray">Stock : {int(sq)}</span>'
+                st.markdown(badges, unsafe_allow_html=True)
 
-                def _display_name(it):
-                    return (
-                        null_str(it.get("label"), "")
-                        or " ".join(filter(None, [
-                            null_str(it.get("brand"), ""),
-                            null_str(it.get("model"), ""),
-                        ]))
-                        or it["equipment_id"]
-                    )
+                # ── Boutons action ─────────────────────────────
+                if etype == "equipment":
+                    # Équipement : Voir | 🧺 Kit | 📤 Sortie
+                    in_kit  = eid in st.session_state.get("kit_basket",  {})
+                    in_loan = eid in st.session_state.get("loan_basket", {})
 
-                btn_col, kit_col, loan_col = st.columns([3, 1, 1])
-                with btn_col:
-                    if st.button("Voir", key=f"detail_{eid}", use_container_width=True):
-                        show_equipment_modal(eid)
-                with kit_col:
-                    if st.button(
-                        "✓" if in_kit else "🧺",
-                        key=f"basket_{eid}", use_container_width=True,
-                        help="Retirer du panier Kit" if in_kit else "Ajouter au panier Kit",
-                    ):
-                        if in_kit:
-                            del st.session_state["kit_basket"][eid]
-                        else:
-                            st.session_state["kit_basket"][eid] = _display_name(item)
-                        st.rerun()
-                with loan_col:
-                    if st.button(
-                        "✓" if in_loan else "📤",
-                        key=f"loan_{eid}", use_container_width=True,
-                        help="Retirer de la sortie groupée" if in_loan else "Ajouter à la sortie groupée",
-                    ):
-                        if in_loan:
-                            del st.session_state["loan_basket"][eid]
-                        else:
-                            st.session_state["loan_basket"][eid] = _display_name(item)
-                        st.rerun()
-
-                # Bouton validation rapide (visible uniquement si review_required)
-                if is_admin() and item.get("review_required"):
-                    if st.button("⚡ Valider", key=f"qval_{eid}", use_container_width=True,
-                                 help="Valider cette fiche directement sans la modifier"):
-                        ok = run_write(
-                            "UPDATE equipment SET review_required = false WHERE equipment_id = ?", [eid]
+                    def _display_name(it):
+                        return (
+                            null_str(it.get("label"), "")
+                            or " ".join(filter(None, [
+                                null_str(it.get("brand"), ""),
+                                null_str(it.get("model_ref"), ""),
+                            ]))
+                            or it.get("entity_id", "")
                         )
-                        if ok:
-                            run_write("""
-                                INSERT INTO equipment_audit
-                                    (audit_id, equipment_id, action, changed_fields, operator)
-                                VALUES (?, ?, 'VALIDATE', 'review_required', ?)
-                            """, [str(uuid.uuid4()), eid, get_current_user()])
+
+                    btn_col, kit_col, loan_col = st.columns([3, 1, 1])
+                    with btn_col:
+                        if st.button("Voir", key=f"detail_{eid}", use_container_width=True):
+                            show_equipment_modal(eid)
+                    with kit_col:
+                        if st.button(
+                            "✓" if in_kit else "🧺",
+                            key=f"basket_{eid}", use_container_width=True,
+                            help="Retirer du panier Kit" if in_kit else "Ajouter au panier Kit",
+                        ):
+                            if in_kit:
+                                del st.session_state["kit_basket"][eid]
+                            else:
+                                st.session_state["kit_basket"][eid] = _display_name(item)
                             st.rerun()
+                    with loan_col:
+                        if st.button(
+                            "✓" if in_loan else "📤",
+                            key=f"loan_{eid}", use_container_width=True,
+                            help="Retirer de la sortie groupée" if in_loan else "Ajouter à la sortie groupée",
+                        ):
+                            if in_loan:
+                                del st.session_state["loan_basket"][eid]
+                            else:
+                                st.session_state["loan_basket"][eid] = _display_name(item)
+                            st.rerun()
+
+                    # Validation rapide admin
+                    if is_admin() and item.get("review_required"):
+                        if st.button("⚡ Valider", key=f"qval_{eid}", use_container_width=True,
+                                     help="Valider cette fiche directement"):
+                            ok = run_write(
+                                "UPDATE equipment SET review_required = false WHERE equipment_id = ?", [eid]
+                            )
+                            if ok:
+                                run_write("""
+                                    INSERT INTO equipment_audit
+                                        (audit_id, equipment_id, action, changed_fields, operator)
+                                    VALUES (?, ?, 'VALIDATE', 'review_required', ?)
+                                """, [str(uuid.uuid4()), eid, get_current_user()])
+                                st.rerun()
+
+                elif etype == "accessory":
+                    if st.button("Voir", key=f"detail_acc_{eid}", use_container_width=True):
+                        show_accessory_modal(eid)
+
+                elif etype == "consumable":
+                    if st.button("Voir", key=f"detail_con_{eid}", use_container_width=True):
+                        show_consumable_modal(eid)
 
                 st.markdown("<div style='margin-bottom:12px'></div>", unsafe_allow_html=True)
 
-    # ── Bouton "Charger la suite" ───────────────────────────────
+    # ── Charger la suite ───────────────────────────────────────
     if shown < nb:
         remaining = nb - shown
         if st.button(
-            f"⬇ Charger la suite ({remaining} équipement(s) restant(s))",
+            f"⬇ Charger la suite ({remaining} objet(s) restant(s))",
             key="parc_load_more",
             use_container_width=True,
         ):
             st.session_state[_page_key] = current_page + 1
             st.rerun()
     else:
-        st.caption(f"✓ Tous les {nb} équipements affichés.")
+        st.caption(f"✓ Tous les {nb} objets affichés.")
 
 # ─────────────────────────────────────────────────────────────
 #  VUE 4 : JOURNAL DES ACCÈS (logs Traefik)
@@ -4123,6 +4902,20 @@ def main():
     if "loan_basket" not in st.session_state:
         st.session_state["loan_basket"] = {}
     init_db_tables()
+
+    # ── Dispatch modal différé (navigation depuis l'arbre de dépendances) ──
+    # Les dialogs Streamlit ne peuvent pas être imbriqués. Quand l'utilisateur
+    # clique "Voir →" depuis une fiche, on stocke la cible et on rerun.
+    # Ici on ouvre le bon modal AVANT de rendre la page.
+    _pm = st.session_state.pop("_pending_modal", None)
+    if _pm:
+        _etype, _eid = _pm.get("entity_type"), _pm.get("entity_id")
+        if _etype == "equipment":
+            show_equipment_modal(_eid)
+        elif _etype == "accessory":
+            show_accessory_modal(_eid)
+        elif _etype == "consumable":
+            show_consumable_modal(_eid)
 
     # ── Mode kiosque ──────────────────────────────────────────
     params = st.query_params

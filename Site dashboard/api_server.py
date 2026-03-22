@@ -279,7 +279,7 @@ def _drive_list_folder(folder_id: str) -> List[Dict]:
         while True:
             kwargs: Dict[str, Any] = {
                 "q": f"'{folder_id}' in parents and trashed = false",
-                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents)",
+                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents, webViewLink)",
                 "pageSize": 200,
                 "supportsAllDrives": True,
                 "includeItemsFromAllDrives": True,
@@ -294,6 +294,22 @@ def _drive_list_folder(folder_id: str) -> List[Dict]:
         return results
     except Exception:
         return []
+
+
+def _map_drive_file(f: Dict) -> "DriveFileInfo":
+    """Convertit un dict brut de l'API Drive en DriveFileInfo Pydantic."""
+    size_raw = f.get("size")
+    return DriveFileInfo(
+        file_id=f.get("id", ""),
+        name=f.get("name", ""),
+        mime_type=f.get("mimeType", ""),
+        size=int(size_raw) if size_raw is not None else None,
+        created_time=f.get("createdTime"),
+        modified_time=f.get("modifiedTime"),
+        parents=f.get("parents") or [],
+        web_view_link=f.get("webViewLink"),
+        is_folder=f.get("mimeType") == "application/vnd.google-apps.folder",
+    )
 
 
 def _drive_get_file_meta(file_id: str) -> Optional[Dict]:
@@ -1134,6 +1150,38 @@ class LegacyMappingResponse(BaseModel):
     derived_consumable_ids: List[str] = []
     notes: Optional[str] = None
     created_at: Optional[str] = None
+
+
+# — v4.2 Catalogue unifié ─────────────────────────────────────
+
+class CatalogItem(BaseModel):
+    entity_type: str                        # "equipment" | "accessory" | "consumable"
+    entity_id: str
+    label: str
+    brand: Optional[str] = None
+    model: Optional[str] = None             # equipment / accessory
+    reference: Optional[str] = None         # consumable
+    category: Optional[str] = None
+    subtype: Optional[str] = None           # equipment
+    condition_label: Optional[str] = None   # equipment
+    location_hint: Optional[str] = None
+    availability_status: Optional[str] = None   # equipment
+    stock_qty: Optional[float] = None           # accessory / consumable
+    stock_min_alert: Optional[float] = None     # consumable
+    stock_ok: Optional[bool] = None             # consumable
+    archived: bool = False
+    migration_status: str = "NOT_REVIEWED"
+    primary_photo_file_id: Optional[str] = None
+    photo_count: int = 0
+
+
+class CatalogListResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
+    entity_types: List[str]   # types présents dans les résultats
+    items: List[CatalogItem]
 
 
 # ─── App FastAPI ──────────────────────────────────────────────
@@ -3321,12 +3369,15 @@ def get_equipment_full(
         )
         for p in photo_rows:
             photos.append(EquipmentPhotoRef(
-                media_id=p["media_id"],
-                final_drive_file_id=p.get("final_drive_file_id"),
-                image_role=p.get("image_role", "overview"),
-                image_index=int(p.get("image_index", 0)),
-                source_drive_file_id=p.get("source_drive_file_id"),
-                notes=p.get("notes"),
+                photo_id=p["media_id"],
+                file_id=p.get("final_drive_file_id"),
+                folder_id=p.get("final_drive_folder_id"),
+                filename=p.get("filename"),
+                mime_type=p.get("mime_type"),
+                role=p.get("image_role", "overview"),
+                sort_order=int(p.get("image_index") or 0),
+                is_primary=bool(p.get("is_primary") or False),
+                web_view_link=p.get("web_view_link"),
             ))
     except Exception:
         pass  # table may not have all columns yet
@@ -3339,6 +3390,28 @@ def get_equipment_full(
         except Exception:
             ai_meta = {"raw": row["ai_metadata"]}
 
+    # technical_specs / business_context — JSON stocké en VARCHAR
+    tech_specs = None
+    if row.get("technical_specs"):
+        try:
+            tech_specs = json.loads(row["technical_specs"])
+        except Exception:
+            tech_specs = {"raw": row["technical_specs"]}
+
+    biz_ctx = None
+    if row.get("business_context"):
+        try:
+            biz_ctx = json.loads(row["business_context"])
+        except Exception:
+            biz_ctx = {"raw": row["business_context"]}
+
+    review_reasons = None
+    if row.get("review_reasons"):
+        try:
+            review_reasons = json.loads(row["review_reasons"])
+        except Exception:
+            review_reasons = [row["review_reasons"]]
+
     return EquipmentFullResponse(
         equipment_id=row["equipment_id"],
         label=row.get("label", ""),
@@ -3347,19 +3420,27 @@ def get_equipment_full(
         serial_number=row.get("serial_number"),
         category=row.get("category"),
         subtype=row.get("subtype"),
+        condition_label=row.get("condition_label"),
+        location_hint=row.get("location_hint") or row.get("location"),
+        ownership_mode=row.get("ownership_mode"),
+        purchase_price=row.get("purchase_price"),
+        purchase_currency=row.get("purchase_currency"),
         status=row.get("status"),
-        location=row.get("location"),
-        purchase_date=str(row["purchase_date"]) if row.get("purchase_date") else None,
-        drive_file_id=row.get("drive_file_id"),
         notes=row.get("notes"),
+        technical_specs=tech_specs,
+        business_context=biz_ctx,
         ai_metadata=ai_meta,
+        review_required=bool(row.get("review_required") or False),
+        review_reasons=review_reasons,
         archived=bool(row.get("archived", False)),
         migration_status=row.get("migration_status", "NOT_REVIEWED"),
         legacy_source_id=row.get("legacy_source_id"),
         migrated_at=str(row["migrated_at"]) if row.get("migrated_at") else None,
         migrated_by=row.get("migrated_by"),
         classification_confidence=row.get("classification_confidence"),
+        photo_count=len(photos),
         photos=photos,
+        drive_folder_id=row.get("final_drive_folder_id") or row.get("drive_folder_id"),
         created_at=str(row["created_at"]) if row.get("created_at") else None,
         updated_at=str(row["updated_at"]) if row.get("updated_at") else None,
     )
@@ -3629,12 +3710,15 @@ def get_equipment_photos(
     )
     photos = [
         EquipmentPhotoRef(
-            media_id=p["media_id"],
-            final_drive_file_id=p.get("final_drive_file_id"),
-            image_role=p.get("image_role", "overview"),
-            image_index=int(p.get("image_index", 0)),
-            source_drive_file_id=p.get("source_drive_file_id"),
-            notes=p.get("notes"),
+            photo_id=p["media_id"],
+            file_id=p.get("final_drive_file_id"),
+            folder_id=p.get("final_drive_folder_id"),
+            filename=p.get("filename"),
+            mime_type=p.get("mime_type"),
+            role=p.get("image_role", "overview"),
+            sort_order=int(p.get("image_index") or 0),
+            is_primary=bool(p.get("is_primary") or False),
+            web_view_link=p.get("web_view_link"),
         )
         for p in photo_rows
     ]
@@ -3654,23 +3738,30 @@ def put_equipment_photos(
     try:
         _run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
         for i, photo in enumerate(body.photos):
-            media_id = photo.media_id or str(uuid.uuid4())
+            media_id = str(uuid.uuid4())
             _run_write(
                 """INSERT INTO equipment_media
-                   (media_id, equipment_id, final_drive_file_id, image_role, image_index, source_drive_file_id, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   (media_id, equipment_id, final_drive_file_id, final_drive_folder_id,
+                    filename, mime_type, image_role, image_index, is_primary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (media_id) DO UPDATE SET
                        final_drive_file_id = EXCLUDED.final_drive_file_id,
+                       final_drive_folder_id = EXCLUDED.final_drive_folder_id,
+                       filename = EXCLUDED.filename,
+                       mime_type = EXCLUDED.mime_type,
                        image_role = EXCLUDED.image_role,
-                       image_index = EXCLUDED.image_index""",
+                       image_index = EXCLUDED.image_index,
+                       is_primary = EXCLUDED.is_primary""",
                 [
                     media_id,
                     equipment_id,
-                    photo.final_drive_file_id,
-                    photo.image_role or "overview",
-                    photo.image_index if photo.image_index is not None else i,
-                    photo.source_drive_file_id,
-                    photo.notes,
+                    photo.file_id,
+                    photo.folder_id,
+                    photo.filename,
+                    photo.mime_type,
+                    photo.role or "overview",
+                    photo.sort_order if photo.sort_order is not None else i,
+                    photo.is_primary,
                 ],
             )
     except RuntimeError as e:
@@ -3688,7 +3779,8 @@ def drive_list_folder(
 ):
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
-    files = _drive_list_folder(folder_id)
+    raw_files = _drive_list_folder(folder_id)
+    files = [_map_drive_file(f) for f in raw_files]
     return DriveFolderContents(folder_id=folder_id, files=files, count=len(files))
 
 
@@ -4173,6 +4265,297 @@ def admin_duplicates(
     groups.extend(_detect_duplicates(con_rows, "consumable", "consumable_id"))
 
     return DuplicatesResponse(count=len(groups), groups=groups)
+
+
+# ─── v4.2 : Catalogue unifié multi-types ─────────────────────
+
+# Requête UNION ALL pour agréger les 3 types d'entités
+_CATALOG_UNION_SQL = """
+    SELECT
+        'equipment'                      AS entity_type,
+        e.equipment_id                   AS entity_id,
+        e.label,
+        e.brand,
+        e.model,
+        CAST(NULL AS VARCHAR)            AS reference,
+        e.category,
+        e.subtype,
+        e.condition_label,
+        e.location_hint,
+        e.status                         AS availability_status,
+        CAST(NULL AS DOUBLE)             AS stock_qty,
+        CAST(NULL AS DOUBLE)             AS stock_min_alert,
+        COALESCE(e.archived, FALSE)      AS archived,
+        COALESCE(e.migration_status, 'NOT_REVIEWED') AS migration_status,
+        (SELECT em.final_drive_file_id
+         FROM equipment_media em
+         WHERE em.equipment_id = e.equipment_id
+         ORDER BY CASE em.image_role
+             WHEN 'overview'  THEN 1
+             WHEN 'nameplate' THEN 2
+             ELSE 3
+         END LIMIT 1)                    AS primary_photo_file_id,
+        (SELECT COUNT(*)
+         FROM equipment_media em
+         WHERE em.equipment_id = e.equipment_id) AS photo_count
+    FROM equipment e
+
+    UNION ALL
+
+    SELECT
+        'accessory'                      AS entity_type,
+        a.accessory_id                   AS entity_id,
+        a.label,
+        a.brand,
+        a.model,
+        CAST(NULL AS VARCHAR)            AS reference,
+        a.category,
+        CAST(NULL AS VARCHAR)            AS subtype,
+        CAST(NULL AS VARCHAR)            AS condition_label,
+        a.location_hint,
+        CAST(NULL AS VARCHAR)            AS availability_status,
+        CAST(a.stock_qty AS DOUBLE)      AS stock_qty,
+        CAST(NULL AS DOUBLE)             AS stock_min_alert,
+        COALESCE(a.archived, FALSE)      AS archived,
+        COALESCE(a.migration_status, 'NOT_REVIEWED') AS migration_status,
+        a.drive_file_id                  AS primary_photo_file_id,
+        CASE WHEN a.drive_file_id IS NOT NULL THEN 1 ELSE 0 END AS photo_count
+    FROM accessories a
+
+    UNION ALL
+
+    SELECT
+        'consumable'                     AS entity_type,
+        c.consumable_id                  AS entity_id,
+        c.label,
+        c.brand,
+        CAST(NULL AS VARCHAR)            AS model,
+        c.reference,
+        c.category,
+        CAST(NULL AS VARCHAR)            AS subtype,
+        CAST(NULL AS VARCHAR)            AS condition_label,
+        c.location_hint,
+        CAST(NULL AS VARCHAR)            AS availability_status,
+        c.stock_qty,
+        c.stock_min_alert,
+        COALESCE(c.archived, FALSE)      AS archived,
+        COALESCE(c.migration_status, 'NOT_REVIEWED') AS migration_status,
+        c.drive_file_id                  AS primary_photo_file_id,
+        CASE WHEN c.drive_file_id IS NOT NULL THEN 1 ELSE 0 END AS photo_count
+    FROM consumables c
+"""
+
+
+@app.get(
+    "/api/catalog",
+    tags=["v4.2 Catalogue"],
+    summary="Catalogue unifié : équipements + accessoires + consommables",
+)
+def get_catalog(
+    q: Optional[str] = None,
+    entity_type: Optional[str] = None,   # "equipment" | "accessory" | "consumable"
+    category: Optional[str] = None,
+    brand: Optional[str] = None,
+    archived: Optional[bool] = None,
+    migration_status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    _: None = Security(_require_token),
+) -> CatalogListResponse:
+    """
+    Retourne toutes les entités de premier rang dans un payload harmonisé.
+    Supporte les mêmes filtres que les endpoints individuels, plus `entity_type`.
+    """
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    # Archivage — par défaut on masque les archivés
+    if archived:
+        conditions.append("archived = TRUE")
+    else:
+        conditions.append("(archived IS NULL OR archived = FALSE)")
+
+    if entity_type:
+        conditions.append("entity_type = ?")
+        params.append(entity_type)
+
+    if q:
+        like = f"%{q.lower()}%"
+        conditions.append(
+            "(LOWER(label) LIKE ? OR LOWER(brand) LIKE ? OR LOWER(model) LIKE ?"
+            " OR LOWER(reference) LIKE ? OR LOWER(category) LIKE ?)"
+        )
+        params += [like, like, like, like, like]
+
+    if category:
+        conditions.append("LOWER(category) = ?")
+        params.append(category.lower())
+
+    if brand:
+        conditions.append("LOWER(brand) = ?")
+        params.append(brand.lower())
+
+    if migration_status:
+        conditions.append("migration_status = ?")
+        params.append(migration_status)
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    offset = (page - 1) * page_size
+
+    try:
+        count_rows = _rows(
+            f"SELECT COUNT(*) AS cnt FROM ({_CATALOG_UNION_SQL}) catalog {where}",
+            params,
+        )
+        total = int(count_rows[0]["cnt"]) if count_rows else 0
+
+        item_rows = _rows(
+            f"""SELECT * FROM ({_CATALOG_UNION_SQL}) catalog
+                {where}
+                ORDER BY label
+                LIMIT ? OFFSET ?""",
+            params + [page_size, offset],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    items: List[CatalogItem] = []
+    for r in item_rows:
+        sq = r.get("stock_qty")
+        sm = r.get("stock_min_alert")
+        stock_ok = (float(sq) >= float(sm)) if (sq is not None and sm is not None) else None
+        items.append(CatalogItem(
+            entity_type=r["entity_type"],
+            entity_id=r["entity_id"],
+            label=r.get("label", ""),
+            brand=r.get("brand"),
+            model=r.get("model"),
+            reference=r.get("reference"),
+            category=r.get("category"),
+            subtype=r.get("subtype"),
+            condition_label=r.get("condition_label"),
+            location_hint=r.get("location_hint"),
+            availability_status=r.get("availability_status"),
+            stock_qty=float(sq) if sq is not None else None,
+            stock_min_alert=float(sm) if sm is not None else None,
+            stock_ok=stock_ok,
+            archived=bool(r.get("archived", False)),
+            migration_status=r.get("migration_status", "NOT_REVIEWED"),
+            primary_photo_file_id=r.get("primary_photo_file_id"),
+            photo_count=int(r.get("photo_count") or 0),
+        ))
+
+    entity_types_present = sorted({i.entity_type for i in items})
+    return CatalogListResponse(
+        total=total,
+        page=page,
+        page_size=page_size,
+        has_more=(offset + page_size) < total,
+        entity_types=entity_types_present,
+        items=items,
+    )
+
+
+# ─── v4.2 : Photos accessoires & consommables ─────────────────
+
+@app.get(
+    "/api/accessories/{accessory_id}/photos",
+    tags=["v4.2 Catalogue"],
+    summary="Photos d'un accessoire",
+)
+def get_accessory_photos(
+    accessory_id: str,
+    _: None = Security(_require_token),
+) -> PhotoListResponse:
+    """Retourne la photo principale d'un accessoire (stockée dans drive_file_id)."""
+    rows = _rows("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+    row = rows[0]
+    photos: List[EquipmentPhotoRef] = []
+    if row.get("drive_file_id"):
+        photos.append(EquipmentPhotoRef(
+            photo_id=f"{accessory_id}_primary",
+            file_id=row["drive_file_id"],
+            role="overview",
+            sort_order=0,
+            is_primary=True,
+        ))
+    return PhotoListResponse(equipment_id=accessory_id, photos=photos, count=len(photos))
+
+
+@app.put(
+    "/api/accessories/{accessory_id}/photos",
+    tags=["v4.2 Catalogue"],
+    summary="Définir la photo d'un accessoire",
+)
+def put_accessory_photos(
+    accessory_id: str,
+    body: PhotoUpdateRequest,
+    _: None = Security(_require_token),
+):
+    """Met à jour la photo principale d'un accessoire via drive_file_id."""
+    if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+    primary_file_id = body.photos[0].file_id if body.photos else None
+    try:
+        _run_write(
+            "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
+            [primary_file_id, datetime.utcnow().isoformat(), accessory_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "accessory_id": accessory_id, "photos_count": len(body.photos)}
+
+
+@app.get(
+    "/api/consumables/{consumable_id}/photos",
+    tags=["v4.2 Catalogue"],
+    summary="Photos d'un consommable",
+)
+def get_consumable_photos(
+    consumable_id: str,
+    _: None = Security(_require_token),
+) -> PhotoListResponse:
+    """Retourne la photo principale d'un consommable (stockée dans drive_file_id)."""
+    rows = _rows("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+    row = rows[0]
+    photos: List[EquipmentPhotoRef] = []
+    if row.get("drive_file_id"):
+        photos.append(EquipmentPhotoRef(
+            photo_id=f"{consumable_id}_primary",
+            file_id=row["drive_file_id"],
+            role="overview",
+            sort_order=0,
+            is_primary=True,
+        ))
+    return PhotoListResponse(equipment_id=consumable_id, photos=photos, count=len(photos))
+
+
+@app.put(
+    "/api/consumables/{consumable_id}/photos",
+    tags=["v4.2 Catalogue"],
+    summary="Définir la photo d'un consommable",
+)
+def put_consumable_photos(
+    consumable_id: str,
+    body: PhotoUpdateRequest,
+    _: None = Security(_require_token),
+):
+    """Met à jour la photo principale d'un consommable via drive_file_id."""
+    if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+    primary_file_id = body.photos[0].file_id if body.photos else None
+    try:
+        _run_write(
+            "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
+            [primary_file_id, datetime.utcnow().isoformat(), consumable_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "consumable_id": consumable_id, "photos_count": len(body.photos)}
 
 
 # ─── Health check (sans auth) ─────────────────────────────────
