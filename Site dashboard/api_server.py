@@ -3208,10 +3208,9 @@ def list_equipment(
     migration_status: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Liste tous les équipements avec filtres optionnels et pagination."""
-    _require_token(_creds)
     conditions = []
     params: List[Any] = []
 
@@ -3277,10 +3276,9 @@ def _coerce_equipment_summary(row: dict) -> dict:
 @app.get("/api/equipment/{equipment_id}", tags=["v4.1 Équipement"], summary="Fiche complète équipement")
 def get_equipment_full(
     equipment_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Retourne la fiche complète d'un équipement : métadonnées, photos, gouvernance."""
-    _require_token(_creds)
     rows = _rows("SELECT * FROM equipment WHERE equipment_id = ?", [equipment_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
@@ -3343,10 +3341,9 @@ def get_equipment_full(
 def patch_equipment(
     equipment_id: str,
     body: EquipmentUpdateRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Met à jour les champs fournis (PATCH sémantique — seuls les champs non-null sont modifiés)."""
-    _require_token(_creds)
     if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
@@ -3373,10 +3370,9 @@ def patch_equipment(
 @app.post("/api/equipment/{equipment_id}/archive", tags=["v4.1 Équipement"], summary="Archiver un équipement")
 def archive_equipment(
     equipment_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Soft-delete : marque archived=TRUE et migration_status=ARCHIVED."""
-    _require_token(_creds)
     if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
     try:
@@ -3392,10 +3388,9 @@ def archive_equipment(
 @app.post("/api/equipment/{equipment_id}/unarchive", tags=["v4.1 Équipement"], summary="Désarchiver un équipement")
 def unarchive_equipment(
     equipment_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Restaure un équipement archivé (archived=FALSE, migration_status=REVIEWED)."""
-    _require_token(_creds)
     if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
     try:
@@ -3413,9 +3408,8 @@ def unarchive_equipment(
 @app.get("/api/accessories/{accessory_id}", tags=["v4.1 Accessoires"], summary="Fiche complète accessoire")
 def get_accessory_full(
     accessory_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     rows = _rows("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
@@ -3450,9 +3444,8 @@ def get_accessory_full(
 def patch_accessory(
     accessory_id: str,
     body: AccessoryUpdateRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
 
@@ -3480,10 +3473,9 @@ def patch_accessory(
 def delete_accessory(
     accessory_id: str,
     hard: bool = False,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
-    _require_token(_creds)
     if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
     try:
@@ -3506,9 +3498,8 @@ def delete_accessory(
 @app.get("/api/consumables/{consumable_id}", tags=["v4.1 Consommables"], summary="Fiche complète consommable")
 def get_consumable_full(
     consumable_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     rows = _rows("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
@@ -3545,9 +3536,8 @@ def get_consumable_full(
 def patch_consumable(
     consumable_id: str,
     body: ConsumableUpdateRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
 
@@ -3575,10 +3565,9 @@ def patch_consumable(
 def delete_consumable(
     consumable_id: str,
     hard: bool = False,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
-    _require_token(_creds)
     if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
     try:
@@ -3601,9 +3590,8 @@ def delete_consumable(
 @app.get("/api/equipment/{equipment_id}/photos", tags=["v4.1 Photos"], summary="Lister les photos d'un équipement")
 def get_equipment_photos(
     equipment_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
@@ -3629,10 +3617,9 @@ def get_equipment_photos(
 def put_equipment_photos(
     equipment_id: str,
     body: PhotoUpdateRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Remplace entièrement la liste de photos d'un équipement."""
-    _require_token(_creds)
     if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
@@ -3669,9 +3656,8 @@ def put_equipment_photos(
 @app.get("/api/drive/folder/{folder_id}", tags=["v4.1 Drive"], summary="Lister le contenu d'un dossier Drive")
 def drive_list_folder(
     folder_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     files = _drive_list_folder(folder_id)
@@ -3681,9 +3667,8 @@ def drive_list_folder(
 @app.get("/api/drive/files/{file_id}", tags=["v4.1 Drive"], summary="Métadonnées d'un fichier Drive")
 def drive_get_file(
     file_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     meta = _drive_get_file_meta(file_id)
@@ -3695,9 +3680,8 @@ def drive_get_file(
 @app.post("/api/drive/folder", tags=["v4.1 Drive"], summary="Créer un dossier Drive")
 def drive_create_folder(
     body: DriveCreateFolderRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     folder_id = _drive_create_folder(body.name, body.parent_id)
@@ -3710,9 +3694,8 @@ def drive_create_folder(
 def drive_move_file(
     file_id: str,
     body: DriveMoveRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     ok = _drive_move_file(file_id, body.new_parent_id)
@@ -3725,9 +3708,8 @@ def drive_move_file(
 def drive_copy_file(
     file_id: str,
     body: DriveCopyRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     new_id = _drive_copy_file(file_id, body.new_parent_id, body.new_name)
@@ -3740,9 +3722,8 @@ def drive_copy_file(
 def drive_rename_file(
     file_id: str,
     body: DriveRenameRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
     ok = _drive_rename_file(file_id, body.new_name)
@@ -3756,10 +3737,9 @@ def drive_rename_file(
 @app.post("/api/media/reassign", tags=["v4.1 Photos"], summary="Réassigner une photo vers une autre entité")
 def media_reassign(
     body: MediaReassignRequest,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Déplace ou copie une photo entre entités. Supporte equipment→equipment, equipment→accessory, equipment→consumable."""
-    _require_token(_creds)
 
     # Vérifier la photo source
     src_rows = _rows(
@@ -3818,7 +3798,7 @@ def media_reassign(
 def reclassify_equipment(
     body: ReclassifyRequest,
     dry_run: bool = False,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """
     Opération de migration atomique. Avec ?dry_run=true retourne un plan sans modifier la base.
@@ -3827,7 +3807,6 @@ def reclassify_equipment(
       - reclassify_as_accessory : transforme l'équipement en accessoire
       - reclassify_as_consumable : transforme l'équipement en consommable
     """
-    _require_token(_creds)
 
     # Vérifier la source
     src_rows = _rows("SELECT * FROM equipment WHERE equipment_id = ?", [body.source_equipment_id])
@@ -4006,9 +3985,8 @@ def get_migration_logs(
     operation: Optional[str] = None,
     source_entity_id: Optional[str] = None,
     limit: int = 100,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     conditions = []
     params: List[Any] = []
     if operator:
@@ -4058,9 +4036,8 @@ def get_migration_logs(
 )
 def get_legacy_mapping(
     equipment_id: str,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
-    _require_token(_creds)
     rows = _rows(
         "SELECT * FROM legacy_mappings WHERE legacy_equipment_id = ?",
         [equipment_id],
@@ -4086,10 +4063,9 @@ def get_legacy_mapping(
 @app.get("/api/admin/export", tags=["v4.1 Admin"], summary="Export bulk de tout l'inventaire")
 def admin_export(
     include_archived: bool = False,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Exporte l'intégralité de l'inventaire (équipements, accessoires, consommables, liens)."""
-    _require_token(_creds)
     arch_filter = "" if include_archived else "WHERE (archived IS NULL OR archived = FALSE)"
 
     equipment = _rows(f"SELECT * FROM equipment {arch_filter} ORDER BY label")
@@ -4129,10 +4105,9 @@ def admin_export(
 @app.get("/api/admin/duplicates", tags=["v4.1 Admin"], summary="Détection de doublons potentiels")
 def admin_duplicates(
     threshold: float = 0.85,
-    _creds: HTTPAuthorizationCredentials = Security(_bearer),
+    _: None = Security(_require_token),
 ):
     """Détecte les doublons potentiels en comparant label+brand+model par type d'entité."""
-    _require_token(_creds)
 
     def _detect_duplicates(rows: List[dict], entity_type: str, id_col: str) -> List[DuplicateGroup]:
         groups: List[DuplicateGroup] = []
