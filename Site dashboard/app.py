@@ -479,6 +479,65 @@ def init_db_tables() -> None:
         )
     """)
 
+    # ── v4.1 Gouvernance — colonnes sur equipment ──────────────
+    for col_sql in [
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMP",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS migrated_by VARCHAR",
+        "ALTER TABLE equipment ADD COLUMN IF NOT EXISTS classification_confidence DOUBLE",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Gouvernance — colonnes sur accessories ────────────
+    for col_sql in [
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE accessories ADD COLUMN IF NOT EXISTS ai_metadata VARCHAR",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Gouvernance — colonnes sur consumables ────────────
+    for col_sql in [
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS migration_status VARCHAR DEFAULT 'NOT_REVIEWED'",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS legacy_source_id VARCHAR",
+        "ALTER TABLE consumables ADD COLUMN IF NOT EXISTS ai_metadata VARCHAR",
+    ]:
+        run_write(col_sql)
+
+    # ── v4.1 Tables de traçabilité migration ──────────────────
+    run_write("""
+        CREATE TABLE IF NOT EXISTS legacy_mappings (
+            mapping_id              VARCHAR PRIMARY KEY,
+            legacy_equipment_id     VARCHAR NOT NULL,
+            canonical_equipment_id  VARCHAR,
+            derived_accessory_ids   VARCHAR,
+            derived_consumable_ids  VARCHAR,
+            notes                   VARCHAR,
+            created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (legacy_equipment_id)
+        )
+    """)
+
+    run_write("""
+        CREATE TABLE IF NOT EXISTS migration_logs (
+            log_id              VARCHAR PRIMARY KEY,
+            operation           VARCHAR NOT NULL,
+            operator            VARCHAR NOT NULL DEFAULT 'openclaw',
+            source_entity_type  VARCHAR,
+            source_entity_id    VARCHAR,
+            target_entities     VARCHAR,
+            details             VARCHAR,
+            dry_run             BOOLEAN DEFAULT FALSE,
+            status              VARCHAR DEFAULT 'COMPLETED',
+            error_message       VARCHAR,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 def safe_json(value, default=None):
     """Parse une colonne JSON stockée en VARCHAR. Retourne default si NULL ou invalide."""

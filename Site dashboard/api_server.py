@@ -139,6 +139,12 @@ def _run_query(sql: str, params=None) -> pd.DataFrame:
         raise RuntimeError(f"Lecture DuckDB : {e}") from e
 
 
+def _rows(sql: str, params=None) -> List[dict]:
+    """Variante de _run_query qui retourne une liste de dict — compatible avec les patterns v4.1."""
+    df = _run_query(sql, params)
+    return df.to_dict(orient="records")
+
+
 def _run_write(sql: str, params=None, _retries: int = 5) -> None:
     delay = 2
     last_err = None
@@ -3235,14 +3241,13 @@ def list_equipment(
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     offset = (page - 1) * page_size
 
-    count_rows = _run_query(f"SELECT COUNT(*) as cnt FROM equipment {where}", params)
+    count_rows = _rows(f"SELECT COUNT(*) as cnt FROM equipment {where}", params)
     total = int(count_rows[0]["cnt"]) if count_rows else 0
 
-    rows = _run_query(
+    items = _rows(
         f"SELECT * FROM equipment {where} ORDER BY label LIMIT ? OFFSET ?",
         params + [page_size, offset],
     )
-    items = [dict(r) for r in rows]
     return EquipmentListResponse(
         total=total,
         page=page,
@@ -3276,15 +3281,15 @@ def get_equipment_full(
 ):
     """Retourne la fiche complète d'un équipement : métadonnées, photos, gouvernance."""
     _require_token(_creds)
-    rows = _run_query("SELECT * FROM equipment WHERE equipment_id = ?", [equipment_id])
+    rows = _rows("SELECT * FROM equipment WHERE equipment_id = ?", [equipment_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
-    row = dict(rows[0])
+    row = rows[0]
 
     # Photos
     photos: List[EquipmentPhotoRef] = []
     try:
-        photo_rows = _run_query(
+        photo_rows = _rows(
             "SELECT * FROM equipment_media WHERE equipment_id = ? ORDER BY image_index",
             [equipment_id],
         )
@@ -3342,8 +3347,7 @@ def patch_equipment(
 ):
     """Met à jour les champs fournis (PATCH sémantique — seuls les champs non-null sont modifiés)."""
     _require_token(_creds)
-    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
-    if not rows:
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
     updates: Dict[str, Any] = {}
@@ -3373,8 +3377,7 @@ def archive_equipment(
 ):
     """Soft-delete : marque archived=TRUE et migration_status=ARCHIVED."""
     _require_token(_creds)
-    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
-    if not rows:
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
     try:
         _run_write(
@@ -3393,8 +3396,7 @@ def unarchive_equipment(
 ):
     """Restaure un équipement archivé (archived=FALSE, migration_status=REVIEWED)."""
     _require_token(_creds)
-    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
-    if not rows:
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
     try:
         _run_write(
@@ -3414,10 +3416,10 @@ def get_accessory_full(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
+    rows = _rows("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
-    row = dict(rows[0])
+    row = rows[0]
     ai_meta = None
     if row.get("ai_metadata"):
         try:
@@ -3451,8 +3453,7 @@ def patch_accessory(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id])
-    if not rows:
+    if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
 
     updates: Dict[str, Any] = {}
@@ -3483,8 +3484,7 @@ def delete_accessory(
 ):
     """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
     _require_token(_creds)
-    rows = _run_query("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id])
-    if not rows:
+    if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
     try:
         if hard:
@@ -3509,10 +3509,10 @@ def get_consumable_full(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
+    rows = _rows("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
     if not rows:
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
-    row = dict(rows[0])
+    row = rows[0]
     ai_meta = None
     if row.get("ai_metadata"):
         try:
@@ -3548,8 +3548,7 @@ def patch_consumable(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id])
-    if not rows:
+    if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
 
     updates: Dict[str, Any] = {}
@@ -3580,8 +3579,7 @@ def delete_consumable(
 ):
     """Par défaut : soft-delete (archived=TRUE). hard=true pour suppression physique."""
     _require_token(_creds)
-    rows = _run_query("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id])
-    if not rows:
+    if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
     try:
         if hard:
@@ -3606,11 +3604,10 @@ def get_equipment_photos(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
-    if not rows:
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
-    photo_rows = _run_query(
+    photo_rows = _rows(
         "SELECT * FROM equipment_media WHERE equipment_id = ? ORDER BY image_index",
         [equipment_id],
     )
@@ -3636,8 +3633,7 @@ def put_equipment_photos(
 ):
     """Remplace entièrement la liste de photos d'un équipement."""
     _require_token(_creds)
-    rows = _run_query("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id])
-    if not rows:
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
 
     try:
@@ -3766,14 +3762,14 @@ def media_reassign(
     _require_token(_creds)
 
     # Vérifier la photo source
-    src_rows = _run_query(
+    src_rows = _rows(
         "SELECT * FROM equipment_media WHERE media_id = ? AND equipment_id = ?",
         [body.photo_id, body.source_entity_id],
     )
     if not src_rows:
         raise HTTPException(status_code=404, detail=f"Photo {body.photo_id} introuvable sur {body.source_entity_id}.")
 
-    src = dict(src_rows[0])
+    src = src_rows[0]
     final_file_id = src.get("final_drive_file_id")
     new_file_id = final_file_id
 
@@ -3834,10 +3830,10 @@ def reclassify_equipment(
     _require_token(_creds)
 
     # Vérifier la source
-    src_rows = _run_query("SELECT * FROM equipment WHERE equipment_id = ?", [body.source_equipment_id])
+    src_rows = _rows("SELECT * FROM equipment WHERE equipment_id = ?", [body.source_equipment_id])
     if not src_rows:
         raise HTTPException(status_code=404, detail=f"Équipement source {body.source_equipment_id} introuvable.")
-    src = dict(src_rows[0])
+    src = src_rows[0]
 
     plan = ReclassifyPlan(
         source_equipment_id=body.source_equipment_id,
@@ -4025,13 +4021,12 @@ def get_migration_logs(
         conditions.append("source_entity_id = ?")
         params.append(source_entity_id)
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    rows = _run_query(
+    rows = _rows(
         f"SELECT * FROM migration_logs {where} ORDER BY created_at DESC LIMIT ?",
         params + [limit],
     )
     logs = []
-    for r in rows:
-        entry = dict(r)
+    for entry in rows:
         try:
             entry["target_entities"] = json.loads(entry["target_entities"]) if entry.get("target_entities") else None
         except Exception:
@@ -4066,13 +4061,13 @@ def get_legacy_mapping(
     _creds: HTTPAuthorizationCredentials = Security(_bearer),
 ):
     _require_token(_creds)
-    rows = _run_query(
+    rows = _rows(
         "SELECT * FROM legacy_mappings WHERE legacy_equipment_id = ?",
         [equipment_id],
     )
     if not rows:
         raise HTTPException(status_code=404, detail=f"Aucun mapping legacy pour {equipment_id}.")
-    row = dict(rows[0])
+    row = rows[0]
     derived_acc = json.loads(row["derived_accessory_ids"]) if row.get("derived_accessory_ids") else []
     derived_con = json.loads(row["derived_consumable_ids"]) if row.get("derived_consumable_ids") else []
     return LegacyMappingResponse(
@@ -4097,11 +4092,11 @@ def admin_export(
     _require_token(_creds)
     arch_filter = "" if include_archived else "WHERE (archived IS NULL OR archived = FALSE)"
 
-    equipment = [dict(r) for r in _run_query(f"SELECT * FROM equipment {arch_filter} ORDER BY label")]
-    accessories = [dict(r) for r in _run_query(f"SELECT * FROM accessories {arch_filter} ORDER BY label")]
-    consumables = [dict(r) for r in _run_query(f"SELECT * FROM consumables {arch_filter} ORDER BY label")]
-    links_compat = [dict(r) for r in _run_query("SELECT * FROM links_compatibility ORDER BY created_at")]
-    links_cons = [dict(r) for r in _run_query("SELECT * FROM links_consumables ORDER BY created_at")]
+    equipment = _rows(f"SELECT * FROM equipment {arch_filter} ORDER BY label")
+    accessories = _rows(f"SELECT * FROM accessories {arch_filter} ORDER BY label")
+    consumables = _rows(f"SELECT * FROM consumables {arch_filter} ORDER BY label")
+    links_compat = _rows("SELECT * FROM links_compatibility ORDER BY created_at")
+    links_cons = _rows("SELECT * FROM links_consumables ORDER BY created_at")
 
     # Convertir les timestamps en strings pour la sérialisation JSON
     def _serialize(rows: List[dict]) -> List[dict]:
@@ -4169,15 +4164,15 @@ def admin_duplicates(
                 ))
         return groups
 
-    eq_rows = [dict(r) for r in _run_query(
+    eq_rows = _rows(
         "SELECT equipment_id, label, brand, model FROM equipment WHERE (archived IS NULL OR archived = FALSE)"
-    )]
-    acc_rows = [dict(r) for r in _run_query(
+    )
+    acc_rows = _rows(
         "SELECT accessory_id, label, brand, model FROM accessories WHERE (archived IS NULL OR archived = FALSE)"
-    )]
-    con_rows = [dict(r) for r in _run_query(
+    )
+    con_rows = _rows(
         "SELECT consumable_id, label, brand FROM consumables WHERE (archived IS NULL OR archived = FALSE)"
-    )]
+    )
 
     groups: List[DuplicateGroup] = []
     groups.extend(_detect_duplicates(eq_rows, "equipment", "equipment_id"))
