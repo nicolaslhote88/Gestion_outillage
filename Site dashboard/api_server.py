@@ -279,7 +279,7 @@ def _drive_list_folder(folder_id: str) -> List[Dict]:
         while True:
             kwargs: Dict[str, Any] = {
                 "q": f"'{folder_id}' in parents and trashed = false",
-                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents)",
+                "fields": "nextPageToken, files(id, name, mimeType, size, createdTime, modifiedTime, parents, webViewLink)",
                 "pageSize": 200,
                 "supportsAllDrives": True,
                 "includeItemsFromAllDrives": True,
@@ -294,6 +294,22 @@ def _drive_list_folder(folder_id: str) -> List[Dict]:
         return results
     except Exception:
         return []
+
+
+def _map_drive_file(f: Dict) -> "DriveFileInfo":
+    """Convertit un dict brut de l'API Drive en DriveFileInfo Pydantic."""
+    size_raw = f.get("size")
+    return DriveFileInfo(
+        file_id=f.get("id", ""),
+        name=f.get("name", ""),
+        mime_type=f.get("mimeType", ""),
+        size=int(size_raw) if size_raw is not None else None,
+        created_time=f.get("createdTime"),
+        modified_time=f.get("modifiedTime"),
+        parents=f.get("parents") or [],
+        web_view_link=f.get("webViewLink"),
+        is_folder=f.get("mimeType") == "application/vnd.google-apps.folder",
+    )
 
 
 def _drive_get_file_meta(file_id: str) -> Optional[Dict]:
@@ -3321,12 +3337,15 @@ def get_equipment_full(
         )
         for p in photo_rows:
             photos.append(EquipmentPhotoRef(
-                media_id=p["media_id"],
-                final_drive_file_id=p.get("final_drive_file_id"),
-                image_role=p.get("image_role", "overview"),
-                image_index=int(p.get("image_index", 0)),
-                source_drive_file_id=p.get("source_drive_file_id"),
-                notes=p.get("notes"),
+                photo_id=p["media_id"],
+                file_id=p.get("final_drive_file_id"),
+                folder_id=p.get("final_drive_folder_id"),
+                filename=p.get("filename"),
+                mime_type=p.get("mime_type"),
+                role=p.get("image_role", "overview"),
+                sort_order=int(p.get("image_index") or 0),
+                is_primary=bool(p.get("is_primary") or False),
+                web_view_link=p.get("web_view_link"),
             ))
     except Exception:
         pass  # table may not have all columns yet
@@ -3339,6 +3358,28 @@ def get_equipment_full(
         except Exception:
             ai_meta = {"raw": row["ai_metadata"]}
 
+    # technical_specs / business_context — JSON stocké en VARCHAR
+    tech_specs = None
+    if row.get("technical_specs"):
+        try:
+            tech_specs = json.loads(row["technical_specs"])
+        except Exception:
+            tech_specs = {"raw": row["technical_specs"]}
+
+    biz_ctx = None
+    if row.get("business_context"):
+        try:
+            biz_ctx = json.loads(row["business_context"])
+        except Exception:
+            biz_ctx = {"raw": row["business_context"]}
+
+    review_reasons = None
+    if row.get("review_reasons"):
+        try:
+            review_reasons = json.loads(row["review_reasons"])
+        except Exception:
+            review_reasons = [row["review_reasons"]]
+
     return EquipmentFullResponse(
         equipment_id=row["equipment_id"],
         label=row.get("label", ""),
@@ -3347,19 +3388,27 @@ def get_equipment_full(
         serial_number=row.get("serial_number"),
         category=row.get("category"),
         subtype=row.get("subtype"),
+        condition_label=row.get("condition_label"),
+        location_hint=row.get("location_hint") or row.get("location"),
+        ownership_mode=row.get("ownership_mode"),
+        purchase_price=row.get("purchase_price"),
+        purchase_currency=row.get("purchase_currency"),
         status=row.get("status"),
-        location=row.get("location"),
-        purchase_date=str(row["purchase_date"]) if row.get("purchase_date") else None,
-        drive_file_id=row.get("drive_file_id"),
         notes=row.get("notes"),
+        technical_specs=tech_specs,
+        business_context=biz_ctx,
         ai_metadata=ai_meta,
+        review_required=bool(row.get("review_required") or False),
+        review_reasons=review_reasons,
         archived=bool(row.get("archived", False)),
         migration_status=row.get("migration_status", "NOT_REVIEWED"),
         legacy_source_id=row.get("legacy_source_id"),
         migrated_at=str(row["migrated_at"]) if row.get("migrated_at") else None,
         migrated_by=row.get("migrated_by"),
         classification_confidence=row.get("classification_confidence"),
+        photo_count=len(photos),
         photos=photos,
+        drive_folder_id=row.get("final_drive_folder_id") or row.get("drive_folder_id"),
         created_at=str(row["created_at"]) if row.get("created_at") else None,
         updated_at=str(row["updated_at"]) if row.get("updated_at") else None,
     )
@@ -3629,12 +3678,15 @@ def get_equipment_photos(
     )
     photos = [
         EquipmentPhotoRef(
-            media_id=p["media_id"],
-            final_drive_file_id=p.get("final_drive_file_id"),
-            image_role=p.get("image_role", "overview"),
-            image_index=int(p.get("image_index", 0)),
-            source_drive_file_id=p.get("source_drive_file_id"),
-            notes=p.get("notes"),
+            photo_id=p["media_id"],
+            file_id=p.get("final_drive_file_id"),
+            folder_id=p.get("final_drive_folder_id"),
+            filename=p.get("filename"),
+            mime_type=p.get("mime_type"),
+            role=p.get("image_role", "overview"),
+            sort_order=int(p.get("image_index") or 0),
+            is_primary=bool(p.get("is_primary") or False),
+            web_view_link=p.get("web_view_link"),
         )
         for p in photo_rows
     ]
@@ -3654,23 +3706,30 @@ def put_equipment_photos(
     try:
         _run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
         for i, photo in enumerate(body.photos):
-            media_id = photo.media_id or str(uuid.uuid4())
+            media_id = str(uuid.uuid4())
             _run_write(
                 """INSERT INTO equipment_media
-                   (media_id, equipment_id, final_drive_file_id, image_role, image_index, source_drive_file_id, notes)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   (media_id, equipment_id, final_drive_file_id, final_drive_folder_id,
+                    filename, mime_type, image_role, image_index, is_primary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (media_id) DO UPDATE SET
                        final_drive_file_id = EXCLUDED.final_drive_file_id,
+                       final_drive_folder_id = EXCLUDED.final_drive_folder_id,
+                       filename = EXCLUDED.filename,
+                       mime_type = EXCLUDED.mime_type,
                        image_role = EXCLUDED.image_role,
-                       image_index = EXCLUDED.image_index""",
+                       image_index = EXCLUDED.image_index,
+                       is_primary = EXCLUDED.is_primary""",
                 [
                     media_id,
                     equipment_id,
-                    photo.final_drive_file_id,
-                    photo.image_role or "overview",
-                    photo.image_index if photo.image_index is not None else i,
-                    photo.source_drive_file_id,
-                    photo.notes,
+                    photo.file_id,
+                    photo.folder_id,
+                    photo.filename,
+                    photo.mime_type,
+                    photo.role or "overview",
+                    photo.sort_order if photo.sort_order is not None else i,
+                    photo.is_primary,
                 ],
             )
     except RuntimeError as e:
@@ -3688,7 +3747,8 @@ def drive_list_folder(
 ):
     if not _DRIVE_AVAILABLE:
         raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
-    files = _drive_list_folder(folder_id)
+    raw_files = _drive_list_folder(folder_id)
+    files = [_map_drive_file(f) for f in raw_files]
     return DriveFolderContents(folder_id=folder_id, files=files, count=len(files))
 
 
