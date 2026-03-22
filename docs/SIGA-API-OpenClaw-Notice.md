@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 3.0 — Mars 2026
+**Version :** 4.0 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -10,15 +10,16 @@
 ## Vue d'ensemble
 
 L'API SIGA est l'interface entre OpenClaw et la base de données d'inventaire d'atelier.
-Elle couvre **six domaines** :
+Elle couvre **sept domaines** :
 
 | Domaine | Ce que tu peux faire |
 |---|---|
-| **Équipements** | Chercher un outil, vérifier s'il est disponible |
+| **Équipements** | Chercher un outil, vérifier s'il est disponible, consulter son écosystème complet |
 | **Mouvements** | Enregistrer les sorties et les retours d'outils |
 | **Kits** | Créer, composer, sortir et rentrer des caisses à outils |
 | **Kiosque** | Afficher un outil sur l'écran de l'atelier |
 | **Réservations** | Réserver un outil sur une plage de dates, vérifier les conflits, annuler |
+| **Relationnel v4.0** | Gérer le catalogue accessoires/consommables et leurs liaisons avec les équipements |
 | **Système** | Vérifier que l'API fonctionne |
 
 Toutes les réponses sont en JSON. Les erreurs ont toujours la forme :
@@ -524,9 +525,12 @@ POST /api/display/show
 - Titre, marque / modèle, état, catégorie
 - Spécifications techniques (grille clé/valeur)
 - Infos pratiques : N° série, emplacement, mode d'acquisition, prix d'achat
-- Accessoires livrés, consommables associés, éléments associés (si renseignés)
+- Accessoires livrés (business_context_json — rétrocompat) + **Accessoires compatibles (liaisons v4.0, avec stock)**
+- Consommables (business_context_json — rétrocompat) + **Consommables à prévoir (liaisons v4.0, avec état stock)**
 - Notes
 - Statut de disponibilité : « Disponible » ou « En cours d'utilisation (emprunteur, retour prévu) »
+
+> **v4.0** : la réponse du kiosque embarque deux nouveaux champs `accessories_rel` et `consumables_rel` issus de la base relationnelle. Chaque consommable porte le champ `stock_ok: bool` pour afficher instantanément si le stock est suffisant.
 
 ---
 
@@ -826,16 +830,332 @@ GET /api/health
 
 ---
 
+## 7. Accessoires & Consommables (v4.0)
+
+Le modèle relationnel v4.0 introduit deux catalogues indépendants — **accessoires** et **consommables** — liés aux équipements par des tables de jointure Many-to-Many. Un accessoire (ex: batterie 18V) peut être lié à 10 outils différents sans duplication. Un consommable (ex: foret SDS-Plus Ø10) peut être lié à plusieurs machines.
+
+### 7.1 Catalogue des accessoires
+```
+GET /api/accessories
+```
+**Quand l'utiliser :** « Quels accessoires tu as en stock ? », « y a-t-il des batteries disponibles ? »
+
+**Paramètre optionnel :** `q` — filtre texte libre (label, marque, modèle)
+
+**Réponse :**
+```json
+{
+  "count": 4,
+  "accessories": [
+    {
+      "accessory_id": "uuid-acc-...",
+      "label": "Batterie 18V 5Ah",
+      "brand": "Makita",
+      "model": "BL1850B",
+      "category": "Batterie",
+      "stock_qty": 3,
+      "location_hint": "Armoire chargeurs A1"
+    }
+  ]
+}
+```
+
+---
+
+### 7.2 Créer un accessoire
+```
+POST /api/accessories
+```
+**Quand l'utiliser :** L'utilisateur ajoute une nouvelle batterie, un chargeur, un adaptateur… au catalogue.
+
+**Corps :**
+```json
+{
+  "label": "Batterie 18V 5Ah",
+  "brand": "Makita",
+  "model": "BL1850B",
+  "category": "Batterie",
+  "stock_qty": 3,
+  "location_hint": "Armoire chargeurs A1",
+  "notes": "Compatible tous outils Makita LXT"
+}
+```
+
+| Champ | Obligatoire | Description |
+|---|---|---|
+| `label` | Oui | Désignation de l'accessoire |
+| `brand` | Non | Marque |
+| `model` | Non | Référence modèle |
+| `category` | Non | Ex: Batterie, Chargeur, Lame, Adaptateur… |
+| `stock_qty` | Non (défaut: 0) | Quantité disponible en stock |
+| `location_hint` | Non | Emplacement dans l'atelier |
+| `notes` | Non | Notes libres |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-acc-...",
+  "message": "Accessoire 'Batterie 18V 5Ah' créé (id=uuid-acc-...)."
+}
+```
+
+> **Note :** le champ `link_id` contient ici l'`accessory_id` créé (convention de réponse unifiée).
+
+---
+
+### 7.3 Catalogue des consommables
+```
+GET /api/consumables
+```
+**Quand l'utiliser :** « Combien de forets Ø8 il reste ? », « montre les consommables en rupture », « quel papier de verre on a ? »
+
+**Paramètres optionnels :**
+
+| Paramètre | Description |
+|---|---|
+| `q` | Filtre texte libre (label, marque, référence) |
+| `low_stock=true` | Ne retourne que les consommables dont `stock_qty <= stock_min_alert` |
+
+**Réponse :**
+```json
+{
+  "count": 6,
+  "consumables": [
+    {
+      "consumable_id": "uuid-con-...",
+      "label": "Foret SDS-Plus Ø10 béton",
+      "brand": "Bosch",
+      "reference": "2608833800",
+      "category": "Foret",
+      "unit": "pcs",
+      "stock_qty": 2.0,
+      "stock_min_alert": 5.0,
+      "location_hint": "Tiroir forets B3",
+      "stock_ok": false
+    }
+  ]
+}
+```
+
+**Points clés :**
+- `stock_ok: false` → `stock_qty <= stock_min_alert` → signaler à l'utilisateur
+- `unit` : `pcs` (pièces), `ml`, `L`, `g`, `kg`, `m`, `feuilles`…
+- Toujours vérifier `stock_ok` avant de valider une préparation chantier
+
+---
+
+### 7.4 Créer un consommable
+```
+POST /api/consumables
+```
+**Quand l'utiliser :** L'utilisateur ajoute des forets, des lames de scie, du papier abrasif, de la visserie… au catalogue.
+
+**Corps :**
+```json
+{
+  "label": "Foret SDS-Plus Ø10 béton",
+  "brand": "Bosch",
+  "reference": "2608833800",
+  "category": "Foret",
+  "unit": "pcs",
+  "stock_qty": 10,
+  "stock_min_alert": 5,
+  "location_hint": "Tiroir forets B3",
+  "notes": "Pour perforateurs SDS-Plus"
+}
+```
+
+| Champ | Obligatoire | Description |
+|---|---|---|
+| `label` | Oui | Désignation du consommable |
+| `brand` | Non | Marque |
+| `reference` | Non | Référence fabricant |
+| `category` | Non | Ex: Foret, Abrasif, Lame, Visserie, Filtre… |
+| `unit` | Non (défaut: `pcs`) | Unité de mesure |
+| `stock_qty` | Non (défaut: 0) | Stock actuel |
+| `stock_min_alert` | Non (défaut: 0) | Seuil d'alerte (stock_ok devient false en dessous) |
+| `location_hint` | Non | Emplacement dans l'atelier |
+| `notes` | Non | Notes libres |
+
+---
+
+## 8. Liaisons équipements ↔ accessoires / consommables (v4.0)
+
+Les liaisons sont des relations Many-to-Many entre les équipements et les accessoires/consommables. Elles permettent de savoir instantanément, pour n'importe quel outil, ce qu'il faut pour l'utiliser.
+
+### 8.1 Écosystème complet d'un équipement
+```
+GET /api/equipment/{equipment_id}/family
+```
+**Quand l'utiliser :** « Qu'est-ce qu'il me faut pour utiliser ce perforateur ? », « la ponceuse a-t-elle tous ses consommables en stock ? », l'utilisateur affiche une fiche outil et veut voir ce qui est lié.
+
+**Réponse :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "label": "Perforateur Bosch GBH 2-26",
+  "accessories": [
+    {
+      "accessory_id": "uuid-acc-...",
+      "label": "Batterie 18V 5Ah",
+      "brand": "Bosch",
+      "model": "GBA 18V",
+      "stock_qty": 3,
+      "location_hint": "Armoire chargeurs A1",
+      "link_id": "uuid-link-...",
+      "note": null
+    }
+  ],
+  "consumables": [
+    {
+      "consumable_id": "uuid-con-...",
+      "label": "Foret SDS-Plus Ø10 béton",
+      "brand": "Bosch",
+      "reference": "2608833800",
+      "unit": "pcs",
+      "stock_qty": 2.0,
+      "stock_min_alert": 5.0,
+      "qty_per_use": 1.0,
+      "stock_ok": false,
+      "location_hint": "Tiroir forets B3",
+      "link_id": "uuid-link-...",
+      "note": "Forets pour béton uniquement"
+    }
+  ]
+}
+```
+
+**Points clés :**
+- `stock_ok: false` sur un consommable → signaler immédiatement à l'utilisateur
+- `qty_per_use` → quantité typiquement consommée par session de travail
+- `link_id` → à conserver pour supprimer une liaison si nécessaire
+- Appeler cet endpoint après chaque `search_equipment` dès qu'une opération terrain est prévue
+
+---
+
+### 8.2 Lier un accessoire à un équipement
+```
+POST /api/links/compatibility
+```
+**Quand l'utiliser :** L'utilisateur dit « lie la batterie 5Ah au perforateur », « cette batterie 18V est compatible avec la visseuse aussi », ou suite à une suggestion automatique après ingestion.
+
+**Corps :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "accessory_id": "uuid-acc-...",
+  "note": "Compatible uniquement avec adaptateur ADP60F"
+}
+```
+
+| Champ | Obligatoire | Description |
+|---|---|---|
+| `equipment_id` | Oui | UUID de l'équipement |
+| `accessory_id` | Oui | UUID de l'accessoire |
+| `note` | Non | Note de compatibilité libre |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-link-...",
+  "message": "'Batterie 18V 5Ah' lié à 'Perforateur Bosch GBH 2-26' comme accessoire compatible."
+}
+```
+
+**Points clés :**
+- Si la liaison existe déjà, elle est ignorée silencieusement (`ok: true` sans doublon)
+- Conserver le `link_id` pour pouvoir supprimer la liaison
+
+---
+
+### 8.3 Supprimer une liaison accessoire
+```
+DELETE /api/links/compatibility/{link_id}
+```
+**Quand l'utiliser :** L'utilisateur veut dissocier un accessoire d'un outil. L'accessoire et l'équipement ne sont pas supprimés.
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-link-...",
+  "message": "Liaison supprimée."
+}
+```
+
+---
+
+### 8.4 Lier un consommable à un équipement
+```
+POST /api/links/consumables
+```
+**Quand l'utiliser :** L'utilisateur dit « les forets SDS-Plus sont pour le perforateur », « lie le papier de verre grain 120 à la ponceuse orbitale », ou suite à une suggestion post-ingestion.
+
+**Corps :**
+```json
+{
+  "equipment_id": "uuid-eq-...",
+  "consumable_id": "uuid-con-...",
+  "qty_per_use": 2.0,
+  "note": "Forets béton — remplacer toutes les 3 utilisations"
+}
+```
+
+| Champ | Obligatoire | Description |
+|---|---|---|
+| `equipment_id` | Oui | UUID de l'équipement |
+| `consumable_id` | Oui | UUID du consommable |
+| `qty_per_use` | Non (défaut: 1) | Quantité typiquement utilisée par session |
+| `note` | Non | Note sur l'usage |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-link-...",
+  "message": "'Foret SDS-Plus Ø10 béton' lié à 'Perforateur Bosch GBH 2-26' (qty/usage : 2.0)."
+}
+```
+
+**Points clés :**
+- `qty_per_use` permet à la checklist chantier de calculer si le stock total est suffisant pour tous les équipements prévus
+- Si la liaison existe déjà, elle est ignorée silencieusement
+
+---
+
+### 8.5 Supprimer une liaison consommable
+```
+DELETE /api/links/consumables/{link_id}
+```
+**Quand l'utiliser :** L'utilisateur veut dissocier un consommable d'un outil.
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-link-...",
+  "message": "Liaison consommable supprimée."
+}
+```
+
+---
+
 ## Référence complète des endpoints
 
 | Méthode | Endpoint | Auth | Usage |
 |---|---|---|---|
 | GET | `/api/health` | Non | État du serveur |
+| **Équipements** | | | |
 | GET | `/api/equipment/search?q=` | Oui | Recherche d'outil |
 | GET | `/api/equipment/{id}/status` | Oui | Disponibilité |
+| GET | `/api/equipment/{id}/family` | Oui | **v4.0** Écosystème complet (accessoires + consommables) |
+| **Mouvements** | | | |
 | POST | `/api/movements/checkout` | Oui | Sortie d'outil(s) |
 | POST | `/api/movements/checkin` | Oui | Retour d'outil(s) |
 | GET | `/api/movements/active` | Oui | Sorties en cours |
+| **Kits** | | | |
 | GET | `/api/kits` | Oui | Liste des kits |
 | GET | `/api/kits/{id}` | Oui | Contenu d'un kit |
 | POST | `/api/kits` | Oui | Créer un kit |
@@ -846,15 +1166,27 @@ GET /api/health
 | PUT | `/api/kits/{id}/content` | Oui | Redéfinir le contenu |
 | POST | `/api/kits/{id}/checkout` | Oui | Sortir un kit |
 | POST | `/api/kits/{id}/checkin` | Oui | Rentrer un kit |
+| **Kiosque** | | | |
 | POST | `/api/display/show` | Oui | Afficher fiche outil sur kiosque |
 | POST | `/api/display/show-kit` | Oui | Afficher fiche kit sur kiosque |
 | POST | `/api/display/show-movements` | Oui | Afficher sorties en cours sur kiosque |
 | POST | `/api/display/show-confirmation` | Oui | Afficher écran de confirmation |
 | POST | `/api/display/clear` | Oui | Repasser le kiosque en veille |
+| **Réservations** | | | |
 | GET | `/api/reservations/conflicts?equipment_id=&start=&end=` | Oui | Vérifier conflits avant réservation |
 | POST | `/api/reservations` | Oui | Créer une réservation |
 | GET | `/api/reservations/active` | Oui | Lister les réservations à venir |
 | DELETE | `/api/reservations/{res_id}` | Oui | Annuler une réservation |
+| **Relationnel v4.0 — Catalogue** | | | |
+| GET | `/api/accessories?q=` | Oui | Catalogue accessoires (filtre optionnel) |
+| POST | `/api/accessories` | Oui | Créer un accessoire |
+| GET | `/api/consumables?q=&low_stock=` | Oui | Catalogue consommables (filtres optionnels) |
+| POST | `/api/consumables` | Oui | Créer un consommable |
+| **Relationnel v4.0 — Liaisons** | | | |
+| POST | `/api/links/compatibility` | Oui | Lier un accessoire ↔ équipement |
+| DELETE | `/api/links/compatibility/{link_id}` | Oui | Supprimer une liaison accessoire |
+| POST | `/api/links/consumables` | Oui | Lier un consommable ↔ équipement |
+| DELETE | `/api/links/consumables/{link_id}` | Oui | Supprimer une liaison consommable |
 
 ---
 
@@ -965,6 +1297,86 @@ POST /api/display/show-confirmation  { title, subtitle, details, batch_id, color
 
 ---
 
+### Situation M — Ingestion intelligente : lier après ajout d'un outil *(v4.0)*
+
+À déclencher **immédiatement** après l'ajout d'un nouvel équipement via n8n.
+
+```
+1. [n8n] Nouvel équipement ajouté → equipment_id disponible
+2. GET /api/accessories                          → lister les accessoires en stock
+   GET /api/consumables                          → lister les consommables en stock
+3. [OpenClaw] Analyse label/subtype/category de l'équipement
+   → proposer à l'utilisateur : "J'ai ajouté ce perforateur.
+     Il y a des forets SDS-Plus en stock. Je les lie ?"
+4. Si l'utilisateur dit oui :
+   POST /api/links/consumables                   → lier chaque consommable pertinent
+   POST /api/links/compatibility                 → lier chaque accessoire pertinent
+```
+
+**Règles de suggestion :**
+- Perforateur / Perceuse → proposer les forets correspondants (SDS-Plus, SDS-Max, standard…)
+- Outil 18V Makita → proposer les batteries et chargeurs Makita 18V
+- Ponceuse orbitale → proposer les papiers abrasifs et disques
+- Scie circulaire → proposer les lames de scie
+- Meuleuse → proposer les disques (coupe, meulage, lamelles)
+- Ne jamais lier automatiquement sans confirmation explicite
+
+---
+
+### Situation N — Préparation chantier : checklist accessoires & consommables *(v4.0)*
+
+```
+1. GET /api/equipment/search?q=<outil>            → trouver chaque outil prévu (répéter)
+   → collecter les equipment_ids
+2. GET /api/equipment/{id}/family                 → pour chaque outil :
+   → vérifier les accessoires (stock_qty > 0 ?)
+   → vérifier les consommables (stock_ok: true ?)
+3. Annoncer les alertes à l'utilisateur :
+   - Accessoires en rupture : "La batterie 5Ah n'est pas en stock"
+   - Consommables insuffisants : "Il reste 2 forets Ø10, seuil min = 5"
+4. Optionnel : POST /api/kits                     → créer un kit si le chantier est récurrent
+```
+
+**Message type OpenClaw :**
+> "Kit SDB prêt à 80%. Attention : la batterie 5Ah est en stock mais en dessous du seuil. Il te manque du papier de verre grain 120 (rupture de stock). Veux-tu que je note une commande ?"
+
+---
+
+### Situation O — Ajouter un accessoire/consommable et le lier *(v4.0)*
+
+```
+1. POST /api/accessories  { label, brand, stock_qty }   → créer l'accessoire
+   — ou —
+   POST /api/consumables  { label, brand, stock_qty, stock_min_alert }
+   → noter l'accessory_id / consumable_id retourné dans link_id
+
+2. GET /api/equipment/search?q=<outil>            → trouver l'équipement cible
+   → noter l'equipment_id
+
+3. POST /api/links/compatibility  { equipment_id, accessory_id }
+   — ou —
+   POST /api/links/consumables  { equipment_id, consumable_id, qty_per_use }
+
+4. Confirmer : "Batterie 18V 5Ah ajoutée et liée au perforateur et à la visseuse."
+```
+
+---
+
+### Situation P — Vérifier les stocks en alerte *(v4.0)*
+
+```
+1. GET /api/consumables?low_stock=true           → tous les consommables en dessous du seuil
+   → lister à l'utilisateur avec location_hint pour qu'il sache où regarder
+```
+
+**Message type OpenClaw :**
+> "3 consommables en alerte stock :
+> ⚠ Foret SDS-Plus Ø10 — 2 pcs (seuil : 5) — Tiroir forets B3
+> ⚠ Papier abrasif grain 120 — 0 feuilles — Étagère consommables C2
+> ⚠ Lame scie circulaire 165mm — 1 pcs (seuil : 2) — Caisse lames"
+
+---
+
 ## Types de mouvement
 
 | Code | Signification | Usage typique |
@@ -992,7 +1404,51 @@ Format étendu accepté : `2025-04-30T14:00`
 | 404 | `equipment_not_found` | L'`equipment_id` n'existe pas dans la base |
 | 404 | `kit_not_found` | Le `kit_id` n'existe pas |
 | 404 | `reservation_not_found` | Le `res_id` n'existe pas |
+| 404 | `link_not_found` | Le `link_id` (liaison) n'existe pas |
+| 404 | *(message inline)* | L'`accessory_id` ou `consumable_id` n'existe pas |
 | 409 | `conflict` | La plage demandée est déjà réservée ou l'outil est en maintenance |
 | 503 | `screen_unavailable` | L'écran kiosque ou la base est inaccessible |
 
 En cas d'erreur 503, la base DuckDB est temporairement verrouillée par n8n. Réessayer dans quelques secondes.
+
+---
+
+## Modèle de données v4.0 — Vue relationnelle
+
+```
+equipment (catalogue outils)
+    │
+    ├── links_compatibility ──→ accessories (batteries, adaptateurs, chargeurs…)
+    │       equipment_id FK         accessory_id PK
+    │       accessory_id FK         label, brand, model
+    │       note                    stock_qty
+    │       [UNIQUE equipment+accessory]
+    │
+    └── links_consumables   ──→ consumables (forets, abrasifs, visserie…)
+            equipment_id FK         consumable_id PK
+            consumable_id FK        label, brand, reference
+            qty_per_use             unit, stock_qty, stock_min_alert
+            note                    → stock_ok = stock_qty > stock_min_alert
+            [UNIQUE equipment+consumable]
+```
+
+**Règle de mutualisation :** une batterie 18V peut être liée à 10 outils. Elle n'existe qu'une fois dans `accessories`. Les 10 liaisons sont dans `links_compatibility`.
+
+**Règle Many-to-Many :** un perforateur peut avoir des forets Ø8, Ø10, Ø12 liés. Chaque foret peut aussi être lié à une autre perceuse. La relation est bidirectionnelle.
+
+---
+
+## Champs `ai_metadata` dans equipment *(v4.0)*
+
+Chaque fiche équipement dispose d'un champ `ai_metadata` (JSON) permettant de stocker les capacités sémantiques de l'outil pour les suggestions automatiques :
+
+```json
+{
+  "domaines": ["maçonnerie", "béton", "perçage bois"],
+  "technologie_batterie": "SDS-Plus 18V",
+  "force_impact": "2.9 J",
+  "compatible_marque": "Bosch"
+}
+```
+
+Ce champ est libre — OpenClaw peut le lire pour affiner ses suggestions de liaisons lors de l'ingestion.
