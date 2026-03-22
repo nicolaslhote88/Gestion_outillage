@@ -885,13 +885,14 @@ def _render_relation_cards(
             )
 
         # Carte HTML (visuel seul — le bouton Streamlit reste natif)
+        sub_html = f'<div class="dep-sub">{subtitle}</div>' if subtitle else ""
         card_html = (
             f'<div class="dep-card">'
             f'<div class="dep-thumb-wrap">{thumb_html}</div>'
             f'<div class="dep-info">'
             f'  {badge_html}'
             f'  <div class="dep-label">{label}</div>'
-            f'  {f\'<div class="dep-sub">{subtitle}</div>\' if subtitle else ""}'
+            f'  {sub_html}'
             f'</div>'
             f'</div>'
         )
