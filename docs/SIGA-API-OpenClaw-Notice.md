@@ -1,9 +1,118 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 4.1 — Mars 2026
+**Version :** 4.2 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
+
+---
+
+## 0. Modèle mental — Comprendre SIGA avant d'agir
+
+### 0.1 Ce qu'est SIGA
+
+SIGA est un **système d'inventaire d'atelier**. Il gère des équipements (outils), des accessoires (batteries, chargeurs, adaptateurs) et des consommables (forets, lames, abrasifs) appartenant à un atelier physique. Chaque objet physique de l'atelier doit avoir exactement **une fiche** dans SIGA et exactement **un dossier** sur Google Drive contenant ses photos.
+
+Le système est mono-utilisateur (Nicolas) et ses données servent à :
+- Savoir ce qui existe dans l'atelier
+- Savoir ce qui est sorti / disponible
+- Retrouver rapidement un outil et ses accessoires associés
+- Afficher une fiche sur l'écran kiosque de l'atelier
+
+### 0.2 Les deux piliers synchronisés : Drive + DuckDB
+
+SIGA repose sur **deux systèmes qui doivent toujours être cohérents** :
+
+```
+Google Drive (stockage physique des fichiers)
+    └── dossier par fiche
+        └── photos de l'objet physique
+
+DuckDB (base de données — source de vérité des métadonnées)
+    └── table equipment / accessories / consumables
+        └── champs label, brand, model, category…
+    └── table equipment_media
+        └── final_drive_file_id → pointe vers la photo dans Drive
+```
+
+**Règle fondamentale :** toute modification de la base DuckDB qui concerne une photo DOIT être accompagnée du déplacement physique du fichier sur Drive. Une mise à jour de pointeur sans déplacement physique crée une incohérence.
+
+### 0.3 Structure des dossiers Drive
+
+```
+My Drive/
+  SIGA_TEMP/
+    {ingestion_id}/          ← dossier temporaire pendant l'ingestion n8n
+  {drive_root}/
+    SIGA/
+      onboarding/
+        {année}/
+          {mois}/
+            {ingestion_id}/  ← dossier final d'un équipement ingéré par n8n
+      accessories/
+        {accessory_id}/      ← dossier d'un accessoire (créé par OpenClaw)
+      consumables/
+        {consumable_id}/     ← dossier d'un consommable (créé par OpenClaw)
+```
+
+**Important :** Le `{drive_root}` est la valeur configurée dans l'environnement (`SIGA_DRIVE_ROOT_ID`). Ne jamais créer de dossier à la racine de My Drive sauf `SIGA_TEMP`.
+
+### 0.4 Les trois types d'entités et leur cycle de vie
+
+| Entité | Table DB | Dossier Drive | Photos |
+|---|---|---|---|
+| Équipement | `equipment` | `onboarding/{année}/{mois}/{ingestion_id}/` | Obligatoires |
+| Accessoire | `accessories` | `accessories/{accessory_id}/` | Optionnelles |
+| Consommable | `consumables` | `consumables/{consumable_id}/` | Optionnelles |
+
+**Règle :** un équipement est un objet unique (une perceuse particulière). Un accessoire ou consommable peut exister en plusieurs exemplaires (stock_qty). Si un accessoire est "la batterie 18V Makita" en stock = 3, c'est une seule fiche avec `stock_qty: 3`, pas trois fiches.
+
+### 0.5 Ce qu'OpenClaw peut et doit faire
+
+OpenClaw est l'opérateur intelligent de SIGA. Il dispose de tous les outils pour :
+- Lire et modifier les fiches (via l'API SIGA)
+- Créer et organiser les dossiers Drive (via le bridge `/api/drive/`)
+- Déplacer physiquement les photos d'un dossier Drive à un autre
+- Lier des entités entre elles (liaisons accessoires/consommables)
+- Archiver et nettoyer les données obsolètes
+
+OpenClaw **ne doit jamais** laisser la base DuckDB et Google Drive dans un état incohérent.
+
+---
+
+## RÈGLES ABSOLUES — Lire avant toute opération
+
+### ✅ CE QU'IL FAUT TOUJOURS FAIRE
+
+1. **Créer le dossier Drive AVANT la fiche SIGA.** La fiche doit référencer un dossier Drive réel.
+
+2. **Déplacer physiquement les photos** quand on les réaffecte. Utiliser `/api/drive/files/{file_id}/move` + mettre à jour la fiche via `/api/equipment/{id}/photos` ou `/api/media/reassign`.
+
+3. **Vérifier visuellement chaque photo** avant de l'affecter à une fiche. Une photo de batterie ne doit jamais aller sur une fiche de perceuse. Une photo de Kärcher ne doit jamais aller sur une fiche d'AEG.
+
+4. **Faire un `dry_run=true`** avant tout appel à `/api/admin/migrations/reclassify`. Analyser le plan retourné avant de l'exécuter.
+
+5. **Archiver les anciennes fiches** (pas supprimer brutalement) après migration. Utiliser `POST /api/equipment/{id}/archive`.
+
+6. **Vérifier la cohérence Drive** après chaque opération : le dossier Drive de la fiche cible doit contenir exactement les photos listées dans `equipment_media`.
+
+7. **Confirmer avec l'utilisateur** avant toute opération destructive ou toute réaffectation de photo si le doute existe.
+
+### ❌ CE QU'IL NE FAUT JAMAIS FAIRE
+
+1. **Ne jamais réaffecter un `final_drive_file_id` sans déplacer le fichier** sur Drive. Mettre à jour un pointeur sans déplacer le fichier crée une incohérence permanente.
+
+2. **Ne jamais créer une fiche sans créer son dossier Drive.** Une fiche sans dossier Drive associé est une fiche orpheline qui ne peut pas héberger de photos proprement.
+
+3. **Ne jamais affecter une photo d'un objet A à la fiche d'un objet B.** Même si les photos semblent proches (deux batteries similaires, deux outils de même marque), chaque photo appartient à l'objet physique qu'elle représente.
+
+4. **Ne jamais supprimer physiquement une fiche** (hard delete) sans avoir d'abord migré ou supprimé ses photos sur Drive. Préférer l'archivage (`archived=true`).
+
+5. **Ne jamais lancer une migration en masse sans avoir vérifié chaque fiche individuellement.** Les migrations automatiques sans supervision visuelle sont la source des erreurs d'affectation de photos.
+
+6. **Ne jamais ignorer les fiches fantômes.** Une fiche avec `archived=false` mais sans photos et sans dossier Drive correspondant doit être traitée, pas ignorée.
+
+7. **Ne jamais créer plusieurs fiches pour le même objet physique.** Utiliser `/api/admin/duplicates` pour détecter les doublons avant création.
 
 ---
 
@@ -1378,6 +1487,332 @@ POST /api/display/show-confirmation  { title, subtitle, details, batch_id, color
 
 ---
 
+### Situation Q — Créer une nouvelle fiche complète avec dossier Drive *(processus complet)*
+
+Ce processus s'applique quand l'utilisateur veut créer manuellement une nouvelle fiche (sans passer par n8n). Chaque étape est obligatoire et doit être exécutée dans l'ordre.
+
+```
+ÉTAPE 1 — Vérifier qu'il n'existe pas déjà une fiche similaire
+  GET /api/equipment/search?q=<label>
+  GET /api/admin/duplicates?threshold=0.85
+  → Si doublon trouvé : proposer de mettre à jour la fiche existante plutôt que d'en créer une nouvelle
+
+ÉTAPE 2 — Créer le dossier Drive AVANT la fiche
+  POST /api/drive/folder  { "name": "<label_normalisé>", "parent_id": "<dossier_parent_drive_id>" }
+  → Structure attendue selon le type :
+    Équipement  : SIGA/onboarding/{année}/{mois}/{nouvel_id}/
+    Accessoire  : SIGA/accessories/{accessory_id}/   (utiliser l'ID provisoire ou créer le dossier après)
+    Consommable : SIGA/consumables/{consumable_id}/
+  → Noter le folder_id retourné — il sera passé à la fiche
+
+ÉTAPE 3 — Déplacer physiquement les photos dans le dossier Drive créé
+  Pour chaque photo à affecter à cette fiche :
+    a. Identifier la photo sur Drive (via GET /api/drive/folder/{dossier_source})
+    b. VÉRIFIER VISUELLEMENT que la photo correspond bien à l'objet (pas une photo d'un autre outil)
+    c. POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_id_étape_2>" }
+    d. Optionnel : PATCH /api/drive/files/{file_id}/rename  { "new_name": "<label>_overview.jpg" }
+
+ÉTAPE 4 — Créer la fiche SIGA avec les références Drive
+  POST /api/accessories  { label, brand, model, stock_qty, location_hint, notes }
+  — ou —
+  POST /api/consumables  { label, brand, reference, stock_qty, stock_min_alert, ... }
+  → Pour les équipements, ils sont créés par n8n (ingestion) — OpenClaw les met à jour via PATCH
+
+ÉTAPE 5 — Adresser les photos dans la fiche SIGA
+  PUT /api/equipment/{id}/photos  { "photos": [{ "final_drive_file_id": "...", "image_role": "overview", "image_index": 0 }] }
+  → Utiliser les file_id des fichiers déplacés à l'étape 3
+  → Vérifier que chaque file_id pointe bien vers un fichier dans le dossier Drive de la fiche
+
+ÉTAPE 6 — Construire les liaisons
+  POST /api/links/compatibility  { equipment_id, accessory_id }   → pour chaque accessoire compatible
+  POST /api/links/consumables  { equipment_id, consumable_id }    → pour chaque consommable lié
+
+ÉTAPE 7 — Vérification finale
+  GET /api/equipment/{id}         → vérifier que la fiche est complète
+  GET /api/drive/folder/{folder_id}  → vérifier que le dossier Drive contient les photos attendues
+  → Les deux doivent être cohérents
+```
+
+---
+
+### Situation R — Scission d'une fiche existante (split_record) *(processus complet)*
+
+Ce processus s'applique quand une fiche "équipement" contient en réalité plusieurs objets (ex: un kit perceuse + batterie + chargeur ingéré ensemble). Il faut scinder la fiche en plusieurs entités distinctes.
+
+**IMPÉRATIF : analyser chaque photo individuellement avant de commencer.**
+
+```
+ÉTAPE 0 — Audit de la fiche source
+  GET /api/equipment/{source_id}
+  → Lister toutes les photos (champ "photos")
+  GET /api/drive/folder/{drive_folder_id_source}
+  → Vérifier que les photos listées dans la base correspondent aux fichiers Drive
+  → Identifier à quel objet physique chaque photo appartient (regarder le contenu de chaque photo)
+
+ÉTAPE 1 — Simulation (dry_run)
+  POST /api/admin/migrations/reclassify?dry_run=true
+  {
+    "source_equipment_id": "uuid-source",
+    "action": "split_record",
+    "target_equipment": { "label": "...", "migration_status": "REVIEWED" },
+    "new_accessories": [ { "label": "Batterie 18V", "brand": "...", "stock_qty": 1 } ],
+    "new_consumables": [],
+    "photo_mapping": [],   ← NE PAS remplir les photo_mapping ici, gérer les photos manuellement après
+    "source_record_policy": "archive",
+    "operator": "openclaw",
+    "notes": "Scission fiche..."
+  }
+  → Lire le plan retourné : combien d'entités créées, combien de liens
+
+ÉTAPE 2 — Présenter le plan à l'utilisateur et attendre confirmation
+  "Je vais scinder cette fiche en :
+  - 1 équipement : Perforateur Bosch GBH 2-26
+  - 1 accessoire : Batterie 18V 4Ah (stock: 1)
+  La fiche source sera archivée.
+  Les photos devront être réaffectées manuellement.
+  Confirmes-tu ?"
+
+ÉTAPE 3 — Créer les dossiers Drive pour chaque nouvelle entité
+  Pour chaque entité à créer (accessoires, consommables) :
+    POST /api/drive/folder  { "name": "<label>", "parent_id": "<dossier_accessories|consumables>" }
+    → noter le folder_id
+
+ÉTAPE 4 — Exécuter la migration (sans photo_mapping)
+  POST /api/admin/migrations/reclassify?dry_run=false
+  { ...même body que dry_run... }
+  → noter les IDs créés : created_accessory_ids, created_consumable_ids
+
+ÉTAPE 5 — Réaffecter les photos manuellement (une par une)
+  Pour chaque photo de la fiche source :
+    a. Identifier à quelle entité elle appartient (vérification visuelle)
+    b. POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_id_entité_cible>" }
+    c. Mettre à jour la fiche cible :
+       PUT /api/equipment/{id}/photos  { "photos": [...] }
+       — ou utiliser PATCH /api/accessories/{id}  avec la photo
+  → Chaque photo ne peut appartenir qu'à UNE SEULE entité après la migration
+
+ÉTAPE 6 — Vider le dossier Drive source (si toutes les photos ont été déplacées)
+  → Vérifier que le dossier source Drive est vide
+  → Ne pas supprimer le dossier source (le laisser vide pour traçabilité)
+
+ÉTAPE 7 — Construire les liaisons
+  POST /api/links/compatibility  { equipment_id: uuid-new-equip, accessory_id: uuid-new-acc }
+
+ÉTAPE 8 — Marquer la fiche source comme archivée (si pas fait automatiquement)
+  POST /api/equipment/{source_id}/archive
+
+ÉTAPE 9 — Vérification de cohérence
+  GET /api/equipment/{new_id}        → fiche équipement avec photos ✓
+  GET /api/accessories/{acc_id}      → fiche accessoire avec photos ✓
+  GET /api/drive/folder/{folder_source}  → vide ✓
+  GET /api/drive/folder/{folder_equip}   → contient les photos de l'équipement ✓
+  GET /api/drive/folder/{folder_acc}     → contient les photos de l'accessoire ✓
+```
+
+---
+
+### Situation S — Nettoyage des fiches fantômes *(processus complet)*
+
+Une fiche fantôme est une fiche `archived=false` qui correspond à une entité supprimée, remplacée ou mal ingérée. Elle pollue le catalogue et les recherches.
+
+```
+ÉTAPE 1 — Identifier les fiches fantômes
+  GET /api/equipment?migration_status=NOT_REVIEWED&page_size=100
+  → Lister toutes les fiches non revues
+  GET /api/admin/duplicates?threshold=0.80
+  → Identifier les doublons potentiels
+
+ÉTAPE 2 — Pour chaque fiche suspecte
+  GET /api/equipment/{id}
+  → Vérifier : a-t-elle des photos ? Des liaisons ? Des mouvements actifs ?
+  GET /api/drive/folder/{drive_folder_id}
+  → Vérifier : le dossier Drive existe-t-il ? Contient-il des fichiers ?
+
+ÉTAPE 3 — Prendre la décision pour chaque fiche
+  CAS A — Fiche en doublon d'une autre fiche valide
+    → Transférer les photos vers la fiche canonique (Étape 4)
+    → Archiver la fiche fantôme : POST /api/equipment/{id}/archive
+
+  CAS B — Fiche sans équivalent dans l'atelier réel
+    → Archiver la fiche : POST /api/equipment/{id}/archive
+    → Si le dossier Drive est vide : le laisser (ne pas supprimer)
+    → Si le dossier Drive contient des photos : vérifier si elles appartiennent à une autre fiche
+
+  CAS C — Fiche avec des données valides mais mal classée
+    → PATCH /api/equipment/{id}  { "label": ..., "category": ..., "migration_status": "REVIEWED" }
+    → Garder la fiche, corriger les données
+
+ÉTAPE 4 — Transfert de photos d'une fiche fantôme vers une fiche canonique
+  a. GET /api/equipment/{fantome_id}  → lister les photos
+  b. Pour chaque photo :
+     - Vérifier visuellement qu'elle correspond bien à l'entité canonique
+     - POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_canonique>" }
+     - Ajouter la photo à la fiche canonique :
+       PUT /api/equipment/{canonique_id}/photos  { "photos": [...photos existantes + nouvelle...] }
+  c. Supprimer la photo de la fiche fantôme :
+     PUT /api/equipment/{fantome_id}/photos  { "photos": [] }
+
+ÉTAPE 5 — Marquer le statut de migration
+  PATCH /api/equipment/{id}  { "migration_status": "ARCHIVED", "migrated_by": "openclaw" }
+  POST /api/equipment/{id}/archive
+
+ÉTAPE 6 — Rapport final à l'utilisateur
+  "Nettoyage terminé :
+  - X fiches archivées
+  - Y photos déplacées
+  - Z doublons résolus
+  Fiches actives restantes : N"
+```
+
+---
+
+### Situation T — Audit de cohérence Drive ↔ DuckDB
+
+À exécuter avant toute opération de migration en masse pour connaître l'état réel du système.
+
+```
+ÉTAPE 1 — Export complet de la base
+  GET /api/admin/export?include_archived=false
+  → Récupérer la liste de tous les équipements actifs avec leurs photos
+
+ÉTAPE 2 — Pour chaque équipement avec photos
+  GET /api/drive/folder/{drive_folder_id}  → lister les fichiers Drive
+  → Comparer :
+    - Photos dans la base (equipment_media) : liste des final_drive_file_id
+    - Fichiers dans le dossier Drive : liste des file_id présents
+  → Signaler les incohérences :
+    - Photo dans la base mais absente du Drive → lien mort
+    - Fichier dans Drive mais absent de la base → photo orpheline non référencée
+
+ÉTAPE 3 — Identifier les dossiers Drive sans fiche associée
+  → Parcourir les dossiers SIGA/onboarding/{année}/{mois}/
+  → Pour chaque dossier, vérifier si un équipement avec ce ingestion_id existe dans la base
+
+ÉTAPE 4 — Rapport d'audit
+  "Audit Drive ↔ DuckDB :
+  - X fiches cohérentes
+  - Y liens morts (photo référencée mais absente Drive)
+  - Z photos orphelines (présentes Drive mais non référencées)
+  - W dossiers Drive sans fiche associée"
+```
+
+---
+
+### Situation U — Corriger une affectation de photo erronée
+
+Ce processus s'applique quand une photo est affectée à la mauvaise fiche (ex: photo d'une batterie dans la fiche perceuse).
+
+```
+ÉTAPE 1 — Identifier la photo mal affectée
+  GET /api/equipment/{id_fiche_incorrecte}
+  → Identifier le media_id et final_drive_file_id de la photo erronée
+
+ÉTAPE 2 — Identifier la fiche correcte
+  GET /api/equipment/search?q=<label_correct>
+  → Trouver l'equipment_id / accessory_id de la fiche qui devrait avoir cette photo
+
+ÉTAPE 3 — Vérifier que la fiche correcte a un dossier Drive
+  GET /api/equipment/{id_fiche_correcte}
+  → Récupérer le drive_folder_id de la fiche correcte
+  → Si pas de dossier : créer d'abord le dossier (Situation Q, Étape 2)
+
+ÉTAPE 4 — Déplacer physiquement la photo sur Drive
+  POST /api/drive/files/{file_id_photo}/move  { "new_parent_id": "<folder_id_fiche_correcte>" }
+
+ÉTAPE 5 — Retirer la photo de la fiche incorrecte
+  GET /api/equipment/{id_fiche_incorrecte}
+  → Photos actuelles : [photo_A, photo_erronée, photo_C]
+  PUT /api/equipment/{id_fiche_incorrecte}/photos  { "photos": [photo_A, photo_C] }
+  → Supprimer la photo_erronée de la liste
+
+ÉTAPE 6 — Ajouter la photo à la fiche correcte
+  GET /api/equipment/{id_fiche_correcte}
+  → Photos actuelles : [photo_X, photo_Y]
+  PUT /api/equipment/{id_fiche_correcte}/photos  { "photos": [photo_X, photo_Y, photo_déplacée] }
+
+ÉTAPE 7 — Vérification
+  GET /api/equipment/{id_fiche_incorrecte}  → photo absente ✓
+  GET /api/equipment/{id_fiche_correcte}   → photo présente ✓
+  GET /api/drive/folder/{folder_correcte}  → fichier présent dans le bon dossier ✓
+```
+
+---
+
+### Situation V — Reclasser un équipement comme accessoire ou consommable
+
+Ce processus s'applique quand une fiche ingérée comme "équipement" doit être reclassée (ex: une batterie ingérée comme équipement alors qu'elle est un accessoire).
+
+```
+ÉTAPE 1 — Analyser la fiche source
+  GET /api/equipment/{source_id}
+  → Vérifier les photos, le label, la catégorie actuelle
+  → Vérifier si d'autres équipements pourraient être liés à cet accessoire/consommable
+
+ÉTAPE 2 — Vérifier si l'accessoire/consommable n'existe pas déjà
+  GET /api/accessories?q=<label>   — ou —   GET /api/consumables?q=<label>
+  GET /api/admin/duplicates?threshold=0.80
+  → Si doublon : ne pas créer un nouveau, mettre à jour le stock de l'existant
+
+ÉTAPE 3 — Dry run
+  POST /api/admin/migrations/reclassify?dry_run=true
+  {
+    "source_equipment_id": "uuid-source",
+    "action": "reclassify_as_accessory",   ← ou "reclassify_as_consumable"
+    "new_accessories": [ { "label": "...", "brand": "...", "stock_qty": 1 } ],
+    "source_record_policy": "archive",
+    "operator": "openclaw"
+  }
+
+ÉTAPE 4 — Créer le dossier Drive pour le nouvel accessoire/consommable
+  POST /api/drive/folder  { "name": "<label>", "parent_id": "<dossier_accessories>" }
+
+ÉTAPE 5 — Exécuter la migration
+  POST /api/admin/migrations/reclassify?dry_run=false  { ...même body... }
+
+ÉTAPE 6 — Déplacer les photos (obligatoire)
+  Pour chaque photo de la fiche source :
+    POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_id_nouvel_accessoire>" }
+  PUT /api/accessories/{new_acc_id}/photos  { "photos": [...] }
+  → Ou utiliser PATCH /api/accessories/{new_acc_id} selon l'endpoint disponible
+
+ÉTAPE 7 — Créer les liaisons vers les équipements qui utilisent cet accessoire
+  Pour chaque équipement compatible :
+    POST /api/links/compatibility  { equipment_id, accessory_id: new_acc_id }
+
+ÉTAPE 8 — Vérification
+  GET /api/accessories/{new_acc_id}   → fiche complète avec photos ✓
+  GET /api/equipment/{source_id}      → archived=true ✓
+```
+
+---
+
+### Situation W — Vérification avant toute opération en masse
+
+**À exécuter SYSTÉMATIQUEMENT avant de lancer plusieurs migrations d'affilée.**
+
+```
+1. GET /api/admin/export?include_archived=false
+   → Compter les entités actives (équipements, accessoires, consommables)
+   → Mémoriser ce chiffre de référence
+
+2. GET /api/admin/duplicates?threshold=0.80
+   → Signaler les doublons à l'utilisateur avant de commencer
+
+3. Pour un échantillon de 5 fiches :
+   GET /api/equipment/{id}
+   GET /api/drive/folder/{folder_id}
+   → Vérifier que Drive et DuckDB sont cohérents
+
+4. Annoncer à l'utilisateur :
+   "Avant de commencer la migration :
+   - X équipements actifs, Y accessoires, Z consommables
+   - N doublons potentiels détectés : [liste]
+   - Cohérence Drive/DB vérifiée sur 5 fiches : OK/PROBLÈMES DÉTECTÉS
+   Procéder ?"
+```
+
+---
+
 ## Types de mouvement
 
 | Code | Signification | Usage typique |
@@ -1577,15 +2012,25 @@ DELETE /api/consumables/{consumable_id}?hard=true  → suppression physique
 
 ### 9.7 Gestion des photos
 
+> **PRINCIPE FONDAMENTAL :** Toute modification de photo implique DEUX opérations indissociables :
+> 1. Déplacer le fichier physiquement sur Drive (`POST /api/drive/files/{id}/move`)
+> 2. Mettre à jour la référence dans la base SIGA (`PUT /api/equipment/{id}/photos`)
+> Ces deux opérations doivent toujours être effectuées ensemble, dans cet ordre.
+> **Ne jamais faire l'une sans l'autre.**
+
 ```
 GET /api/equipment/{equipment_id}/photos
 ```
-Liste toutes les photos (`equipment_media`) d'un équipement.
+Liste toutes les photos (`equipment_media`) d'un équipement. Retourne les `media_id`, `final_drive_file_id`, `image_role`, `image_index`.
+
+**Utilisation typique :** avant toute opération sur les photos, toujours appeler cet endpoint pour connaître l'état actuel.
 
 ```
 PUT /api/equipment/{equipment_id}/photos
 ```
-Remplace entièrement la liste de photos. Body :
+Remplace entièrement la liste de photos. **Opération atomique** : la liste fournie remplace l'intégralité de `equipment_media` pour cet équipement.
+
+Body :
 ```json
 {
   "photos": [
@@ -1605,6 +2050,36 @@ Remplace entièrement la liste de photos. Body :
 
 `image_role` : `overview` | `nameplate` | `detail`
 
+**Règles pour les rôles :**
+- `overview` : photo générale de l'objet entier — la photo principale affichée dans le catalogue
+- `nameplate` : photo de la plaque signalétique (marque, modèle, numéro de série)
+- `detail` : photo d'un détail spécifique (connecteur, état d'usure, accessoire monté)
+
+**Séquence obligatoire pour ajouter/déplacer une photo :**
+```
+1. Déplacer le fichier Drive dans le dossier de la fiche cible :
+   POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_id_fiche_cible>" }
+
+2. Lire les photos existantes :
+   GET /api/equipment/{id}/photos
+
+3. Mettre à jour la liste avec la nouvelle photo :
+   PUT /api/equipment/{id}/photos  { "photos": [...existantes + { final_drive_file_id: file_id, image_role, image_index }] }
+```
+
+**Séquence obligatoire pour retirer une photo :**
+```
+1. Lire les photos existantes :
+   GET /api/equipment/{id}/photos
+
+2. Mettre à jour la liste sans la photo à retirer :
+   PUT /api/equipment/{id}/photos  { "photos": [...existantes SAUF la photo retirée] }
+
+3. Si la photo doit être supprimée définitivement de Drive :
+   (action manuelle — ne pas supprimer sans confirmation utilisateur)
+   Si la photo doit être déplacée vers une autre fiche : suivre Situation U
+```
+
 ### 9.8 Bridge Google Drive
 
 > Ces endpoints nécessitent un compte de service configuré via `GOOGLE_APPLICATION_CREDENTIALS`. Si Drive n'est pas disponible, ils retournent HTTP 503.
@@ -1618,15 +2093,30 @@ POST /api/drive/files/{file_id}/copy       → copier dans un dossier
 PATCH /api/drive/files/{file_id}/rename    → renommer
 ```
 
+**Quand utiliser chaque opération Drive :**
+
+| Opération | Quand l'utiliser |
+|---|---|
+| `GET /api/drive/folder/{id}` | Avant toute migration : auditer ce qu'il y a dans un dossier |
+| `GET /api/drive/files/{id}` | Vérifier qu'un fichier existe avant de le déplacer |
+| `POST /api/drive/folder` | TOUJOURS avant de créer une nouvelle fiche SIGA |
+| `POST /api/drive/files/{id}/move` | TOUJOURS avant de mettre à jour une référence photo dans SIGA |
+| `POST /api/drive/files/{id}/copy` | Uniquement si on veut garder une copie dans le dossier source |
+| `PATCH /api/drive/files/{id}/rename` | Pour normaliser les noms de fichiers après déplacement |
+
 **Body `POST /api/drive/folder` :**
 ```json
 { "name": "Perforateur_Bosch_GBH", "parent_id": "1FolderDriveId..." }
 ```
 
+> Le `parent_id` doit être l'ID du dossier parent existant sur Drive, jamais `"root"` sauf pour `SIGA_TEMP`.
+
 **Body `POST /api/drive/files/{id}/move` :**
 ```json
 { "new_parent_id": "1FolderDriveId..." }
 ```
+
+> Cette opération déplace le fichier — il disparaît du dossier source et apparaît dans le dossier cible. Irréversible sans un nouveau déplacement.
 
 **Body `POST /api/drive/files/{id}/copy` :**
 ```json
@@ -1853,3 +2343,83 @@ migration_logs
     status                 → COMPLETED / FAILED
     created_at
 ```
+
+---
+
+## 10. Checklist opérationnelle — Avant / Pendant / Après chaque opération
+
+### Avant de commencer (pour toute opération modifiant des fiches ou des photos)
+
+```
+□ J'ai vérifié qu'aucune fiche en doublon n'existe déjà (GET /api/admin/duplicates)
+□ J'ai vérifié la cohérence Drive de la fiche source (GET /api/drive/folder/{folder_id})
+□ J'ai analysé chaque photo individuellement avant de l'affecter
+□ Pour une migration : j'ai fait un dry_run et présenté le plan à l'utilisateur
+```
+
+### Pendant l'opération (pour chaque photo traitée)
+
+```
+□ J'ai déplacé le fichier physiquement sur Drive AVANT de mettre à jour la base
+□ J'ai vérifié que le fichier est bien arrivé dans le dossier cible (GET /api/drive/files/{id})
+□ J'ai mis à jour la fiche SIGA avec le nouveau file_id
+□ Je n'ai pas affecté une photo d'un objet A à la fiche d'un objet B
+```
+
+### Après l'opération
+
+```
+□ J'ai vérifié la fiche résultante (GET /api/equipment/{id} ou GET /api/accessories/{id})
+□ J'ai vérifié le dossier Drive de la fiche (GET /api/drive/folder/{folder_id})
+□ Les deux listes sont cohérentes (même file_ids dans la base et dans Drive)
+□ J'ai archivé les fiches sources si nécessaire
+□ J'ai rapporté le résultat à l'utilisateur avec un résumé des actions effectuées
+```
+
+---
+
+## 11. Erreurs courantes et comment les éviter
+
+### Erreur : "Photo de l'équipement X affectée à l'accessoire Y"
+
+**Cause :** Affectation en masse sans vérification visuelle de chaque photo.
+
+**Solution :** Traiter une photo à la fois. Pour chaque photo, identifier son contenu avant de l'affecter. En cas de doute, demander confirmation à l'utilisateur.
+
+---
+
+### Erreur : "Dossier Drive non créé pour la nouvelle fiche"
+
+**Cause :** Création de la fiche SIGA sans avoir créé le dossier Drive correspondant en amont.
+
+**Solution :** Toujours respecter l'ordre : (1) créer le dossier Drive → (2) créer la fiche SIGA → (3) affecter les photos.
+
+---
+
+### Erreur : "Photos non déplacées physiquement — juste réadressées"
+
+**Cause :** Mise à jour du `final_drive_file_id` dans la base sans appel à `/api/drive/files/{id}/move`.
+
+**Conséquence :** Les photos restent dans le dossier d'origine sur Drive mais la base pointe ailleurs. L'affichage semble correct mais la structure Drive est incohérente.
+
+**Solution :** Toujours appeler `POST /api/drive/files/{file_id}/move` avant de mettre à jour la référence dans SIGA.
+
+---
+
+### Erreur : "Fiches fantômes non nettoyées"
+
+**Cause :** Nouvelles fiches créées sans archiver les anciennes.
+
+**Conséquence :** Le catalogue contient des doublons, les recherches retournent des résultats parasites.
+
+**Solution :** Après chaque migration, archiver systématiquement les fiches sources. Utiliser le workflow Situation S pour le nettoyage en lot.
+
+---
+
+### Erreur : "Migration lancée sans dry_run"
+
+**Cause :** Appel direct à `/api/admin/migrations/reclassify?dry_run=false` sans avoir analysé le plan.
+
+**Conséquence :** Des entités sont créées, des liens sont posés, la fiche source est archivée — irréversible sans intervention manuelle.
+
+**Solution :** Toujours passer par `dry_run=true` d'abord, lire le plan, le présenter à l'utilisateur, attendre confirmation.
