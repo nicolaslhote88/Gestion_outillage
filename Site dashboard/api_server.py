@@ -2928,11 +2928,32 @@ def list_accessories(
 )
 def create_accessory(
     body: AccessoryCreateRequest,
+    force_create: bool = False,
     _: None = Security(_require_token),
 ) -> LinkCreateResponse:
-    """Ajoute un accessoire (batterie, adaptateur, chargeur…) au catalogue SIGA."""
+    """Ajoute un accessoire (batterie, adaptateur, chargeur…) au catalogue SIGA.
+    Si un accessoire non-archivé avec le même label+brand+model existe déjà,
+    retourne l'existant (pas de doublon). Utilisez force_create=true pour forcer."""
     if not body.label or not body.label.strip():
         raise HTTPException(status_code=400, detail="label est obligatoire.")
+
+    # Déduplication : éviter les doublons à label+brand+model identiques
+    if not force_create:
+        existing = _rows("""
+            SELECT accessory_id FROM accessories
+            WHERE LOWER(TRIM(label)) = LOWER(?)
+              AND COALESCE(LOWER(TRIM(brand)), '') = COALESCE(LOWER(?), '')
+              AND COALESCE(LOWER(TRIM(model)), '') = COALESCE(LOWER(?), '')
+              AND (archived IS NULL OR archived = FALSE)
+            LIMIT 1
+        """, [body.label.strip(), body.brand or "", body.model or ""])
+        if existing:
+            return LinkCreateResponse(
+                ok=True,
+                link_id=existing[0]["accessory_id"],
+                message=f"Accessoire existant retourné (doublon évité) : {body.label.strip()}",
+            )
+
     acc_id = str(uuid.uuid4())
     try:
         _run_write(
@@ -3021,11 +3042,32 @@ def list_consumables(
 )
 def create_consumable(
     body: ConsumableCreateRequest,
+    force_create: bool = False,
     _: None = Security(_require_token),
 ) -> LinkCreateResponse:
-    """Ajoute un consommable (foret, lame de scie, abrasif…) au catalogue SIGA."""
+    """Ajoute un consommable (foret, lame de scie, abrasif…) au catalogue SIGA.
+    Si un consommable non-archivé avec le même label+brand+reference existe déjà,
+    retourne l'existant (pas de doublon). Utilisez force_create=true pour forcer."""
     if not body.label or not body.label.strip():
         raise HTTPException(status_code=400, detail="label est obligatoire.")
+
+    # Déduplication : éviter les doublons à label+brand+reference identiques
+    if not force_create:
+        existing = _rows("""
+            SELECT consumable_id FROM consumables
+            WHERE LOWER(TRIM(label)) = LOWER(?)
+              AND COALESCE(LOWER(TRIM(brand)), '') = COALESCE(LOWER(?), '')
+              AND COALESCE(LOWER(TRIM(reference)), '') = COALESCE(LOWER(?), '')
+              AND (archived IS NULL OR archived = FALSE)
+            LIMIT 1
+        """, [body.label.strip(), body.brand or "", body.reference or ""])
+        if existing:
+            return LinkCreateResponse(
+                ok=True,
+                link_id=existing[0]["consumable_id"],
+                message=f"Consommable existant retourné (doublon évité) : {body.label.strip()}",
+            )
+
     con_id = str(uuid.uuid4())
     try:
         _run_write(
@@ -4469,16 +4511,28 @@ def reclassify_equipment(
                 list(updates.values()) + [body.source_equipment_id],
             )
 
-        # 2. Créer les nouveaux accessoires
+        # 2. Créer les nouveaux accessoires (avec déduplication)
         for acc in body.new_accessories:
-            acc_id = str(uuid.uuid4())
-            _run_write(
-                """INSERT INTO accessories (accessory_id, label, brand, model, category, stock_qty, notes,
-                   drive_file_id, created_at, updated_at, migration_status, legacy_source_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
-                [acc_id, acc.label, acc.brand, acc.model, acc.category,
-                 acc.stock_qty, acc.notes, acc.drive_file_id, now, now, body.source_equipment_id],
-            )
+            # Vérifier si un accessoire identique existe déjà (non-archivé)
+            dup = _rows("""
+                SELECT accessory_id FROM accessories
+                WHERE LOWER(TRIM(label)) = LOWER(?)
+                  AND COALESCE(LOWER(TRIM(brand)), '') = COALESCE(LOWER(?), '')
+                  AND COALESCE(LOWER(TRIM(model)), '') = COALESCE(LOWER(?), '')
+                  AND (archived IS NULL OR archived = FALSE)
+                LIMIT 1
+            """, [acc.label or "", acc.brand or "", acc.model or ""])
+            if dup:
+                acc_id = dup[0]["accessory_id"]
+            else:
+                acc_id = str(uuid.uuid4())
+                _run_write(
+                    """INSERT INTO accessories (accessory_id, label, brand, model, category, stock_qty, notes,
+                       drive_file_id, created_at, updated_at, migration_status, legacy_source_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
+                    [acc_id, acc.label, acc.brand, acc.model, acc.category,
+                     acc.stock_qty, acc.notes, acc.drive_file_id, now, now, body.source_equipment_id],
+                )
             created_accessory_ids.append(acc_id)
             # Lier automatiquement à l'équipement source si split_record
             if body.action == "split_record":
@@ -4489,18 +4543,30 @@ def reclassify_equipment(
                 )
                 links_created += 1
 
-        # 3. Créer les nouveaux consommables
+        # 3. Créer les nouveaux consommables (avec déduplication)
         for con in body.new_consumables:
-            con_id = str(uuid.uuid4())
-            _run_write(
-                """INSERT INTO consumables (consumable_id, label, brand, reference, category, unit,
-                   stock_qty, stock_min_alert, notes, drive_file_id, created_at, updated_at,
-                   migration_status, legacy_source_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
-                [con_id, con.label, con.brand, con.reference, con.category, con.unit,
-                 con.stock_qty, con.stock_min_alert, con.notes, con.drive_file_id,
-                 now, now, body.source_equipment_id],
-            )
+            # Vérifier si un consommable identique existe déjà (non-archivé)
+            dup = _rows("""
+                SELECT consumable_id FROM consumables
+                WHERE LOWER(TRIM(label)) = LOWER(?)
+                  AND COALESCE(LOWER(TRIM(brand)), '') = COALESCE(LOWER(?), '')
+                  AND COALESCE(LOWER(TRIM(reference)), '') = COALESCE(LOWER(?), '')
+                  AND (archived IS NULL OR archived = FALSE)
+                LIMIT 1
+            """, [con.label or "", con.brand or "", con.reference or ""])
+            if dup:
+                con_id = dup[0]["consumable_id"]
+            else:
+                con_id = str(uuid.uuid4())
+                _run_write(
+                    """INSERT INTO consumables (consumable_id, label, brand, reference, category, unit,
+                       stock_qty, stock_min_alert, notes, drive_file_id, created_at, updated_at,
+                       migration_status, legacy_source_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'MIGRATED', ?)""",
+                    [con_id, con.label, con.brand, con.reference, con.category, con.unit,
+                     con.stock_qty, con.stock_min_alert, con.notes, con.drive_file_id,
+                     now, now, body.source_equipment_id],
+                )
             created_consumable_ids.append(con_id)
             if body.action == "split_record":
                 link_id = str(uuid.uuid4())
@@ -4670,6 +4736,84 @@ def get_legacy_mapping(
         notes=row.get("notes"),
         created_at=str(row["created_at"]) if row.get("created_at") else None,
     )
+
+
+# ─── Admin : doublons & nettoyage ────────────────────────────
+
+@app.get("/api/admin/duplicates", tags=["v4.1 Admin"], summary="Lister les accessoires/consommables en doublon")
+def admin_duplicates(
+    _: None = Security(_require_token),
+):
+    """Retourne tous les accessoires et consommables dont le label+brand apparaît
+    plus d'une fois parmi les enregistrements non-archivés."""
+    acc_dups = _rows("""
+        SELECT label, brand, COUNT(*) AS count,
+               STRING_AGG(accessory_id, ', ') AS ids
+        FROM accessories
+        WHERE (archived IS NULL OR archived = FALSE)
+        GROUP BY LOWER(TRIM(label)), LOWER(COALESCE(TRIM(brand), ''))
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC, label
+    """)
+    con_dups = _rows("""
+        SELECT label, brand, COUNT(*) AS count,
+               STRING_AGG(consumable_id, ', ') AS ids
+        FROM consumables
+        WHERE (archived IS NULL OR archived = FALSE)
+        GROUP BY LOWER(TRIM(label)), LOWER(COALESCE(TRIM(brand), ''))
+        HAVING COUNT(*) > 1
+        ORDER BY count DESC, label
+    """)
+    return {
+        "ok": True,
+        "accessories_duplicates": acc_dups,
+        "consumables_duplicates": con_dups,
+        "total_accessory_groups": len(acc_dups),
+        "total_consumable_groups": len(con_dups),
+    }
+
+
+@app.post("/api/admin/archive-by-label", tags=["v4.1 Admin"],
+          summary="Archiver tous les enregistrements correspondant à un label+type")
+def admin_archive_by_label(
+    entity_type: str,
+    label: str,
+    brand: Optional[str] = None,
+    _: None = Security(_require_token),
+):
+    """Archive TOUS les enregistrements (y compris doublons) du type donné
+    dont le label correspond (insensible à la casse).
+    entity_type : 'accessory' ou 'consumable'."""
+    now = datetime.utcnow().isoformat()
+    if entity_type == "accessory":
+        rows = _rows("""
+            SELECT accessory_id FROM accessories
+            WHERE LOWER(TRIM(label)) = LOWER(?)
+              AND (archived IS NULL OR archived = FALSE)
+        """, [label.strip()])
+        for r in rows:
+            _run_write(
+                "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
+                [now, r["accessory_id"]],
+            )
+        return {"ok": True, "archived_count": len(rows),
+                "entity_type": "accessory", "label": label}
+    elif entity_type == "consumable":
+        rows = _rows("""
+            SELECT consumable_id FROM consumables
+            WHERE LOWER(TRIM(label)) = LOWER(?)
+              AND (archived IS NULL OR archived = FALSE)
+        """, [label.strip()])
+        for r in rows:
+            _run_write(
+                "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
+                [now, r["consumable_id"]],
+            )
+        return {"ok": True, "archived_count": len(rows),
+                "entity_type": "consumable", "label": label}
+    else:
+        raise HTTPException(status_code=400,
+                            detail="entity_type doit être 'accessory' ou 'consumable'.")
 
 
 # ─── v4.1 : Admin export & doublons ──────────────────────────
