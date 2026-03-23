@@ -37,6 +37,12 @@ DB_PATH = "/files/duckdb/siga_v1.duckdb"
 # Fichier JSON écrit par l'API pour piloter le kiosque sans polling DuckDB
 KIOSK_STATE_FILE = Path(DB_PATH).parent / "kiosk_state.json"
 
+# Dossiers Drive parents pour les entités sans photo existante.
+# Renseigner dans les variables d'environnement du container.
+SIGA_ACCESSORIES_FOLDER_ID = os.environ.get("SIGA_ACCESSORIES_FOLDER_ID", "")
+SIGA_CONSUMABLES_FOLDER_ID = os.environ.get("SIGA_CONSUMABLES_FOLDER_ID", "")
+SIGA_EQUIPEMENTS_FOLDER_ID = os.environ.get("SIGA_EQUIPEMENTS_FOLDER_ID", "")
+
 st.set_page_config(
     page_title="SIGA — Gestion Outillage",
     page_icon="🔧",
@@ -279,6 +285,8 @@ def run_write(sql: str, params=None, _retries: int = 5) -> bool:
                     conn.execute(sql, params)
                 else:
                     conn.execute(sql)
+                conn.commit()
+                conn.execute("CHECKPOINT")
             return True
         except duckdb.IOException as e:
             last_err = e
@@ -686,6 +694,95 @@ def _drive_service_rw():
         import sys
         print(f"[DRIVE_SVC_RW] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
         return None
+
+
+def _drive_upload_file(
+    file_bytes: bytes, filename: str, mime_type: str, parent_folder_id: str
+) -> tuple:
+    """Upload un fichier local vers un dossier Google Drive.
+    Retourne (file_id, web_view_link) en cas de succès, (None, None) sinon."""
+    from googleapiclient.http import MediaIoBaseUpload
+    svc = _drive_service_rw()
+    if svc is None:
+        return None, None
+    try:
+        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
+        f = svc.files().create(
+            body={"name": filename, "parents": [parent_folder_id]},
+            media_body=media,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        ).execute()
+        return f.get("id"), f.get("webViewLink")
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_UPLOAD] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return None, None
+
+
+def _get_or_create_entity_folder(
+    entity_type: str, entity_id: str, parent_folder_id: str
+) -> str:
+    """Retourne le final_drive_folder_id d'une entité (accessoire ou consommable).
+    Si aucun dossier n'existe, en crée un nouveau sous parent_folder_id.
+    entity_type : 'accessory' | 'consumable'
+    Retourne '' si impossible."""
+    # 1. Chercher un dossier existant
+    if entity_type == "equipment":
+        # Pour les équipements, final_drive_folder_id est sur la table equipment
+        df = run_query(
+            "SELECT final_drive_folder_id FROM equipment"
+            " WHERE equipment_id = ? LIMIT 1",
+            [entity_id],
+        )
+        if not df.empty:
+            fid = df.iloc[0]["final_drive_folder_id"]
+            if fid and str(fid) not in ("", "nan", "None"):
+                return str(fid)
+        # Fallback : chercher dans equipment_media
+        df = run_query(
+            "SELECT final_drive_folder_id FROM equipment_media"
+            " WHERE equipment_id = ? AND final_drive_folder_id IS NOT NULL LIMIT 1",
+            [entity_id],
+        )
+    elif entity_type == "accessory":
+        df = run_query(
+            "SELECT final_drive_folder_id FROM accessory_media"
+            " WHERE accessory_id = ? AND final_drive_folder_id IS NOT NULL LIMIT 1",
+            [entity_id],
+        )
+    else:
+        df = run_query(
+            "SELECT final_drive_folder_id FROM consumable_media"
+            " WHERE consumable_id = ? AND final_drive_folder_id IS NOT NULL LIMIT 1",
+            [entity_id],
+        )
+    if not df.empty:
+        fid = df.iloc[0]["final_drive_folder_id"]
+        if fid and str(fid) not in ("", "nan", "None"):
+            return str(fid)
+
+    # 2. Créer un nouveau dossier sous parent_folder_id
+    if not parent_folder_id:
+        return ""
+    svc = _drive_service_rw()
+    if svc is None:
+        return ""
+    try:
+        f = svc.files().create(
+            body={
+                "name": entity_id,
+                "mimeType": "application/vnd.google-apps.folder",
+                "parents": [parent_folder_id],
+            },
+            fields="id",
+            supportsAllDrives=True,
+        ).execute()
+        return f.get("id", "")
+    except Exception as e:
+        import sys
+        print(f"[DRIVE_CREATE_FOLDER] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return ""
 
 
 def trash_drive_folder(folder_id: str) -> bool:
@@ -1937,6 +2034,54 @@ def show_equipment_modal(equipment_id: str):
         else:
             st.info("Aucune image disponible.")
 
+        # ── Ajouter une photo (upload local → Drive) — admins ──
+        if is_admin():
+            with st.expander("➕ Ajouter une photo"):
+                uploaded_file = st.file_uploader(
+                    "Choisir une image depuis l'ordinateur",
+                    type=["jpg", "jpeg", "png", "webp", "gif"],
+                    key=f"eq_upload_{equipment_id}",
+                )
+                new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                        key=f"eq_new_role_{equipment_id}")
+                if uploaded_file is not None:
+                    if st.button("☁️ Uploader sur Drive", key=f"eq_add_photo_{equipment_id}"):
+                        with st.spinner("Recherche du dossier Drive…"):
+                            folder_id = _get_or_create_entity_folder(
+                                "equipment", equipment_id, SIGA_EQUIPEMENTS_FOLDER_ID
+                            )
+                        if not folder_id:
+                            st.error(
+                                "Impossible de déterminer le dossier Drive de cet équipement. "
+                                "Vérifiez que la variable d'environnement **SIGA_EQUIPEMENTS_FOLDER_ID** "
+                                "est configurée dans le container."
+                            )
+                        else:
+                            with st.spinner("Upload en cours…"):
+                                mime = uploaded_file.type or "image/jpeg"
+                                file_id, web_link = _drive_upload_file(
+                                    uploaded_file.read(), uploaded_file.name, mime, folder_id
+                                )
+                            if not file_id:
+                                st.error("Échec de l'upload vers Google Drive.")
+                            else:
+                                next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                                ok = run_write(
+                                    """INSERT INTO equipment_media
+                                           (media_id, equipment_id, final_drive_file_id,
+                                            final_drive_folder_id, filename, mime_type,
+                                            image_role, image_index, attached_by)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
+                                    [str(uuid.uuid4()), equipment_id, file_id,
+                                     folder_id, uploaded_file.name, mime,
+                                     new_role, next_idx],
+                                )
+                                if ok:
+                                    st.success("Photo uploadée et enregistrée.")
+                                    st.rerun()
+                                else:
+                                    st.error("Fichier uploadé sur Drive mais enregistrement DB échoué.")
+
     # ── Détails ───────────────────────────────────────────────
     with right_col:
         st.markdown("**Identification**")
@@ -2023,6 +2168,7 @@ def show_equipment_modal(equipment_id: str):
         FROM links_compatibility lc
         JOIN accessories a ON a.accessory_id = lc.accessory_id
         WHERE lc.equipment_id = ?
+          AND (a.archived IS NULL OR a.archived = FALSE)
         ORDER BY a.label
     """, [equipment_id])
 
@@ -2032,6 +2178,7 @@ def show_equipment_modal(equipment_id: str):
         FROM links_consumables lc
         JOIN consumables c ON c.consumable_id = lc.consumable_id
         WHERE lc.equipment_id = ?
+          AND (c.archived IS NULL OR c.archived = FALSE)
         ORDER BY c.label
     """, [equipment_id])
 
@@ -2337,26 +2484,52 @@ def show_accessory_modal(accessory_id: str):
             )
             st.caption("Aucune image disponible")
 
-        # ── Ajouter une photo (Drive file ID) ─────────────────
+        # ── Ajouter une photo (upload local → Drive) ───────────
         with st.expander("➕ Ajouter une photo"):
-            new_fid = st.text_input("Google Drive file ID", key=f"acc_new_fid_{accessory_id}",
-                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            uploaded_file = st.file_uploader(
+                "Choisir une image depuis l'ordinateur",
+                type=["jpg", "jpeg", "png", "webp", "gif"],
+                key=f"acc_upload_{accessory_id}",
+            )
             new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
                                     key=f"acc_new_role_{accessory_id}")
-            if st.button("💾 Ajouter", key=f"acc_add_photo_{accessory_id}"):
-                nfid = new_fid.strip() if new_fid else ""
-                if not nfid:
-                    st.error("Entrez un Drive file ID.")
-                else:
-                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
-                    ok = run_write("""
-                        INSERT INTO accessory_media
-                            (media_id, accessory_id, final_drive_file_id, image_role, image_index)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, [str(uuid.uuid4()), accessory_id, nfid, new_role, next_idx])
-                    if ok:
-                        st.success("Photo ajoutée.")
-                        st.rerun()
+            if uploaded_file is not None:
+                if st.button("☁️ Uploader sur Drive", key=f"acc_add_photo_{accessory_id}"):
+                    with st.spinner("Upload en cours…"):
+                        folder_id = _get_or_create_entity_folder(
+                            "accessory", accessory_id, SIGA_ACCESSORIES_FOLDER_ID
+                        )
+                    if not folder_id:
+                        st.error(
+                            "Impossible de déterminer le dossier Drive de cet accessoire. "
+                            "Vérifiez que la variable d'environnement **SIGA_ACCESSORIES_FOLDER_ID** "
+                            "est configurée dans le container."
+                        )
+                    else:
+                        with st.spinner("Upload en cours…"):
+                            mime = uploaded_file.type or "image/jpeg"
+                            file_id, web_link = _drive_upload_file(
+                                uploaded_file.read(), uploaded_file.name, mime, folder_id
+                            )
+                        if not file_id:
+                            st.error("Échec de l'upload vers Google Drive.")
+                        else:
+                            next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                            ok = run_write(
+                                """INSERT INTO accessory_media
+                                       (media_id, accessory_id, final_drive_file_id,
+                                        final_drive_folder_id, filename, mime_type,
+                                        image_role, image_index, attached_by)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
+                                [str(uuid.uuid4()), accessory_id, file_id,
+                                 folder_id, uploaded_file.name, mime,
+                                 new_role, next_idx],
+                            )
+                            if ok:
+                                st.success("Photo uploadée et enregistrée.")
+                                st.rerun()
+                            else:
+                                st.error("Fichier uploadé sur Drive mais enregistrement DB échoué.")
 
         # ── Supprimer une photo ────────────────────────────────
         if not media_df.empty:
@@ -2413,6 +2586,7 @@ def show_accessory_modal(accessory_id: str):
         FROM links_compatibility lc
         JOIN equipment e ON e.equipment_id = lc.equipment_id
         WHERE lc.accessory_id = ?
+          AND (e.archived IS NULL OR e.archived = FALSE)
         ORDER BY e.label
     """, [accessory_id])
 
@@ -2432,6 +2606,72 @@ def show_accessory_modal(accessory_id: str):
         )),
     )
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Actions admin ─────────────────────────────────────────
+    if is_admin():
+        st.markdown("---")
+        with st.expander("✏️ Modifier la fiche"):
+            f_label    = st.text_input("Nom / Désignation",
+                                       value=null_str(row.get("label"), ""),
+                                       key=f"acc_edit_label_{accessory_id}")
+            f_brand    = st.text_input("Marque",
+                                       value=null_str(row.get("brand"), ""),
+                                       key=f"acc_edit_brand_{accessory_id}")
+            f_model    = st.text_input("Modèle",
+                                       value=null_str(row.get("model"), ""),
+                                       key=f"acc_edit_model_{accessory_id}")
+            f_category = st.text_input("Catégorie",
+                                       value=null_str(row.get("category"), ""),
+                                       key=f"acc_edit_cat_{accessory_id}")
+            f_location = st.text_input("Emplacement",
+                                       value=null_str(row.get("location_hint"), ""),
+                                       key=f"acc_edit_loc_{accessory_id}")
+            f_stock    = st.number_input("Stock (unités)",
+                                         value=int(row.get("stock_qty") or 0),
+                                         min_value=0, step=1,
+                                         key=f"acc_edit_stock_{accessory_id}")
+            f_notes    = st.text_area("Notes",
+                                      value=null_str(row.get("notes"), ""),
+                                      key=f"acc_edit_notes_{accessory_id}")
+            if st.button("💾 Enregistrer", key=f"acc_save_{accessory_id}",
+                         type="primary", use_container_width=True):
+                ok = run_write("""
+                    UPDATE accessories SET
+                        label=?, brand=?, model=?, category=?,
+                        location_hint=?, stock_qty=?, notes=?, updated_at=?
+                    WHERE accessory_id=?
+                """, [f_label.strip() or None, f_brand.strip() or None,
+                      f_model.strip() or None, f_category.strip() or None,
+                      f_location.strip() or None, int(f_stock),
+                      f_notes.strip() or None,
+                      datetime.utcnow().isoformat(),
+                      accessory_id])
+                if ok:
+                    st.success("✅ Fiche mise à jour.")
+                    st.rerun()
+
+        del_key = f"confirm_del_acc_{accessory_id}"
+        if not st.session_state.get(del_key):
+            if st.button("🗑 Supprimer", key=f"acc_del_{accessory_id}",
+                         use_container_width=True):
+                st.session_state[del_key] = True
+        else:
+            st.warning("⚠️ Cette fiche sera archivée (masquée du catalogue). Confirmer ?")
+            col_yes, col_no = st.columns(2)
+            if col_yes.button("✓ Confirmer", key=f"acc_del_yes_{accessory_id}",
+                              use_container_width=True):
+                ok = run_write(
+                    "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
+                    [datetime.utcnow().isoformat(), accessory_id],
+                )
+                if ok:
+                    st.session_state.pop(del_key, None)
+                    st.rerun()
+                else:
+                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
+            if col_no.button("✗ Annuler", key=f"acc_del_no_{accessory_id}",
+                             use_container_width=True):
+                st.session_state.pop(del_key, None)
 
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
@@ -2528,26 +2768,52 @@ def show_consumable_modal(consumable_id: str):
             )
             st.caption("Aucune image disponible")
 
-        # ── Ajouter une photo (Drive file ID) ─────────────────
+        # ── Ajouter une photo (upload local → Drive) ───────────
         with st.expander("➕ Ajouter une photo"):
-            new_fid = st.text_input("Google Drive file ID", key=f"con_new_fid_{consumable_id}",
-                                    placeholder="ex: 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs")
+            uploaded_file = st.file_uploader(
+                "Choisir une image depuis l'ordinateur",
+                type=["jpg", "jpeg", "png", "webp", "gif"],
+                key=f"con_upload_{consumable_id}",
+            )
             new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
                                     key=f"con_new_role_{consumable_id}")
-            if st.button("💾 Ajouter", key=f"con_add_photo_{consumable_id}"):
-                nfid = new_fid.strip() if new_fid else ""
-                if not nfid:
-                    st.error("Entrez un Drive file ID.")
-                else:
-                    next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
-                    ok = run_write("""
-                        INSERT INTO consumable_media
-                            (media_id, consumable_id, final_drive_file_id, image_role, image_index)
-                        VALUES (?, ?, ?, ?, ?)
-                    """, [str(uuid.uuid4()), consumable_id, nfid, new_role, next_idx])
-                    if ok:
-                        st.success("Photo ajoutée.")
-                        st.rerun()
+            if uploaded_file is not None:
+                if st.button("☁️ Uploader sur Drive", key=f"con_add_photo_{consumable_id}"):
+                    with st.spinner("Upload en cours…"):
+                        folder_id = _get_or_create_entity_folder(
+                            "consumable", consumable_id, SIGA_CONSUMABLES_FOLDER_ID
+                        )
+                    if not folder_id:
+                        st.error(
+                            "Impossible de déterminer le dossier Drive de ce consommable. "
+                            "Vérifiez que la variable d'environnement **SIGA_CONSUMABLES_FOLDER_ID** "
+                            "est configurée dans le container."
+                        )
+                    else:
+                        with st.spinner("Upload en cours…"):
+                            mime = uploaded_file.type or "image/jpeg"
+                            file_id, web_link = _drive_upload_file(
+                                uploaded_file.read(), uploaded_file.name, mime, folder_id
+                            )
+                        if not file_id:
+                            st.error("Échec de l'upload vers Google Drive.")
+                        else:
+                            next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                            ok = run_write(
+                                """INSERT INTO consumable_media
+                                       (media_id, consumable_id, final_drive_file_id,
+                                        final_drive_folder_id, filename, mime_type,
+                                        image_role, image_index, attached_by)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
+                                [str(uuid.uuid4()), consumable_id, file_id,
+                                 folder_id, uploaded_file.name, mime,
+                                 new_role, next_idx],
+                            )
+                            if ok:
+                                st.success("Photo uploadée et enregistrée.")
+                                st.rerun()
+                            else:
+                                st.error("Fichier uploadé sur Drive mais enregistrement DB échoué.")
 
         # ── Supprimer une photo ────────────────────────────────
         if not media_df.empty:
@@ -2645,6 +2911,81 @@ def show_consumable_modal(consumable_id: str):
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # ── Actions admin ─────────────────────────────────────────
+    if is_admin():
+        st.markdown("---")
+        with st.expander("✏️ Modifier la fiche"):
+            f_label     = st.text_input("Nom / Désignation",
+                                        value=null_str(row.get("label"), ""),
+                                        key=f"con_edit_label_{consumable_id}")
+            f_brand     = st.text_input("Marque",
+                                        value=null_str(row.get("brand"), ""),
+                                        key=f"con_edit_brand_{consumable_id}")
+            f_reference = st.text_input("Référence",
+                                        value=null_str(row.get("reference"), ""),
+                                        key=f"con_edit_ref_{consumable_id}")
+            f_category  = st.text_input("Catégorie",
+                                        value=null_str(row.get("category"), ""),
+                                        key=f"con_edit_cat_{consumable_id}")
+            f_unit      = st.text_input("Unité",
+                                        value=null_str(row.get("unit"), "pcs"),
+                                        key=f"con_edit_unit_{consumable_id}")
+            f_location  = st.text_input("Emplacement",
+                                        value=null_str(row.get("location_hint"), ""),
+                                        key=f"con_edit_loc_{consumable_id}")
+            f_stock     = st.number_input("Stock",
+                                          value=float(row.get("stock_qty") or 0),
+                                          min_value=0.0, step=1.0,
+                                          key=f"con_edit_stock_{consumable_id}")
+            f_alert     = st.number_input("Seuil alerte stock",
+                                          value=float(row.get("stock_min_alert") or 0),
+                                          min_value=0.0, step=1.0,
+                                          key=f"con_edit_alert_{consumable_id}")
+            f_notes     = st.text_area("Notes",
+                                       value=null_str(row.get("notes"), ""),
+                                       key=f"con_edit_notes_{consumable_id}")
+            if st.button("💾 Enregistrer", key=f"con_save_{consumable_id}",
+                         type="primary", use_container_width=True):
+                ok = run_write("""
+                    UPDATE consumables SET
+                        label=?, brand=?, reference=?, category=?, unit=?,
+                        location_hint=?, stock_qty=?, stock_min_alert=?,
+                        notes=?, updated_at=?
+                    WHERE consumable_id=?
+                """, [f_label.strip() or None, f_brand.strip() or None,
+                      f_reference.strip() or None, f_category.strip() or None,
+                      f_unit.strip() or None, f_location.strip() or None,
+                      f_stock, f_alert,
+                      f_notes.strip() or None,
+                      datetime.utcnow().isoformat(),
+                      consumable_id])
+                if ok:
+                    st.success("✅ Fiche mise à jour.")
+                    st.rerun()
+
+        del_key = f"confirm_del_con_{consumable_id}"
+        if not st.session_state.get(del_key):
+            if st.button("🗑 Supprimer", key=f"con_del_{consumable_id}",
+                         use_container_width=True):
+                st.session_state[del_key] = True
+        else:
+            st.warning("⚠️ Cette fiche sera archivée (masquée du catalogue). Confirmer ?")
+            col_yes, col_no = st.columns(2)
+            if col_yes.button("✓ Confirmer", key=f"con_del_yes_{consumable_id}",
+                              use_container_width=True):
+                ok = run_write(
+                    "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
+                    [datetime.utcnow().isoformat(), consumable_id],
+                )
+                if ok:
+                    st.session_state.pop(del_key, None)
+                    st.rerun()
+                else:
+                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
+            if col_no.button("✗ Annuler", key=f"con_del_no_{consumable_id}",
+                             use_container_width=True):
+                st.session_state.pop(del_key, None)
+
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
     gov_col1, gov_col2 = st.columns(2)
@@ -2662,6 +3003,17 @@ def render_parc_materiel():
         '<p class="section-subtitle">Catalogue unifié — équipements, accessoires & consommables</p>',
         unsafe_allow_html=True,
     )
+
+    # ── Contrôle cache images ──────────────────────────────────
+    use_cache = st.toggle(
+        "⚡ Cache images activé",
+        value=st.session_state.get("parc_use_cache", True),
+        key="parc_use_cache",
+        help="Désactiver pour forcer le rechargement des images depuis Drive à chaque affichage de la page.",
+    )
+    if not use_cache:
+        get_drive_image_bytes.clear()
+        get_drive_thumb.clear()
 
     # ── Filtres sidebar ────────────────────────────────────────
     with st.sidebar:
@@ -3981,6 +4333,7 @@ def render_preparation_chantier() -> None:
             JOIN accessories a ON a.accessory_id = lc.accessory_id
             JOIN equipment e ON e.equipment_id = lc.equipment_id
             WHERE lc.equipment_id IN ({ids_ph})
+              AND (a.archived IS NULL OR a.archived = FALSE)
             GROUP BY a.accessory_id, a.label, a.brand, a.model, a.stock_qty, a.location_hint
             ORDER BY a.label
             """,
