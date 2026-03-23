@@ -80,14 +80,30 @@ def migrate(db_path: str = DEFAULT_DB_PATH) -> None:
 
         # Colonnes ajoutées en v4.4 (peut-être absentes si la table existait déjà)
         for sql, label in [
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS final_drive_file_id VARCHAR",
+             "accessory_media.final_drive_file_id"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS final_drive_folder_id VARCHAR",
+             "accessory_media.final_drive_folder_id"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS filename VARCHAR",
+             "accessory_media.filename"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS mime_type VARCHAR",
+             "accessory_media.mime_type"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS image_role VARCHAR DEFAULT 'overview'",
+             "accessory_media.image_role"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS image_index INTEGER DEFAULT 0",
+             "accessory_media.image_index"),
             ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT FALSE",
              "accessory_media.is_primary"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS web_view_link VARCHAR",
+             "accessory_media.web_view_link"),
             ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS attached_by VARCHAR DEFAULT 'api'",
              "accessory_media.attached_by"),
             ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
              "accessory_media.attached_at"),
             ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS source_drive_folder_id VARCHAR",
              "accessory_media.source_drive_folder_id"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+             "accessory_media.created_at"),
         ]:
             if not _run(conn, sql, label):
                 errors += 1
@@ -121,14 +137,30 @@ def migrate(db_path: str = DEFAULT_DB_PATH) -> None:
 
         # Colonnes ajoutées en v4.4 (peut-être absentes si la table existait déjà)
         for sql, label in [
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS final_drive_file_id VARCHAR",
+             "consumable_media.final_drive_file_id"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS final_drive_folder_id VARCHAR",
+             "consumable_media.final_drive_folder_id"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS filename VARCHAR",
+             "consumable_media.filename"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS mime_type VARCHAR",
+             "consumable_media.mime_type"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS image_role VARCHAR DEFAULT 'overview'",
+             "consumable_media.image_role"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS image_index INTEGER DEFAULT 0",
+             "consumable_media.image_index"),
             ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT FALSE",
              "consumable_media.is_primary"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS web_view_link VARCHAR",
+             "consumable_media.web_view_link"),
             ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS attached_by VARCHAR DEFAULT 'api'",
              "consumable_media.attached_by"),
             ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
              "consumable_media.attached_at"),
             ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS source_drive_folder_id VARCHAR",
              "consumable_media.source_drive_folder_id"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+             "consumable_media.created_at"),
         ]:
             if not _run(conn, sql, label):
                 errors += 1
