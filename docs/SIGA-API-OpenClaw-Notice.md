@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 4.4 — Mars 2026
+**Version :** 4.5 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -130,6 +130,7 @@ Elle couvre **sept domaines** :
 | **Réservations** | Réserver un outil sur une plage de dates, vérifier les conflits, annuler |
 | **Relationnel v4.0** | Gérer le catalogue accessoires/consommables et leurs liaisons avec les équipements |
 | **Migration & gouvernance v4.1** | Listing complet, CRUD photos, bridge Drive, migration atomique, audit trail, export, doublons |
+| **Déduplication v4.5** | `POST /api/accessories` et `/consumables` idempotents (évitent les doublons automatiquement) ; `GET /api/admin/duplicates` ; `POST /api/admin/archive-by-label` |
 | **Système** | Vérifier que l'API fonctionne |
 
 Toutes les réponses sont en JSON. Les erreurs ont toujours la forme :
@@ -975,8 +976,11 @@ GET /api/accessories
 ### 7.2 Créer un accessoire
 ```
 POST /api/accessories
+POST /api/accessories?force_create=true
 ```
 **Quand l'utiliser :** L'utilisateur ajoute une nouvelle batterie, un chargeur, un adaptateur… au catalogue.
+
+**Déduplication automatique :** avant d'insérer, l'API vérifie si un accessoire non-archivé avec le même `label` + `brand` + `model` (insensible à la casse) existe déjà. Si oui, retourne l'existant sans créer de doublon. Utilisez `?force_create=true` pour forcer la création d'un nouvel enregistrement même en cas de correspondance.
 
 **Corps :**
 ```json
@@ -1001,7 +1005,7 @@ POST /api/accessories
 | `location_hint` | Non | Emplacement dans l'atelier |
 | `notes` | Non | Notes libres |
 
-**Réponse :**
+**Réponse (création) :**
 ```json
 {
   "ok": true,
@@ -1010,7 +1014,16 @@ POST /api/accessories
 }
 ```
 
-> **Note :** le champ `link_id` contient ici l'`accessory_id` créé (convention de réponse unifiée).
+**Réponse (doublon détecté — existant retourné) :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-acc-existant-...",
+  "message": "Accessoire existant retourné (doublon évité) : Batterie 18V 5Ah"
+}
+```
+
+> **Note :** le champ `link_id` contient ici l'`accessory_id` créé ou existant (convention de réponse unifiée).
 
 ---
 
@@ -1058,8 +1071,11 @@ GET /api/consumables
 ### 7.4 Créer un consommable
 ```
 POST /api/consumables
+POST /api/consumables?force_create=true
 ```
 **Quand l'utiliser :** L'utilisateur ajoute des forets, des lames de scie, du papier abrasif, de la visserie… au catalogue.
+
+**Déduplication automatique :** avant d'insérer, l'API vérifie si un consommable non-archivé avec le même `label` + `brand` + `reference` (insensible à la casse) existe déjà. Si oui, retourne l'existant sans créer de doublon. Utilisez `?force_create=true` pour forcer la création.
 
 **Corps :**
 ```json
@@ -1087,6 +1103,23 @@ POST /api/consumables
 | `stock_min_alert` | Non (défaut: 0) | Seuil d'alerte (stock_ok devient false en dessous) |
 | `location_hint` | Non | Emplacement dans l'atelier |
 | `notes` | Non | Notes libres |
+
+**Réponse (création) :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-con-...",
+  "message": "Consommable 'Foret SDS-Plus Ø10 béton' créé (id=uuid-con-...)."
+}
+```
+
+**Réponse (doublon détecté — existant retourné) :**
+```json
+{
+  "ok": true,
+  "link_id": "uuid-con-existant-...",
+  "message": "Consommable existant retourné (doublon évité) : Foret SDS-Plus Ø10 béton"
+}
 
 ---
 
@@ -2300,27 +2333,59 @@ Exporte l'intégralité de l'inventaire (équipements, accessoires, consommables
 }
 ```
 
-### 9.14 Détection de doublons
+### 9.14 Détection et nettoyage de doublons *(v4.5)*
+
+#### Lister les doublons existants
 
 ```
-GET /api/admin/duplicates?threshold=0.85
+GET /api/admin/duplicates
 ```
 
-Compare les `label + brand + model` de toutes les entités et signale les groupes au-dessus du seuil de similarité (0.0–1.0, défaut 0.85).
+Retourne tous les groupes d'accessoires et consommables **non-archivés** dont le `label + brand` apparaît plus d'une fois en base (correspondance exacte, insensible à la casse). Ne couvre pas les équipements.
 
 **Réponse :**
 ```json
 {
-  "count": 2,
-  "groups": [
+  "ok": true,
+  "accessories_duplicates": [
     {
-      "entity_type": "equipment",
-      "ids": ["uuid-a-...", "uuid-b-..."],
-      "labels": ["Perceuse Bosch", "Perceuse Bosch Pro"],
-      "similarity_score": 0.923,
-      "reason": "label/brand/model similaires"
+      "label": "Jeu de lames pour outil multifonction AEG",
+      "brand": "AEG",
+      "count": 3,
+      "ids": "uuid-a-..., uuid-b-..., uuid-c-..."
     }
-  ]
+  ],
+  "consumables_duplicates": [],
+  "total_accessory_groups": 1,
+  "total_consumable_groups": 0
+}
+```
+
+> **À utiliser avant toute création** d'accessoire ou consommable pour vérifier l'absence de doublon. Les endpoints `POST /api/accessories` et `POST /api/consumables` font cette vérification automatiquement depuis la v4.5, mais cet endpoint permet un audit manuel.
+
+#### Archiver tous les enregistrements d'un même label
+
+```
+POST /api/admin/archive-by-label?entity_type=accessory&label=Jeu+de+lames+pour+outil+multifonction+AEG
+POST /api/admin/archive-by-label?entity_type=consumable&label=Foret+SDS-Plus+Ø10+béton
+```
+
+Archive **tous** les enregistrements non-archivés du type donné dont le label correspond (insensible à la casse). Utile pour nettoyer tous les doublons d'une fiche en une seule opération.
+
+**Paramètres :**
+
+| Paramètre | Obligatoire | Description |
+|---|---|---|
+| `entity_type` | Oui | `accessory` ou `consumable` |
+| `label` | Oui | Label exact à archiver (insensible à la casse) |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "archived_count": 3,
+  "entity_type": "accessory",
+  "label": "Jeu de lames pour outil multifonction AEG"
 }
 ```
 
