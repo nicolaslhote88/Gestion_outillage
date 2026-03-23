@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 4.2 — Mars 2026
+**Version :** 4.3 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -1297,6 +1297,11 @@ DELETE /api/links/consumables/{link_id}
 | DELETE | `/api/links/compatibility/{link_id}` | Oui | Supprimer une liaison accessoire |
 | POST | `/api/links/consumables` | Oui | Lier un consommable ↔ équipement |
 | DELETE | `/api/links/consumables/{link_id}` | Oui | Supprimer une liaison consommable |
+| **Photos orphelines v4.3** | | | |
+| GET | `/api/drive/orphan-photos?equipment_id=\|folder_id=` | Oui | Fichiers Drive non référencés dans la base |
+| POST | `/api/equipment/{id}/photos/attach` | Oui | Attacher une photo orpheline à un équipement |
+| POST | `/api/accessories/{id}/photos/attach` | Oui | Attacher une photo à un accessoire |
+| POST | `/api/consumables/{id}/photos/attach` | Oui | Attacher une photo à un consommable |
 
 ---
 
@@ -2296,6 +2301,188 @@ Compare les `label + brand + model` de toutes les entités et signale les groupe
   ]
 }
 ```
+
+### 9.15 Photos orphelines *(v4.3)*
+
+> **Contexte :** Avant v4.3, `PUT /api/equipment/{id}/photos` échouait avec une erreur
+> `Constraint Error: NOT NULL` sur `ingestion_id`, car les photos créées par l'API
+> (hors pipeline n8n) n'ont pas d'`ingestion_id`. La migration v4.3 rend ce champ nullable
+> et ajoute les endpoints ci-dessous pour qu'une IA puisse traiter les photos orphelines.
+
+#### Détecter les photos orphelines dans un dossier Drive
+
+```
+GET /api/drive/orphan-photos?equipment_id=<uuid>
+GET /api/drive/orphan-photos?folder_id=<drive_folder_id>
+```
+
+Retourne les fichiers présents dans un dossier Drive mais absents de `equipment_media`.
+
+**Paramètres (au moins un obligatoire) :**
+- `equipment_id` : utilise le `final_drive_folder_id` de la fiche comme dossier cible
+- `folder_id` : ID Drive direct du dossier (utile si l'équipement n'a pas encore de `final_drive_folder_id`)
+
+**Réponse :**
+```json
+{
+  "folder_id": "1FolderDriveId...",
+  "equipment_id": "uuid-...",
+  "total_files_in_folder": 4,
+  "already_linked": 1,
+  "orphan_count": 3,
+  "orphans": [
+    {
+      "file_id": "1HGGLwGlmVY...",
+      "name": "overview.jpg",
+      "mime_type": "image/jpeg",
+      "size": 245000,
+      "web_view_link": "https://drive.google.com/file/d/..."
+    }
+  ]
+}
+```
+
+**Points clés :**
+- Appeler cet endpoint AVANT d'attacher des photos pour connaître exactement ce qui est orphelin
+- `already_linked` indique combien de fichiers du dossier sont déjà référencés — ne pas les ré-attacher
+
+---
+
+#### Attacher une photo orpheline à un équipement
+
+```
+POST /api/equipment/{equipment_id}/photos/attach
+```
+
+Crée un nouveau lien dans `equipment_media` **sans effacer les photos existantes** (contrairement à `PUT /photos` qui remplace tout).
+
+**Corps :**
+```json
+{
+  "file_id": "1HGGLwGlmVY...",
+  "role": "overview",
+  "folder_id": "1FolderDriveId...",
+  "filename": "dewalt_dc540_overview.jpg",
+  "mime_type": "image/jpeg",
+  "is_primary": true,
+  "attached_by": "openclaw"
+}
+```
+
+| Champ | Obligatoire | Valeurs |
+|---|---|---|
+| `file_id` | Oui | Drive file_id de la photo |
+| `role` | Non (défaut: `overview`) | `overview` · `nameplate` · `detail` |
+| `folder_id` | Non | Drive folder_id parent |
+| `filename` | Non | Nom du fichier |
+| `mime_type` | Non | `image/jpeg` · `image/png` · … |
+| `is_primary` | Non (défaut: `false`) | `true` pour la photo principale |
+| `attached_by` | Non (défaut: `openclaw`) | Traçabilité — qui a fait l'attachement |
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "media_id": "uuid-media-...",
+  "equipment_id": "uuid-...",
+  "file_id": "1HGGLwGlmVY...",
+  "role": "overview",
+  "image_index": 1,
+  "message": "Photo attachée à l'équipement (role=overview, index=1)."
+}
+```
+
+**Erreur 409 si doublon :**
+```json
+{
+  "detail": "Le fichier 1HGGLwGlmVY... est déjà lié à cet équipement (media_id=uuid-...)."
+}
+```
+
+**Points clés :**
+- Idempotent en cas de re-tentative : une 409 signifie que la photo est déjà liée
+- Calcule automatiquement l'`image_index` suivant (max existant + 1)
+- Ne requiert PAS d'`ingestion_id` — conçu pour les photos créées hors pipeline n8n
+
+---
+
+#### Attacher une photo à un accessoire ou consommable
+
+```
+POST /api/accessories/{accessory_id}/photos/attach
+POST /api/consumables/{consumable_id}/photos/attach
+```
+
+Met à jour le champ `drive_file_id` de l'entité (les accessoires et consommables n'ont qu'une seule photo principale).
+
+**Corps :**
+```json
+{
+  "file_id": "1AbCdEfGh...",
+  "role": "overview",
+  "attached_by": "openclaw"
+}
+```
+
+**Réponse :**
+```json
+{
+  "ok": true,
+  "accessory_id": "uuid-acc-...",
+  "file_id": "1AbCdEfGh...",
+  "message": "Photo attachée à l'accessoire."
+}
+```
+
+---
+
+### Situation X — Rattacher des photos orphelines à une fiche *(processus complet v4.3)*
+
+Ce processus s'applique quand des photos existent physiquement dans un dossier Drive mais ne sont pas référencées dans la base SIGA (photos créées par n8n ou OpenClaw mais jamais liées, ou liées à la mauvaise fiche).
+
+```
+PRÉREQUIS : s'assurer que migrate_to_v4_3.py a été exécuté sur la base DuckDB.
+
+ÉTAPE 1 — Identifier les photos orphelines
+  GET /api/drive/orphan-photos?equipment_id=<uuid>
+  → Lire le champ "orphans" : liste des file_ids non référencés
+  → Si orphan_count = 0 : rien à faire
+
+ÉTAPE 2 — Analyser visuellement chaque photo orpheline
+  GET /api/drive/files/{file_id}
+  → Voir le nom, la taille, le lien Drive
+  → VÉRIFIER que la photo correspond bien à la fiche cible (pas une photo d'un autre objet)
+  → Déterminer le rôle : overview / nameplate / detail
+
+ÉTAPE 3 — Attacher chaque photo individuellement
+  Pour chaque photo orpheline confirmée visuellement :
+    POST /api/equipment/{equipment_id}/photos/attach
+    {
+      "file_id": "<file_id>",
+      "role": "<overview|nameplate|detail>",
+      "folder_id": "<folder_id_du_dossier>",
+      "filename": "<nom_fichier>",
+      "is_primary": true   ← seulement pour la première / la plus représentative
+    }
+  → En cas de 409 : la photo est déjà liée — passer à la suivante
+  → En cas d'erreur 503 : réessayer après quelques secondes (DuckDB busy)
+
+ÉTAPE 4 — Vérification
+  GET /api/equipment/{equipment_id}/photos
+  → Vérifier que toutes les photos attendues sont maintenant listées
+  GET /api/drive/orphan-photos?equipment_id=<uuid>
+  → Vérifier que orphan_count = 0
+
+ÉTAPE 5 — Marquer la fiche comme revue
+  PATCH /api/equipment/{equipment_id}
+  { "migration_status": "REVIEWED", "migrated_by": "openclaw" }
+```
+
+**Message type OpenClaw en fin de processus :**
+> "Fiche DEWALT DC540 complétée :
+> - 3 photos orphelines rattachées (overview, nameplate, detail)
+> - Statut mis à jour : REVIEWED
+> - Dossier Drive cohérent : 4 fichiers, 4 référencés, 0 orphelins"
 
 ---
 

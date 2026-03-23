@@ -49,6 +49,10 @@ Opérations :
   DELETE /api/consumables/{id}             → archiver (hard=true pour supprimer)
   GET  /api/equipment/{id}/photos           → liste des photos
   PUT  /api/equipment/{id}/photos           → remplacer les photos
+  POST /api/equipment/{id}/photos/attach    → attacher une photo orpheline (v4.3)
+  POST /api/accessories/{id}/photos/attach  → attacher une photo à un accessoire (v4.3)
+  POST /api/consumables/{id}/photos/attach  → attacher une photo à un consommable (v4.3)
+  GET  /api/drive/orphan-photos             → photos Drive non référencées (v4.3)
   GET  /api/drive/folder/{folder_id}        → lister un dossier Drive
   GET  /api/drive/files/{file_id}           → métadonnées fichier Drive
   POST /api/drive/folder                    → créer un dossier Drive
@@ -866,6 +870,17 @@ class PhotoRefInput(BaseModel):
 
 class PhotoUpdateRequest(BaseModel):
     photos: List[PhotoRefInput]   # remplace entièrement la liste des photos
+
+
+class PhotoAttachRequest(BaseModel):
+    """Attache une photo Drive orpheline à une entité SIGA (v4.3)."""
+    file_id: str                           # Drive file_id (obligatoire)
+    role: str = "overview"                 # overview | nameplate | detail
+    folder_id: Optional[str] = None        # Drive folder_id parent (optionnel)
+    filename: Optional[str] = None         # nom du fichier (optionnel)
+    mime_type: Optional[str] = None        # type MIME (optionnel)
+    is_primary: bool = False
+    attached_by: str = "openclaw"          # traçabilité : qui a attaché la photo
 
 
 class PhotoListResponse(BaseModel):
@@ -3732,8 +3747,12 @@ def put_equipment_photos(
     _: None = Security(_require_token),
 ):
     """Remplace entièrement la liste de photos d'un équipement."""
-    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
+    eq_rows = _rows("SELECT equipment_id, ingestion_id FROM equipment WHERE equipment_id = ?", [equipment_id])
+    if not eq_rows:
         raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+
+    # ingestion_id hérité de la fiche — peut être NULL après migration v4.3
+    ingestion_id = eq_rows[0].get("ingestion_id")
 
     try:
         _run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
@@ -3741,20 +3760,23 @@ def put_equipment_photos(
             media_id = str(uuid.uuid4())
             _run_write(
                 """INSERT INTO equipment_media
-                   (media_id, equipment_id, final_drive_file_id, final_drive_folder_id,
-                    filename, mime_type, image_role, image_index, is_primary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   (media_id, equipment_id, ingestion_id,
+                    final_drive_file_id, final_drive_folder_id,
+                    filename, mime_type, image_role, image_index, is_primary,
+                    attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'api', CURRENT_TIMESTAMP)
                    ON CONFLICT (media_id) DO UPDATE SET
-                       final_drive_file_id = EXCLUDED.final_drive_file_id,
+                       final_drive_file_id   = EXCLUDED.final_drive_file_id,
                        final_drive_folder_id = EXCLUDED.final_drive_folder_id,
-                       filename = EXCLUDED.filename,
-                       mime_type = EXCLUDED.mime_type,
-                       image_role = EXCLUDED.image_role,
-                       image_index = EXCLUDED.image_index,
-                       is_primary = EXCLUDED.is_primary""",
+                       filename              = EXCLUDED.filename,
+                       mime_type             = EXCLUDED.mime_type,
+                       image_role            = EXCLUDED.image_role,
+                       image_index           = EXCLUDED.image_index,
+                       is_primary            = EXCLUDED.is_primary""",
                 [
                     media_id,
                     equipment_id,
+                    ingestion_id,
                     photo.file_id,
                     photo.folder_id,
                     photo.filename,
@@ -3768,6 +3790,229 @@ def put_equipment_photos(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     return {"ok": True, "equipment_id": equipment_id, "photos_count": len(body.photos)}
+
+
+# ─── v4.1 : Bridge Google Drive ──────────────────────────────
+
+# ─── v4.3 : Attach photo orpheline & détection photos non référencées ────────
+
+@app.post(
+    "/api/equipment/{equipment_id}/photos/attach",
+    tags=["v4.3 Photos orphelines"],
+    summary="Attacher une photo Drive orpheline à un équipement",
+)
+def attach_equipment_photo(
+    equipment_id: str,
+    body: PhotoAttachRequest,
+    _: None = Security(_require_token),
+):
+    """Crée un nouveau lien equipment_media pour un fichier Drive qui n'était
+    pas encore référencé dans la base. Contrairement à PUT /photos qui remplace
+    toute la liste, cet endpoint ajoute une seule photo sans toucher aux autres.
+
+    Cas d'usage : rattacher une photo orpheline identifiée via
+    GET /api/drive/orphan-photos ou GET /api/drive/folder/{id}.
+
+    Retourne une erreur 409 si le file_id est déjà lié à cet équipement.
+    """
+    eq_rows = _rows(
+        "SELECT equipment_id, ingestion_id FROM equipment WHERE equipment_id = ?",
+        [equipment_id],
+    )
+    if not eq_rows:
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+
+    ingestion_id = eq_rows[0].get("ingestion_id")
+
+    # Vérifier si ce file_id est déjà lié à cet équipement
+    existing = _rows(
+        "SELECT media_id FROM equipment_media WHERE equipment_id = ? AND final_drive_file_id = ?",
+        [equipment_id, body.file_id],
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Le fichier {body.file_id} est déjà lié à cet équipement (media_id={existing[0]['media_id']}).",
+        )
+
+    # Calculer l'index suivant
+    idx_rows = _rows(
+        "SELECT COALESCE(MAX(image_index), -1) + 1 AS next_idx FROM equipment_media WHERE equipment_id = ?",
+        [equipment_id],
+    )
+    next_idx = int(idx_rows[0]["next_idx"]) if idx_rows else 0
+
+    media_id = str(uuid.uuid4())
+    try:
+        _run_write(
+            """INSERT INTO equipment_media
+               (media_id, equipment_id, ingestion_id,
+                final_drive_file_id, final_drive_folder_id,
+                filename, mime_type, image_role, image_index, is_primary,
+                attached_by, attached_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            [
+                media_id,
+                equipment_id,
+                ingestion_id,
+                body.file_id,
+                body.folder_id,
+                body.filename,
+                body.mime_type,
+                body.role or "overview",
+                next_idx,
+                body.is_primary,
+                body.attached_by,
+            ],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "media_id": media_id,
+        "equipment_id": equipment_id,
+        "file_id": body.file_id,
+        "role": body.role,
+        "image_index": next_idx,
+        "message": f"Photo attachée à l'équipement (role={body.role}, index={next_idx}).",
+    }
+
+
+@app.post(
+    "/api/accessories/{accessory_id}/photos/attach",
+    tags=["v4.3 Photos orphelines"],
+    summary="Attacher une photo Drive à un accessoire",
+)
+def attach_accessory_photo(
+    accessory_id: str,
+    body: PhotoAttachRequest,
+    _: None = Security(_require_token),
+):
+    """Définit (ou remplace) la photo principale d'un accessoire.
+    Les accessoires n'ont qu'un seul champ drive_file_id — cet endpoint le met à jour.
+    """
+    if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
+        raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+    try:
+        _run_write(
+            "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
+            [body.file_id, datetime.utcnow().isoformat(), accessory_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "accessory_id": accessory_id,
+        "file_id": body.file_id,
+        "message": "Photo attachée à l'accessoire.",
+    }
+
+
+@app.post(
+    "/api/consumables/{consumable_id}/photos/attach",
+    tags=["v4.3 Photos orphelines"],
+    summary="Attacher une photo Drive à un consommable",
+)
+def attach_consumable_photo(
+    consumable_id: str,
+    body: PhotoAttachRequest,
+    _: None = Security(_require_token),
+):
+    """Définit (ou remplace) la photo principale d'un consommable."""
+    if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
+        raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+    try:
+        _run_write(
+            "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
+            [body.file_id, datetime.utcnow().isoformat(), consumable_id],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    return {
+        "ok": True,
+        "consumable_id": consumable_id,
+        "file_id": body.file_id,
+        "message": "Photo attachée au consommable.",
+    }
+
+
+@app.get(
+    "/api/drive/orphan-photos",
+    tags=["v4.3 Photos orphelines"],
+    summary="Lister les fichiers Drive non référencés dans la base",
+)
+def drive_orphan_photos(
+    equipment_id: Optional[str] = None,
+    folder_id: Optional[str] = None,
+    _: None = Security(_require_token),
+):
+    """Liste les fichiers présents dans un dossier Drive mais absents de
+    equipment_media (photos orphelines, non référencées).
+
+    Paramètres (au moins un requis) :
+    - equipment_id : utilise le drive_folder_id de la fiche (final_drive_folder_id)
+    - folder_id    : ID Drive direct du dossier à analyser
+
+    Retourne pour chaque fichier orphelin : file_id, name, mimeType, size.
+    """
+    if not _DRIVE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Google Drive non configuré sur ce serveur.")
+
+    # Résoudre le folder_id si non fourni
+    target_folder_id = folder_id
+    if not target_folder_id and equipment_id:
+        eq_rows = _rows(
+            "SELECT final_drive_folder_id FROM equipment WHERE equipment_id = ?",
+            [equipment_id],
+        )
+        if not eq_rows:
+            raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+        target_folder_id = eq_rows[0].get("final_drive_folder_id")
+        if not target_folder_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"L'équipement {equipment_id} n'a pas de final_drive_folder_id renseigné. "
+                       "Fournir folder_id directement.",
+            )
+
+    if not target_folder_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Fournir equipment_id ou folder_id.",
+        )
+
+    # Fichiers dans le dossier Drive
+    raw_files = _drive_list_folder(target_folder_id)
+    drive_file_ids = {f["id"] for f in raw_files}
+
+    if not drive_file_ids:
+        return {"folder_id": target_folder_id, "orphan_count": 0, "orphans": []}
+
+    # File IDs déjà référencés dans equipment_media
+    ph = ", ".join(["?"] * len(drive_file_ids))
+    known_rows = _rows(
+        f"SELECT DISTINCT final_drive_file_id FROM equipment_media WHERE final_drive_file_id IN ({ph})",
+        list(drive_file_ids),
+    )
+    known_ids = {r["final_drive_file_id"] for r in known_rows}
+
+    orphans = [
+        _map_drive_file(f)
+        for f in raw_files
+        if f["id"] not in known_ids
+    ]
+
+    return {
+        "folder_id": target_folder_id,
+        "equipment_id": equipment_id,
+        "total_files_in_folder": len(raw_files),
+        "already_linked": len(known_ids),
+        "orphan_count": len(orphans),
+        "orphans": orphans,
+    }
 
 
 # ─── v4.1 : Bridge Google Drive ──────────────────────────────
