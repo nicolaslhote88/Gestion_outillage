@@ -50,16 +50,20 @@ Opérations :
   GET  /api/equipment/{id}/photos           → liste des photos
   PUT  /api/equipment/{id}/photos           → remplacer les photos
   POST /api/equipment/{id}/photos/attach    → attacher une photo orpheline (v4.3)
-  POST /api/accessories/{id}/photos/attach  → attacher une photo à un accessoire (v4.3)
-  POST /api/consumables/{id}/photos/attach  → attacher une photo à un consommable (v4.3)
-  GET  /api/drive/orphan-photos             → photos Drive non référencées (v4.3)
+  GET  /api/accessories/{id}/photos         → liste des photos accessoire (v4.4)
+  PUT  /api/accessories/{id}/photos         → remplacer les photos accessoire (v4.4)
+  POST /api/accessories/{id}/photos/attach  → attacher une photo orpheline à un accessoire (v4.4)
+  GET  /api/consumables/{id}/photos         → liste des photos consommable (v4.4)
+  PUT  /api/consumables/{id}/photos         → remplacer les photos consommable (v4.4)
+  POST /api/consumables/{id}/photos/attach  → attacher une photo orpheline à un consommable (v4.4)
+  GET  /api/drive/orphan-photos             → photos Drive non référencées dans toutes les tables (v4.4)
   GET  /api/drive/folder/{folder_id}        → lister un dossier Drive
   GET  /api/drive/files/{file_id}           → métadonnées fichier Drive
   POST /api/drive/folder                    → créer un dossier Drive
   POST /api/drive/files/{file_id}/move      → déplacer un fichier Drive
   POST /api/drive/files/{file_id}/copy      → copier un fichier Drive
   PATCH /api/drive/files/{file_id}/rename   → renommer un fichier Drive
-  POST /api/media/reassign                  → réassigner une photo entre entités
+  POST /api/media/reassign                  → réassigner une photo entre toutes entités (v4.4)
   POST /api/admin/migrations/reclassify     → migration atomique (dry_run supporté)
   GET  /api/admin/migrations/logs           → journal d'audit
   GET  /api/admin/migrations/legacy-mappings/{id} → traçabilité legacy → canonical
@@ -900,7 +904,9 @@ class AccessoryFullResponse(BaseModel):
     description: Optional[str] = None
     stock_qty: int = 0
     location_hint: Optional[str] = None
-    drive_file_id: Optional[str] = None
+    drive_file_id: Optional[str] = None   # conservé pour rétrocompatibilité
+    photos: List[EquipmentPhotoRef] = []   # multi-photos via accessory_media (v4.4)
+    photo_count: int = 0
     notes: Optional[str] = None
     ai_metadata: Optional[Dict] = None
     archived: bool = False
@@ -937,7 +943,9 @@ class ConsumableFullResponse(BaseModel):
     stock_qty: float = 0
     stock_min_alert: float = 0
     location_hint: Optional[str] = None
-    drive_file_id: Optional[str] = None
+    drive_file_id: Optional[str] = None   # conservé pour rétrocompatibilité
+    photos: List[EquipmentPhotoRef] = []   # multi-photos via consumable_media (v4.4)
+    photo_count: int = 0
     notes: Optional[str] = None
     ai_metadata: Optional[Dict] = None
     archived: bool = False
@@ -3544,6 +3552,27 @@ def get_accessory_full(
             ai_meta = json.loads(row["ai_metadata"])
         except Exception:
             ai_meta = {"raw": row["ai_metadata"]}
+    # Photos multi depuis accessory_media (v4.4)
+    photos: List[EquipmentPhotoRef] = []
+    try:
+        photo_rows = _rows(
+            "SELECT * FROM accessory_media WHERE accessory_id = ? ORDER BY image_index",
+            [accessory_id],
+        )
+        for p in photo_rows:
+            photos.append(EquipmentPhotoRef(
+                photo_id=p["media_id"],
+                file_id=p.get("final_drive_file_id"),
+                folder_id=p.get("final_drive_folder_id"),
+                filename=p.get("filename"),
+                mime_type=p.get("mime_type"),
+                role=p.get("image_role", "overview"),
+                sort_order=int(p.get("image_index") or 0),
+                is_primary=bool(p.get("is_primary") or False),
+                web_view_link=p.get("web_view_link"),
+            ))
+    except Exception:
+        pass
     return AccessoryFullResponse(
         accessory_id=row["accessory_id"],
         label=row.get("label", ""),
@@ -3554,6 +3583,8 @@ def get_accessory_full(
         stock_qty=int(row.get("stock_qty", 0)),
         location_hint=row.get("location_hint"),
         drive_file_id=row.get("drive_file_id"),
+        photos=photos,
+        photo_count=len(photos),
         notes=row.get("notes"),
         ai_metadata=ai_meta,
         archived=bool(row.get("archived", False)),
@@ -3634,6 +3665,27 @@ def get_consumable_full(
             ai_meta = json.loads(row["ai_metadata"])
         except Exception:
             ai_meta = {"raw": row["ai_metadata"]}
+    # Photos multi depuis consumable_media (v4.4)
+    photos: List[EquipmentPhotoRef] = []
+    try:
+        photo_rows = _rows(
+            "SELECT * FROM consumable_media WHERE consumable_id = ? ORDER BY image_index",
+            [consumable_id],
+        )
+        for p in photo_rows:
+            photos.append(EquipmentPhotoRef(
+                photo_id=p["media_id"],
+                file_id=p.get("final_drive_file_id"),
+                folder_id=p.get("final_drive_folder_id"),
+                filename=p.get("filename"),
+                mime_type=p.get("mime_type"),
+                role=p.get("image_role", "overview"),
+                sort_order=int(p.get("image_index") or 0),
+                is_primary=bool(p.get("is_primary") or False),
+                web_view_link=p.get("web_view_link"),
+            ))
+    except Exception:
+        pass
     return ConsumableFullResponse(
         consumable_id=row["consumable_id"],
         label=row.get("label", ""),
@@ -3646,6 +3698,8 @@ def get_consumable_full(
         stock_min_alert=float(row.get("stock_min_alert", 0)),
         location_hint=row.get("location_hint"),
         drive_file_id=row.get("drive_file_id"),
+        photos=photos,
+        photo_count=len(photos),
         notes=row.get("notes"),
         ai_metadata=ai_meta,
         archived=bool(row.get("archived", False)),
@@ -3881,80 +3935,152 @@ def attach_equipment_photo(
 
 @app.post(
     "/api/accessories/{accessory_id}/photos/attach",
-    tags=["v4.3 Photos orphelines"],
-    summary="Attacher une photo Drive à un accessoire",
+    tags=["v4.4 Multi-photos"],
+    summary="Attacher une photo Drive orpheline à un accessoire",
 )
 def attach_accessory_photo(
     accessory_id: str,
     body: PhotoAttachRequest,
     _: None = Security(_require_token),
 ):
-    """Définit (ou remplace) la photo principale d'un accessoire.
-    Les accessoires n'ont qu'un seul champ drive_file_id — cet endpoint le met à jour.
+    """Insère une photo dans accessory_media. Renvoie 409 si le file_id est déjà lié.
+    Met aussi à jour accessories.drive_file_id pour rétrocompatibilité si c'est la première photo (is_primary).
     """
     if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
+
+    # Vérifier doublon
+    existing = _rows(
+        "SELECT media_id FROM accessory_media WHERE accessory_id = ? AND final_drive_file_id = ?",
+        [accessory_id, body.file_id],
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Le fichier {body.file_id} est déjà lié à l'accessoire {accessory_id}.")
+
+    # Calcul image_index
+    idx_rows = _rows(
+        "SELECT COALESCE(MAX(image_index), -1) + 1 AS next_idx FROM accessory_media WHERE accessory_id = ?",
+        [accessory_id],
+    )
+    next_idx = idx_rows[0]["next_idx"] if idx_rows else 0
+    is_primary = next_idx == 0
+
+    media_id = str(uuid.uuid4())
+    role = body.role or "overview"
+    now = datetime.utcnow().isoformat()
     try:
         _run_write(
-            "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
-            [body.file_id, datetime.utcnow().isoformat(), accessory_id],
+            """INSERT INTO accessory_media
+               (media_id, accessory_id, final_drive_file_id, image_role, image_index, is_primary,
+                attached_by, attached_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
+            [media_id, accessory_id, body.file_id, role, next_idx, is_primary, now],
         )
+        # Rétrocompatibilité : mettre à jour drive_file_id si photo primaire
+        if is_primary:
+            _run_write(
+                "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
+                [body.file_id, now, accessory_id],
+            )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     return {
         "ok": True,
+        "media_id": media_id,
         "accessory_id": accessory_id,
         "file_id": body.file_id,
-        "message": "Photo attachée à l'accessoire.",
+        "role": role,
+        "image_index": next_idx,
+        "is_primary": is_primary,
+        "message": f"Photo attachée à l'accessoire (role={role}, index={next_idx}).",
     }
 
 
 @app.post(
     "/api/consumables/{consumable_id}/photos/attach",
-    tags=["v4.3 Photos orphelines"],
-    summary="Attacher une photo Drive à un consommable",
+    tags=["v4.4 Multi-photos"],
+    summary="Attacher une photo Drive orpheline à un consommable",
 )
 def attach_consumable_photo(
     consumable_id: str,
     body: PhotoAttachRequest,
     _: None = Security(_require_token),
 ):
-    """Définit (ou remplace) la photo principale d'un consommable."""
+    """Insère une photo dans consumable_media. Renvoie 409 si le file_id est déjà lié.
+    Met aussi à jour consumables.drive_file_id pour rétrocompatibilité si c'est la première photo (is_primary).
+    """
     if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
+
+    # Vérifier doublon
+    existing = _rows(
+        "SELECT media_id FROM consumable_media WHERE consumable_id = ? AND final_drive_file_id = ?",
+        [consumable_id, body.file_id],
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Le fichier {body.file_id} est déjà lié au consommable {consumable_id}.")
+
+    # Calcul image_index
+    idx_rows = _rows(
+        "SELECT COALESCE(MAX(image_index), -1) + 1 AS next_idx FROM consumable_media WHERE consumable_id = ?",
+        [consumable_id],
+    )
+    next_idx = idx_rows[0]["next_idx"] if idx_rows else 0
+    is_primary = next_idx == 0
+
+    media_id = str(uuid.uuid4())
+    role = body.role or "overview"
+    now = datetime.utcnow().isoformat()
     try:
         _run_write(
-            "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
-            [body.file_id, datetime.utcnow().isoformat(), consumable_id],
+            """INSERT INTO consumable_media
+               (media_id, consumable_id, final_drive_file_id, image_role, image_index, is_primary,
+                attached_by, attached_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
+            [media_id, consumable_id, body.file_id, role, next_idx, is_primary, now],
         )
+        # Rétrocompatibilité : mettre à jour drive_file_id si photo primaire
+        if is_primary:
+            _run_write(
+                "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
+                [body.file_id, now, consumable_id],
+            )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
     return {
         "ok": True,
+        "media_id": media_id,
         "consumable_id": consumable_id,
         "file_id": body.file_id,
-        "message": "Photo attachée au consommable.",
+        "role": role,
+        "image_index": next_idx,
+        "is_primary": is_primary,
+        "message": f"Photo attachée au consommable (role={role}, index={next_idx}).",
     }
 
 
 @app.get(
     "/api/drive/orphan-photos",
-    tags=["v4.3 Photos orphelines"],
+    tags=["v4.4 Multi-photos"],
     summary="Lister les fichiers Drive non référencés dans la base",
 )
 def drive_orphan_photos(
     equipment_id: Optional[str] = None,
+    accessory_id: Optional[str] = None,
+    consumable_id: Optional[str] = None,
     folder_id: Optional[str] = None,
     _: None = Security(_require_token),
 ):
-    """Liste les fichiers présents dans un dossier Drive mais absents de
-    equipment_media (photos orphelines, non référencées).
+    """Liste les fichiers présents dans un dossier Drive mais absents de toutes les tables
+    media (equipment_media, accessory_media, consumable_media) — photos orphelines.
 
     Paramètres (au moins un requis) :
-    - equipment_id : utilise le drive_folder_id de la fiche (final_drive_folder_id)
-    - folder_id    : ID Drive direct du dossier à analyser
+    - equipment_id  : utilise final_drive_folder_id de l'équipement
+    - accessory_id  : utilise final_drive_folder_id de l'accessoire (accessory_media)
+    - consumable_id : utilise final_drive_folder_id du consommable (consumable_media)
+    - folder_id     : ID Drive direct du dossier à analyser
 
     Retourne pour chaque fichier orphelin : file_id, name, mimeType, size.
     """
@@ -3963,6 +4089,8 @@ def drive_orphan_photos(
 
     # Résoudre le folder_id si non fourni
     target_folder_id = folder_id
+    entity_label = None
+
     if not target_folder_id and equipment_id:
         eq_rows = _rows(
             "SELECT final_drive_folder_id FROM equipment WHERE equipment_id = ?",
@@ -3977,11 +4105,42 @@ def drive_orphan_photos(
                 detail=f"L'équipement {equipment_id} n'a pas de final_drive_folder_id renseigné. "
                        "Fournir folder_id directement.",
             )
+        entity_label = f"equipment/{equipment_id}"
+
+    if not target_folder_id and accessory_id:
+        acc_rows = _rows(
+            "SELECT final_drive_folder_id FROM accessory_media WHERE accessory_id = ? LIMIT 1",
+            [accessory_id],
+        )
+        if acc_rows and acc_rows[0].get("final_drive_folder_id"):
+            target_folder_id = acc_rows[0]["final_drive_folder_id"]
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Aucun final_drive_folder_id trouvé pour l'accessoire {accessory_id}. "
+                       "Fournir folder_id directement.",
+            )
+        entity_label = f"accessory/{accessory_id}"
+
+    if not target_folder_id and consumable_id:
+        con_rows = _rows(
+            "SELECT final_drive_folder_id FROM consumable_media WHERE consumable_id = ? LIMIT 1",
+            [consumable_id],
+        )
+        if con_rows and con_rows[0].get("final_drive_folder_id"):
+            target_folder_id = con_rows[0]["final_drive_folder_id"]
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Aucun final_drive_folder_id trouvé pour le consommable {consumable_id}. "
+                       "Fournir folder_id directement.",
+            )
+        entity_label = f"consumable/{consumable_id}"
 
     if not target_folder_id:
         raise HTTPException(
             status_code=422,
-            detail="Fournir equipment_id ou folder_id.",
+            detail="Fournir equipment_id, accessory_id, consumable_id, ou folder_id.",
         )
 
     # Fichiers dans le dossier Drive
@@ -3991,13 +4150,21 @@ def drive_orphan_photos(
     if not drive_file_ids:
         return {"folder_id": target_folder_id, "orphan_count": 0, "orphans": []}
 
-    # File IDs déjà référencés dans equipment_media
     ph = ", ".join(["?"] * len(drive_file_ids))
-    known_rows = _rows(
-        f"SELECT DISTINCT final_drive_file_id FROM equipment_media WHERE final_drive_file_id IN ({ph})",
-        list(drive_file_ids),
-    )
-    known_ids = {r["final_drive_file_id"] for r in known_rows}
+    ids_list = list(drive_file_ids)
+
+    # File IDs référencés dans toutes les tables media
+    known_ids: set = set()
+    for media_table, col in [
+        ("equipment_media", "final_drive_file_id"),
+        ("accessory_media", "final_drive_file_id"),
+        ("consumable_media", "final_drive_file_id"),
+    ]:
+        rows = _rows(
+            f"SELECT DISTINCT {col} FROM {media_table} WHERE {col} IN ({ph})",
+            ids_list,
+        )
+        known_ids.update(r[col] for r in rows if r[col])
 
     orphans = [
         _map_drive_file(f)
@@ -4007,7 +4174,10 @@ def drive_orphan_photos(
 
     return {
         "folder_id": target_folder_id,
+        "entity": entity_label,
         "equipment_id": equipment_id,
+        "accessory_id": accessory_id,
+        "consumable_id": consumable_id,
         "total_files_in_folder": len(raw_files),
         "already_linked": len(known_ids),
         "orphan_count": len(orphans),
@@ -4099,20 +4269,36 @@ def drive_rename_file(
 
 # ─── v4.1 : Réassignation photo ──────────────────────────────
 
-@app.post("/api/media/reassign", tags=["v4.1 Photos"], summary="Réassigner une photo vers une autre entité")
+@app.post("/api/media/reassign", tags=["v4.4 Multi-photos"], summary="Réassigner une photo entre entités")
 def media_reassign(
     body: MediaReassignRequest,
     _: None = Security(_require_token),
 ):
-    """Déplace ou copie une photo entre entités. Supporte equipment→equipment, equipment→accessory, equipment→consumable."""
+    """Déplace ou copie une photo entre entités.
+    Supporte toutes les combinaisons : equipment, accessory, consumable → equipment, accessory, consumable.
+    source_entity_type : "equipment" (défaut) | "accessory" | "consumable"
+    """
 
-    # Vérifier la photo source
+    # ── Résoudre la table source et récupérer la photo ────────────────────────
+    src_type = body.source_entity_type  # "equipment" | "accessory" | "consumable"
+    if src_type == "equipment":
+        src_table = "equipment_media"
+        src_id_col = "equipment_id"
+    elif src_type == "accessory":
+        src_table = "accessory_media"
+        src_id_col = "accessory_id"
+    elif src_type == "consumable":
+        src_table = "consumable_media"
+        src_id_col = "consumable_id"
+    else:
+        raise HTTPException(status_code=400, detail=f"Type d'entité source inconnu : {src_type}")
+
     src_rows = _rows(
-        "SELECT * FROM equipment_media WHERE media_id = ? AND equipment_id = ?",
+        f"SELECT * FROM {src_table} WHERE media_id = ? AND {src_id_col} = ?",
         [body.photo_id, body.source_entity_id],
     )
     if not src_rows:
-        raise HTTPException(status_code=404, detail=f"Photo {body.photo_id} introuvable sur {body.source_entity_id}.")
+        raise HTTPException(status_code=404, detail=f"Photo {body.photo_id} introuvable sur {src_type}/{body.source_entity_id}.")
 
     src = src_rows[0]
     final_file_id = src.get("final_drive_file_id")
@@ -4120,31 +4306,69 @@ def media_reassign(
 
     # Copie Drive si demandée
     if body.mode == "copy" and _DRIVE_AVAILABLE and final_file_id:
-        new_file_id = _drive_copy_file(final_file_id, None)  # copie sans déplacement de dossier
+        new_file_id = _drive_copy_file(final_file_id, None)
+
+    now = datetime.utcnow().isoformat()
+    dest_file_id = new_file_id or final_file_id
+    role = src.get("image_role", "overview")
 
     try:
+        # ── Insérer dans la table cible ───────────────────────────────────────
         if body.target_entity_type == "equipment":
-            # Créer / mettre à jour dans equipment_media
             new_media_id = str(uuid.uuid4())
             _run_write(
-                """INSERT INTO equipment_media (media_id, equipment_id, final_drive_file_id, image_role, image_index)
-                   VALUES (?, ?, ?, ?, 0)""",
-                [new_media_id, body.target_entity_id, new_file_id or final_file_id,
-                 src.get("image_role", "overview")],
+                """INSERT INTO equipment_media
+                   (media_id, equipment_id, final_drive_file_id, image_role, image_index, attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, 0, 'api', ?)""",
+                [new_media_id, body.target_entity_id, dest_file_id, role, now],
             )
-        elif body.target_entity_type in ("accessory", "consumable"):
-            table = "accessories" if body.target_entity_type == "accessory" else "consumables"
-            id_col = "accessory_id" if body.target_entity_type == "accessory" else "consumable_id"
+        elif body.target_entity_type == "accessory":
+            # Calcul image_index sur la cible
+            idx_rows = _rows(
+                "SELECT COALESCE(MAX(image_index), -1) + 1 AS next_idx FROM accessory_media WHERE accessory_id = ?",
+                [body.target_entity_id],
+            )
+            next_idx = idx_rows[0]["next_idx"] if idx_rows else 0
+            is_primary = next_idx == 0
+            new_media_id = str(uuid.uuid4())
             _run_write(
-                f"UPDATE {table} SET drive_file_id = ?, updated_at = ? WHERE {id_col} = ?",
-                [new_file_id or final_file_id, datetime.utcnow().isoformat(), body.target_entity_id],
+                """INSERT INTO accessory_media
+                   (media_id, accessory_id, final_drive_file_id, image_role, image_index, is_primary,
+                    attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
+                [new_media_id, body.target_entity_id, dest_file_id, role, next_idx, is_primary, now],
             )
+            if is_primary:
+                _run_write(
+                    "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
+                    [dest_file_id, now, body.target_entity_id],
+                )
+        elif body.target_entity_type == "consumable":
+            idx_rows = _rows(
+                "SELECT COALESCE(MAX(image_index), -1) + 1 AS next_idx FROM consumable_media WHERE consumable_id = ?",
+                [body.target_entity_id],
+            )
+            next_idx = idx_rows[0]["next_idx"] if idx_rows else 0
+            is_primary = next_idx == 0
+            new_media_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO consumable_media
+                   (media_id, consumable_id, final_drive_file_id, image_role, image_index, is_primary,
+                    attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
+                [new_media_id, body.target_entity_id, dest_file_id, role, next_idx, is_primary, now],
+            )
+            if is_primary:
+                _run_write(
+                    "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
+                    [dest_file_id, now, body.target_entity_id],
+                )
         else:
             raise HTTPException(status_code=400, detail=f"Type d'entité cible inconnu : {body.target_entity_type}")
 
         # Supprimer la source si mode=move
         if body.mode == "move":
-            _run_write("DELETE FROM equipment_media WHERE media_id = ?", [body.photo_id])
+            _run_write(f"DELETE FROM {src_table} WHERE media_id = ?", [body.photo_id])
 
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
@@ -4153,7 +4377,7 @@ def media_reassign(
         ok=True,
         photo_id=body.photo_id,
         new_file_id=new_file_id,
-        message=f"Photo {body.mode}ée vers {body.target_entity_type}/{body.target_entity_id}.",
+        message=f"Photo {body.mode}ée de {src_type}/{body.source_entity_id} vers {body.target_entity_type}/{body.target_entity_id}.",
     )
 
 
@@ -4712,20 +4936,27 @@ def get_accessory_photos(
     accessory_id: str,
     _: None = Security(_require_token),
 ) -> PhotoListResponse:
-    """Retourne la photo principale d'un accessoire (stockée dans drive_file_id)."""
-    rows = _rows("SELECT * FROM accessories WHERE accessory_id = ?", [accessory_id])
-    if not rows:
+    """Retourne toutes les photos d'un accessoire depuis accessory_media (v4.4)."""
+    if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
-    row = rows[0]
-    photos: List[EquipmentPhotoRef] = []
-    if row.get("drive_file_id"):
-        photos.append(EquipmentPhotoRef(
-            photo_id=f"{accessory_id}_primary",
-            file_id=row["drive_file_id"],
-            role="overview",
-            sort_order=0,
-            is_primary=True,
-        ))
+    photo_rows = _rows(
+        "SELECT * FROM accessory_media WHERE accessory_id = ? ORDER BY image_index",
+        [accessory_id],
+    )
+    photos = [
+        EquipmentPhotoRef(
+            photo_id=p["media_id"],
+            file_id=p.get("final_drive_file_id"),
+            folder_id=p.get("final_drive_folder_id"),
+            filename=p.get("filename"),
+            mime_type=p.get("mime_type"),
+            role=p.get("image_role", "overview"),
+            sort_order=int(p.get("image_index") or 0),
+            is_primary=bool(p.get("is_primary") or False),
+            web_view_link=p.get("web_view_link"),
+        )
+        for p in photo_rows
+    ]
     return PhotoListResponse(equipment_id=accessory_id, photos=photos, count=len(photos))
 
 
@@ -4739,15 +4970,33 @@ def put_accessory_photos(
     body: PhotoUpdateRequest,
     _: None = Security(_require_token),
 ):
-    """Met à jour la photo principale d'un accessoire via drive_file_id."""
+    """Remplace entièrement la liste de photos d'un accessoire via accessory_media (v4.4)."""
     if not _rows("SELECT accessory_id FROM accessories WHERE accessory_id = ?", [accessory_id]):
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
-    primary_file_id = body.photos[0].file_id if body.photos else None
     try:
-        _run_write(
-            "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
-            [primary_file_id, datetime.utcnow().isoformat(), accessory_id],
-        )
+        _run_write("DELETE FROM accessory_media WHERE accessory_id = ?", [accessory_id])
+        for i, photo in enumerate(body.photos):
+            media_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO accessory_media
+                   (media_id, accessory_id, final_drive_file_id, final_drive_folder_id,
+                    filename, mime_type, image_role, image_index, is_primary,
+                    attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'api', CURRENT_TIMESTAMP)""",
+                [
+                    media_id, accessory_id, photo.file_id, photo.folder_id,
+                    photo.filename, photo.mime_type, photo.role or "overview",
+                    photo.sort_order if photo.sort_order is not None else i,
+                    photo.is_primary,
+                ],
+            )
+        # Mettre à jour drive_file_id (rétrocompatibilité) avec la photo primaire
+        primary = next((p for p in body.photos if p.is_primary), body.photos[0] if body.photos else None)
+        if primary:
+            _run_write(
+                "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
+                [primary.file_id, datetime.utcnow().isoformat(), accessory_id],
+            )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return {"ok": True, "accessory_id": accessory_id, "photos_count": len(body.photos)}
@@ -4762,20 +5011,27 @@ def get_consumable_photos(
     consumable_id: str,
     _: None = Security(_require_token),
 ) -> PhotoListResponse:
-    """Retourne la photo principale d'un consommable (stockée dans drive_file_id)."""
-    rows = _rows("SELECT * FROM consumables WHERE consumable_id = ?", [consumable_id])
-    if not rows:
+    """Retourne toutes les photos d'un consommable depuis consumable_media (v4.4)."""
+    if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
-    row = rows[0]
-    photos: List[EquipmentPhotoRef] = []
-    if row.get("drive_file_id"):
-        photos.append(EquipmentPhotoRef(
-            photo_id=f"{consumable_id}_primary",
-            file_id=row["drive_file_id"],
-            role="overview",
-            sort_order=0,
-            is_primary=True,
-        ))
+    photo_rows = _rows(
+        "SELECT * FROM consumable_media WHERE consumable_id = ? ORDER BY image_index",
+        [consumable_id],
+    )
+    photos = [
+        EquipmentPhotoRef(
+            photo_id=p["media_id"],
+            file_id=p.get("final_drive_file_id"),
+            folder_id=p.get("final_drive_folder_id"),
+            filename=p.get("filename"),
+            mime_type=p.get("mime_type"),
+            role=p.get("image_role", "overview"),
+            sort_order=int(p.get("image_index") or 0),
+            is_primary=bool(p.get("is_primary") or False),
+            web_view_link=p.get("web_view_link"),
+        )
+        for p in photo_rows
+    ]
     return PhotoListResponse(equipment_id=consumable_id, photos=photos, count=len(photos))
 
 
@@ -4789,15 +5045,32 @@ def put_consumable_photos(
     body: PhotoUpdateRequest,
     _: None = Security(_require_token),
 ):
-    """Met à jour la photo principale d'un consommable via drive_file_id."""
+    """Remplace entièrement la liste de photos d'un consommable via consumable_media (v4.4)."""
     if not _rows("SELECT consumable_id FROM consumables WHERE consumable_id = ?", [consumable_id]):
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
-    primary_file_id = body.photos[0].file_id if body.photos else None
     try:
-        _run_write(
-            "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
-            [primary_file_id, datetime.utcnow().isoformat(), consumable_id],
-        )
+        _run_write("DELETE FROM consumable_media WHERE consumable_id = ?", [consumable_id])
+        for i, photo in enumerate(body.photos):
+            media_id = str(uuid.uuid4())
+            _run_write(
+                """INSERT INTO consumable_media
+                   (media_id, consumable_id, final_drive_file_id, final_drive_folder_id,
+                    filename, mime_type, image_role, image_index, is_primary,
+                    attached_by, attached_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'api', CURRENT_TIMESTAMP)""",
+                [
+                    media_id, consumable_id, photo.file_id, photo.folder_id,
+                    photo.filename, photo.mime_type, photo.role or "overview",
+                    photo.sort_order if photo.sort_order is not None else i,
+                    photo.is_primary,
+                ],
+            )
+        primary = next((p for p in body.photos if p.is_primary), body.photos[0] if body.photos else None)
+        if primary:
+            _run_write(
+                "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
+                [primary.file_id, datetime.utcnow().isoformat(), consumable_id],
+            )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return {"ok": True, "consumable_id": consumable_id, "photos_count": len(body.photos)}

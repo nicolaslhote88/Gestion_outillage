@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 4.3 — Mars 2026
+**Version :** 4.4 — Mars 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -1298,10 +1298,15 @@ DELETE /api/links/consumables/{link_id}
 | POST | `/api/links/consumables` | Oui | Lier un consommable ↔ équipement |
 | DELETE | `/api/links/consumables/{link_id}` | Oui | Supprimer une liaison consommable |
 | **Photos orphelines v4.3** | | | |
-| GET | `/api/drive/orphan-photos?equipment_id=\|folder_id=` | Oui | Fichiers Drive non référencés dans la base |
+| GET | `/api/drive/orphan-photos?equipment_id=\|folder_id=` | Oui | Fichiers Drive non référencés dans toutes les tables media |
 | POST | `/api/equipment/{id}/photos/attach` | Oui | Attacher une photo orpheline à un équipement |
-| POST | `/api/accessories/{id}/photos/attach` | Oui | Attacher une photo à un accessoire |
-| POST | `/api/consumables/{id}/photos/attach` | Oui | Attacher une photo à un consommable |
+| **Multi-photos accessoires & consommables v4.4** | | | |
+| GET | `/api/accessories/{id}/photos` | Oui | Lister les photos d'un accessoire (accessory_media) |
+| PUT | `/api/accessories/{id}/photos` | Oui | Remplacer la galerie photos d'un accessoire |
+| POST | `/api/accessories/{id}/photos/attach` | Oui | Attacher une photo orpheline à un accessoire (sans effacer) |
+| GET | `/api/consumables/{id}/photos` | Oui | Lister les photos d'un consommable (consumable_media) |
+| PUT | `/api/consumables/{id}/photos` | Oui | Remplacer la galerie photos d'un consommable |
+| POST | `/api/consumables/{id}/photos/attach` | Oui | Attacher une photo orpheline à un consommable (sans effacer) |
 
 ---
 
@@ -2015,27 +2020,41 @@ DELETE /api/consumables/{consumable_id}   → soft-delete
 DELETE /api/consumables/{consumable_id}?hard=true  → suppression physique
 ```
 
-### 9.7 Gestion des photos
+### 9.7 Gestion des photos *(v4.4 — multi-photos pour toutes les entités)*
 
 > **PRINCIPE FONDAMENTAL :** Toute modification de photo implique DEUX opérations indissociables :
 > 1. Déplacer le fichier physiquement sur Drive (`POST /api/drive/files/{id}/move`)
-> 2. Mettre à jour la référence dans la base SIGA (`PUT /api/equipment/{id}/photos`)
+> 2. Mettre à jour la référence dans la base SIGA (`PUT /api/{entity}/{id}/photos`)
 > Ces deux opérations doivent toujours être effectuées ensemble, dans cet ordre.
 > **Ne jamais faire l'une sans l'autre.**
 
-```
-GET /api/equipment/{equipment_id}/photos
-```
-Liste toutes les photos (`equipment_media`) d'un équipement. Retourne les `media_id`, `final_drive_file_id`, `image_role`, `image_index`.
+> **Depuis v4.4 :** Les **accessoires** et **consommables** supportent plusieurs photos, stockées dans les tables `accessory_media` et `consumable_media`. Les endpoints photo sont symétriques pour les 3 types d'entités.
 
-**Utilisation typique :** avant toute opération sur les photos, toujours appeler cet endpoint pour connaître l'état actuel.
+#### Endpoints photo par type d'entité
 
-```
-PUT /api/equipment/{equipment_id}/photos
-```
-Remplace entièrement la liste de photos. **Opération atomique** : la liste fournie remplace l'intégralité de `equipment_media` pour cet équipement.
+| Endpoint | Entité | Table | Description |
+|---|---|---|---|
+| `GET /api/equipment/{id}/photos` | Équipement | `equipment_media` | Lister les photos |
+| `PUT /api/equipment/{id}/photos` | Équipement | `equipment_media` | Remplacer toute la galerie |
+| `POST /api/equipment/{id}/photos/attach` | Équipement | `equipment_media` | Ajouter une photo orpheline |
+| `GET /api/accessories/{id}/photos` | Accessoire | `accessory_media` | Lister les photos |
+| `PUT /api/accessories/{id}/photos` | Accessoire | `accessory_media` | Remplacer toute la galerie |
+| `POST /api/accessories/{id}/photos/attach` | Accessoire | `accessory_media` | Ajouter une photo orpheline |
+| `GET /api/consumables/{id}/photos` | Consommable | `consumable_media` | Lister les photos |
+| `PUT /api/consumables/{id}/photos` | Consommable | `consumable_media` | Remplacer toute la galerie |
+| `POST /api/consumables/{id}/photos/attach` | Consommable | `consumable_media` | Ajouter une photo orpheline |
 
-Body :
+#### GET /api/{entity}/{id}/photos
+
+Liste toutes les photos d'une entité. Retourne `media_id`, `final_drive_file_id`, `image_role`, `image_index`, `is_primary`.
+
+**Utilisation typique :** toujours appeler cet endpoint avant toute opération sur les photos pour connaître l'état actuel.
+
+#### PUT /api/{entity}/{id}/photos
+
+Remplace entièrement la galerie. **Opération atomique** : la liste fournie remplace l'intégralité de la table `*_media` pour cette entité.
+
+Body (identique pour equipment, accessory, consumable) :
 ```json
 {
   "photos": [
@@ -2066,19 +2085,19 @@ Body :
    POST /api/drive/files/{file_id}/move  { "new_parent_id": "<folder_id_fiche_cible>" }
 
 2. Lire les photos existantes :
-   GET /api/equipment/{id}/photos
+   GET /api/{entity}/{id}/photos
 
 3. Mettre à jour la liste avec la nouvelle photo :
-   PUT /api/equipment/{id}/photos  { "photos": [...existantes + { final_drive_file_id: file_id, image_role, image_index }] }
+   PUT /api/{entity}/{id}/photos  { "photos": [...existantes + { final_drive_file_id: file_id, image_role, image_index }] }
 ```
 
 **Séquence obligatoire pour retirer une photo :**
 ```
 1. Lire les photos existantes :
-   GET /api/equipment/{id}/photos
+   GET /api/{entity}/{id}/photos
 
 2. Mettre à jour la liste sans la photo à retirer :
-   PUT /api/equipment/{id}/photos  { "photos": [...existantes SAUF la photo retirée] }
+   PUT /api/{entity}/{id}/photos  { "photos": [...existantes SAUF la photo retirée] }
 
 3. Si la photo doit être supprimée définitivement de Drive :
    (action manuelle — ne pas supprimer sans confirmation utilisateur)
@@ -2133,13 +2152,13 @@ PATCH /api/drive/files/{file_id}/rename    → renommer
 { "new_name": "Bosch_GBH_overview.jpg" }
 ```
 
-### 9.9 Réassignation photo
+### 9.9 Réassignation photo *(v4.4 — toutes entités)*
 
 ```
 POST /api/media/reassign
 ```
 
-Déplace ou copie une photo d'une entité vers une autre.
+Déplace ou copie une photo entre entités. Supporte toutes les combinaisons : equipment, accessory, consumable → equipment, accessory, consumable.
 
 **Body :**
 ```json
@@ -2153,8 +2172,11 @@ Déplace ou copie une photo d'une entité vers une autre.
 }
 ```
 
-`mode` : `move` (supprime la source) | `copy` (garde les deux)
+`source_entity_type` : `equipment` (défaut) | `accessory` | `consumable`
 `target_entity_type` : `equipment` | `accessory` | `consumable`
+`mode` : `move` (supprime la source) | `copy` (garde les deux)
+
+> **Note :** `photo_id` est le `media_id` dans la table `*_media` correspondant au `source_entity_type`. Pour une source accessoire, c'est le `media_id` dans `accessory_media`.
 
 ### 9.10 Migration atomique (reclassification)
 
@@ -2302,30 +2324,33 @@ Compare les `label + brand + model` de toutes les entités et signale les groupe
 }
 ```
 
-### 9.15 Photos orphelines *(v4.3)*
+### 9.15 Photos orphelines & multi-photos *(v4.3 → v4.4)*
 
-> **Contexte :** Avant v4.3, `PUT /api/equipment/{id}/photos` échouait avec une erreur
-> `Constraint Error: NOT NULL` sur `ingestion_id`, car les photos créées par l'API
-> (hors pipeline n8n) n'ont pas d'`ingestion_id`. La migration v4.3 rend ce champ nullable
-> et ajoute les endpoints ci-dessous pour qu'une IA puisse traiter les photos orphelines.
+> **v4.3 :** `PUT /api/equipment/{id}/photos` corrigé (ingestion_id rendu nullable) + endpoints `attach` ajoutés.
+> **v4.4 :** Les accessoires et consommables supportent désormais plusieurs photos via `accessory_media` / `consumable_media`. Les endpoints `attach` insèrent dans ces tables (au lieu de simplement écraser `drive_file_id`).
 
 #### Détecter les photos orphelines dans un dossier Drive
 
 ```
 GET /api/drive/orphan-photos?equipment_id=<uuid>
+GET /api/drive/orphan-photos?accessory_id=<uuid>
+GET /api/drive/orphan-photos?consumable_id=<uuid>
 GET /api/drive/orphan-photos?folder_id=<drive_folder_id>
 ```
 
-Retourne les fichiers présents dans un dossier Drive mais absents de `equipment_media`.
+Retourne les fichiers présents dans un dossier Drive mais absents de **toutes** les tables media (`equipment_media`, `accessory_media`, `consumable_media`).
 
 **Paramètres (au moins un obligatoire) :**
-- `equipment_id` : utilise le `final_drive_folder_id` de la fiche comme dossier cible
-- `folder_id` : ID Drive direct du dossier (utile si l'équipement n'a pas encore de `final_drive_folder_id`)
+- `equipment_id` : utilise le `final_drive_folder_id` de l'équipement
+- `accessory_id` : utilise le `final_drive_folder_id` de l'accessoire (depuis `accessory_media`)
+- `consumable_id` : utilise le `final_drive_folder_id` du consommable (depuis `consumable_media`)
+- `folder_id` : ID Drive direct du dossier (si l'entité n'a pas encore de `final_drive_folder_id`)
 
 **Réponse :**
 ```json
 {
   "folder_id": "1FolderDriveId...",
+  "entity": "equipment/uuid-...",
   "equipment_id": "uuid-...",
   "total_files_in_folder": 4,
   "already_linked": 1,
@@ -2344,19 +2369,21 @@ Retourne les fichiers présents dans un dossier Drive mais absents de `equipment
 
 **Points clés :**
 - Appeler cet endpoint AVANT d'attacher des photos pour connaître exactement ce qui est orphelin
-- `already_linked` indique combien de fichiers du dossier sont déjà référencés — ne pas les ré-attacher
+- `already_linked` inclut les fichiers référencés dans **n'importe laquelle** des 3 tables media — ne pas les ré-attacher
 
 ---
 
-#### Attacher une photo orpheline à un équipement
+#### Attacher une photo orpheline à une fiche (sans effacer les existantes)
 
 ```
 POST /api/equipment/{equipment_id}/photos/attach
+POST /api/accessories/{accessory_id}/photos/attach
+POST /api/consumables/{consumable_id}/photos/attach
 ```
 
-Crée un nouveau lien dans `equipment_media` **sans effacer les photos existantes** (contrairement à `PUT /photos` qui remplace tout).
+Insère une nouvelle entrée dans la table `*_media` correspondante **sans effacer les photos existantes** (contrairement à `PUT /photos` qui remplace tout).
 
-**Corps :**
+**Corps (identique pour les 3 types d'entité) :**
 ```json
 {
   "file_id": "1HGGLwGlmVY...",
@@ -2373,78 +2400,52 @@ Crée un nouveau lien dans `equipment_media` **sans effacer les photos existante
 |---|---|---|
 | `file_id` | Oui | Drive file_id de la photo |
 | `role` | Non (défaut: `overview`) | `overview` · `nameplate` · `detail` |
-| `folder_id` | Non | Drive folder_id parent |
+| `folder_id` | Non | Drive folder_id parent (traçabilité) |
 | `filename` | Non | Nom du fichier |
 | `mime_type` | Non | `image/jpeg` · `image/png` · … |
-| `is_primary` | Non (défaut: `false`) | `true` pour la photo principale |
+| `is_primary` | Non (défaut: auto) | Calculé automatiquement si première photo |
 | `attached_by` | Non (défaut: `openclaw`) | Traçabilité — qui a fait l'attachement |
 
-**Réponse :**
+**Réponse (pour accessoire) :**
 ```json
 {
   "ok": true,
   "media_id": "uuid-media-...",
-  "equipment_id": "uuid-...",
+  "accessory_id": "uuid-acc-...",
   "file_id": "1HGGLwGlmVY...",
   "role": "overview",
-  "image_index": 1,
-  "message": "Photo attachée à l'équipement (role=overview, index=1)."
+  "image_index": 0,
+  "is_primary": true,
+  "message": "Photo attachée à l'accessoire (role=overview, index=0)."
 }
 ```
 
 **Erreur 409 si doublon :**
 ```json
 {
-  "detail": "Le fichier 1HGGLwGlmVY... est déjà lié à cet équipement (media_id=uuid-...)."
+  "detail": "Le fichier 1HGGLwGlmVY... est déjà lié à l'accessoire uuid-acc-..."
 }
 ```
 
 **Points clés :**
-- Idempotent en cas de re-tentative : une 409 signifie que la photo est déjà liée
-- Calcule automatiquement l'`image_index` suivant (max existant + 1)
-- Ne requiert PAS d'`ingestion_id` — conçu pour les photos créées hors pipeline n8n
+- `image_index` est calculé automatiquement (max existant + 1)
+- La première photo ajoutée (`image_index=0`) devient automatiquement `is_primary=true` et met à jour `drive_file_id` pour la rétrocompatibilité
+- 409 = déjà lié : traiter comme succès, passer à la suivante
+- Ne requiert PAS d'`ingestion_id`
 
 ---
 
-#### Attacher une photo à un accessoire ou consommable
+### Situation X — Rattacher des photos orphelines à une fiche *(processus complet v4.3/v4.4)*
+
+Ce processus s'applique quand des photos existent physiquement dans un dossier Drive mais ne sont pas référencées dans la base SIGA (photos créées par n8n ou OpenClaw mais jamais liées, ou liées à la mauvaise fiche). Fonctionne pour les 3 types d'entité : équipement, accessoire, consommable.
 
 ```
-POST /api/accessories/{accessory_id}/photos/attach
-POST /api/consumables/{consumable_id}/photos/attach
-```
-
-Met à jour le champ `drive_file_id` de l'entité (les accessoires et consommables n'ont qu'une seule photo principale).
-
-**Corps :**
-```json
-{
-  "file_id": "1AbCdEfGh...",
-  "role": "overview",
-  "attached_by": "openclaw"
-}
-```
-
-**Réponse :**
-```json
-{
-  "ok": true,
-  "accessory_id": "uuid-acc-...",
-  "file_id": "1AbCdEfGh...",
-  "message": "Photo attachée à l'accessoire."
-}
-```
-
----
-
-### Situation X — Rattacher des photos orphelines à une fiche *(processus complet v4.3)*
-
-Ce processus s'applique quand des photos existent physiquement dans un dossier Drive mais ne sont pas référencées dans la base SIGA (photos créées par n8n ou OpenClaw mais jamais liées, ou liées à la mauvaise fiche).
-
-```
-PRÉREQUIS : s'assurer que migrate_to_v4_3.py a été exécuté sur la base DuckDB.
+PRÉREQUIS : s'assurer que migrate_to_v4_3.py et migrate_to_v4_4.py ont été exécutés.
 
 ÉTAPE 1 — Identifier les photos orphelines
-  GET /api/drive/orphan-photos?equipment_id=<uuid>
+  Pour un équipement :    GET /api/drive/orphan-photos?equipment_id=<uuid>
+  Pour un accessoire :    GET /api/drive/orphan-photos?accessory_id=<uuid>
+  Pour un consommable :   GET /api/drive/orphan-photos?consumable_id=<uuid>
   → Lire le champ "orphans" : liste des file_ids non référencés
   → Si orphan_count = 0 : rien à faire
 
@@ -2456,24 +2457,29 @@ PRÉREQUIS : s'assurer que migrate_to_v4_3.py a été exécuté sur la base Duck
 
 ÉTAPE 3 — Attacher chaque photo individuellement
   Pour chaque photo orpheline confirmée visuellement :
+
+  Équipement :
     POST /api/equipment/{equipment_id}/photos/attach
-    {
-      "file_id": "<file_id>",
-      "role": "<overview|nameplate|detail>",
-      "folder_id": "<folder_id_du_dossier>",
-      "filename": "<nom_fichier>",
-      "is_primary": true   ← seulement pour la première / la plus représentative
-    }
-  → En cas de 409 : la photo est déjà liée — passer à la suivante
+    { "file_id": "<file_id>", "role": "<overview|nameplate|detail>", "folder_id": "<folder_id>" }
+
+  Accessoire :
+    POST /api/accessories/{accessory_id}/photos/attach
+    { "file_id": "<file_id>", "role": "<overview|nameplate|detail>" }
+
+  Consommable :
+    POST /api/consumables/{consumable_id}/photos/attach
+    { "file_id": "<file_id>", "role": "<overview|nameplate|detail>" }
+
+  → En cas de 409 : la photo est déjà liée — passer à la suivante (succès)
   → En cas d'erreur 503 : réessayer après quelques secondes (DuckDB busy)
 
 ÉTAPE 4 — Vérification
-  GET /api/equipment/{equipment_id}/photos
+  GET /api/{entity}/{id}/photos
   → Vérifier que toutes les photos attendues sont maintenant listées
-  GET /api/drive/orphan-photos?equipment_id=<uuid>
+  GET /api/drive/orphan-photos?{entity}_id=<uuid>
   → Vérifier que orphan_count = 0
 
-ÉTAPE 5 — Marquer la fiche comme revue
+ÉTAPE 5 — Marquer la fiche comme revue (équipements uniquement)
   PATCH /api/equipment/{equipment_id}
   { "migration_status": "REVIEWED", "migrated_by": "openclaw" }
 ```
