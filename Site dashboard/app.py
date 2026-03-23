@@ -2663,6 +2663,17 @@ def render_parc_materiel():
         unsafe_allow_html=True,
     )
 
+    # ── Contrôle cache images ──────────────────────────────────
+    use_cache = st.toggle(
+        "⚡ Cache images activé",
+        value=st.session_state.get("parc_use_cache", True),
+        key="parc_use_cache",
+        help="Désactiver pour forcer le rechargement des images depuis Drive à chaque affichage de la page.",
+    )
+    if not use_cache:
+        get_drive_image_bytes.clear()
+        get_drive_thumb.clear()
+
     # ── Filtres sidebar ────────────────────────────────────────
     with st.sidebar:
         st.markdown("---")
