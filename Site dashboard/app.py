@@ -2438,6 +2438,69 @@ def show_accessory_modal(accessory_id: str):
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
+    # ── Actions admin ─────────────────────────────────────────
+    if is_admin():
+        st.markdown("---")
+        with st.expander("✏️ Modifier la fiche"):
+            f_label    = st.text_input("Nom / Désignation",
+                                       value=null_str(row.get("label"), ""),
+                                       key=f"acc_edit_label_{accessory_id}")
+            f_brand    = st.text_input("Marque",
+                                       value=null_str(row.get("brand"), ""),
+                                       key=f"acc_edit_brand_{accessory_id}")
+            f_model    = st.text_input("Modèle",
+                                       value=null_str(row.get("model"), ""),
+                                       key=f"acc_edit_model_{accessory_id}")
+            f_category = st.text_input("Catégorie",
+                                       value=null_str(row.get("category"), ""),
+                                       key=f"acc_edit_cat_{accessory_id}")
+            f_location = st.text_input("Emplacement",
+                                       value=null_str(row.get("location_hint"), ""),
+                                       key=f"acc_edit_loc_{accessory_id}")
+            f_stock    = st.number_input("Stock (unités)",
+                                         value=int(row.get("stock_qty") or 0),
+                                         min_value=0, step=1,
+                                         key=f"acc_edit_stock_{accessory_id}")
+            f_notes    = st.text_area("Notes",
+                                      value=null_str(row.get("notes"), ""),
+                                      key=f"acc_edit_notes_{accessory_id}")
+            if st.button("💾 Enregistrer", key=f"acc_save_{accessory_id}",
+                         type="primary", use_container_width=True):
+                ok = run_write("""
+                    UPDATE accessories SET
+                        label=?, brand=?, model=?, category=?,
+                        location_hint=?, stock_qty=?, notes=?, updated_at=?
+                    WHERE accessory_id=?
+                """, [f_label.strip() or None, f_brand.strip() or None,
+                      f_model.strip() or None, f_category.strip() or None,
+                      f_location.strip() or None, int(f_stock),
+                      f_notes.strip() or None,
+                      datetime.utcnow().isoformat(),
+                      accessory_id])
+                if ok:
+                    st.success("✅ Fiche mise à jour.")
+                    st.rerun()
+
+        del_key = f"confirm_del_acc_{accessory_id}"
+        if not st.session_state.get(del_key):
+            if st.button("🗑 Supprimer", key=f"acc_del_{accessory_id}",
+                         use_container_width=True):
+                st.session_state[del_key] = True
+        else:
+            st.warning("⚠️ Cette fiche sera archivée (masquée du catalogue). Confirmer ?")
+            col_yes, col_no = st.columns(2)
+            if col_yes.button("✓ Confirmer", key=f"acc_del_yes_{accessory_id}",
+                              use_container_width=True):
+                run_write(
+                    "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
+                    [datetime.utcnow().isoformat(), accessory_id],
+                )
+                st.session_state.pop(del_key, None)
+                st.rerun()
+            if col_no.button("✗ Annuler", key=f"acc_del_no_{accessory_id}",
+                             use_container_width=True):
+                st.session_state.pop(del_key, None)
+
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
     gov_col1, gov_col2 = st.columns(2)
@@ -2649,6 +2712,78 @@ def show_consumable_modal(consumable_id: str):
         )),
     )
     st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Actions admin ─────────────────────────────────────────
+    if is_admin():
+        st.markdown("---")
+        with st.expander("✏️ Modifier la fiche"):
+            f_label     = st.text_input("Nom / Désignation",
+                                        value=null_str(row.get("label"), ""),
+                                        key=f"con_edit_label_{consumable_id}")
+            f_brand     = st.text_input("Marque",
+                                        value=null_str(row.get("brand"), ""),
+                                        key=f"con_edit_brand_{consumable_id}")
+            f_reference = st.text_input("Référence",
+                                        value=null_str(row.get("reference"), ""),
+                                        key=f"con_edit_ref_{consumable_id}")
+            f_category  = st.text_input("Catégorie",
+                                        value=null_str(row.get("category"), ""),
+                                        key=f"con_edit_cat_{consumable_id}")
+            f_unit      = st.text_input("Unité",
+                                        value=null_str(row.get("unit"), "pcs"),
+                                        key=f"con_edit_unit_{consumable_id}")
+            f_location  = st.text_input("Emplacement",
+                                        value=null_str(row.get("location_hint"), ""),
+                                        key=f"con_edit_loc_{consumable_id}")
+            f_stock     = st.number_input("Stock",
+                                          value=float(row.get("stock_qty") or 0),
+                                          min_value=0.0, step=1.0,
+                                          key=f"con_edit_stock_{consumable_id}")
+            f_alert     = st.number_input("Seuil alerte stock",
+                                          value=float(row.get("stock_min_alert") or 0),
+                                          min_value=0.0, step=1.0,
+                                          key=f"con_edit_alert_{consumable_id}")
+            f_notes     = st.text_area("Notes",
+                                       value=null_str(row.get("notes"), ""),
+                                       key=f"con_edit_notes_{consumable_id}")
+            if st.button("💾 Enregistrer", key=f"con_save_{consumable_id}",
+                         type="primary", use_container_width=True):
+                ok = run_write("""
+                    UPDATE consumables SET
+                        label=?, brand=?, reference=?, category=?, unit=?,
+                        location_hint=?, stock_qty=?, stock_min_alert=?,
+                        notes=?, updated_at=?
+                    WHERE consumable_id=?
+                """, [f_label.strip() or None, f_brand.strip() or None,
+                      f_reference.strip() or None, f_category.strip() or None,
+                      f_unit.strip() or None, f_location.strip() or None,
+                      f_stock, f_alert,
+                      f_notes.strip() or None,
+                      datetime.utcnow().isoformat(),
+                      consumable_id])
+                if ok:
+                    st.success("✅ Fiche mise à jour.")
+                    st.rerun()
+
+        del_key = f"confirm_del_con_{consumable_id}"
+        if not st.session_state.get(del_key):
+            if st.button("🗑 Supprimer", key=f"con_del_{consumable_id}",
+                         use_container_width=True):
+                st.session_state[del_key] = True
+        else:
+            st.warning("⚠️ Cette fiche sera archivée (masquée du catalogue). Confirmer ?")
+            col_yes, col_no = st.columns(2)
+            if col_yes.button("✓ Confirmer", key=f"con_del_yes_{consumable_id}",
+                              use_container_width=True):
+                run_write(
+                    "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
+                    [datetime.utcnow().isoformat(), consumable_id],
+                )
+                st.session_state.pop(del_key, None)
+                st.rerun()
+            if col_no.button("✗ Annuler", key=f"con_del_no_{consumable_id}",
+                             use_container_width=True):
+                st.session_state.pop(del_key, None)
 
     # ── Gouvernance ───────────────────────────────────────────
     st.markdown("---")
