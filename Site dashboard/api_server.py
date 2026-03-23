@@ -188,6 +188,7 @@ def _run_write(sql: str, params=None, _retries: int = 5) -> None:
                     conn.execute(sql, params)
                 else:
                     conn.execute(sql)
+                conn.commit()
             return
         except duckdb.IOException as e:
             last_err = e
@@ -210,6 +211,7 @@ def _run_write_many(statements: list[tuple], _retries: int = 5) -> None:
             with duckdb.connect(DB_PATH, read_only=False) as conn:
                 for sql, params in statements:
                     conn.execute(sql, params)
+                conn.commit()
             return
         except duckdb.IOException as e:
             last_err = e

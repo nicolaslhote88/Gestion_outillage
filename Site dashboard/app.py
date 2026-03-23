@@ -279,6 +279,7 @@ def run_write(sql: str, params=None, _retries: int = 5) -> bool:
                     conn.execute(sql, params)
                 else:
                     conn.execute(sql)
+                conn.commit()
             return True
         except duckdb.IOException as e:
             last_err = e
