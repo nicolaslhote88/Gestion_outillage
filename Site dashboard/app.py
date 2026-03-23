@@ -2024,6 +2024,7 @@ def show_equipment_modal(equipment_id: str):
         FROM links_compatibility lc
         JOIN accessories a ON a.accessory_id = lc.accessory_id
         WHERE lc.equipment_id = ?
+          AND (a.archived IS NULL OR a.archived = FALSE)
         ORDER BY a.label
     """, [equipment_id])
 
@@ -2033,6 +2034,7 @@ def show_equipment_modal(equipment_id: str):
         FROM links_consumables lc
         JOIN consumables c ON c.consumable_id = lc.consumable_id
         WHERE lc.equipment_id = ?
+          AND (c.archived IS NULL OR c.archived = FALSE)
         ORDER BY c.label
     """, [equipment_id])
 
@@ -2414,6 +2416,7 @@ def show_accessory_modal(accessory_id: str):
         FROM links_compatibility lc
         JOIN equipment e ON e.equipment_id = lc.equipment_id
         WHERE lc.accessory_id = ?
+          AND (e.archived IS NULL OR e.archived = FALSE)
         ORDER BY e.label
     """, [accessory_id])
 
@@ -3993,6 +3996,7 @@ def render_preparation_chantier() -> None:
             JOIN accessories a ON a.accessory_id = lc.accessory_id
             JOIN equipment e ON e.equipment_id = lc.equipment_id
             WHERE lc.equipment_id IN ({ids_ph})
+              AND (a.archived IS NULL OR a.archived = FALSE)
             GROUP BY a.accessory_id, a.label, a.brand, a.model, a.stock_qty, a.location_hint
             ORDER BY a.label
             """,
