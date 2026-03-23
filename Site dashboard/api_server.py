@@ -2873,16 +2873,29 @@ def cancel_reservation(
 )
 def list_accessories(
     q: Optional[str] = None,
+    archived: Optional[bool] = None,
     _: None = Security(_require_token),
 ) -> AccessoryListResponse:
-    """Retourne tous les accessoires (batteries, adaptateurs, lames…), avec filtre texte optionnel."""
-    sql = "SELECT accessory_id, label, brand, model, category, stock_qty, location_hint FROM accessories"
-    params = None
+    """Retourne tous les accessoires (batteries, adaptateurs, lames…), avec filtre texte optionnel.
+    Par défaut (archived non spécifié), seuls les accessoires non-archivés sont retournés.
+    Passer archived=true pour n'obtenir que les archivés, archived=false pour forcer les actifs."""
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    # Filtre archived : par défaut on exclut les archivés
+    if archived is None:
+        conditions.append("(archived IS NULL OR archived = FALSE)")
+    else:
+        conditions.append("archived = ?")
+        params.append(archived)
+
     if q and q.strip():
         like = f"%{q.strip()}%"
-        sql += " WHERE LOWER(label) LIKE LOWER(?) OR LOWER(brand) LIKE LOWER(?) OR LOWER(model) LIKE LOWER(?)"
-        params = [like, like, like]
-    sql += " ORDER BY label"
+        conditions.append("(LOWER(label) LIKE LOWER(?) OR LOWER(brand) LIKE LOWER(?) OR LOWER(model) LIKE LOWER(?))")
+        params += [like, like, like]
+
+    where = " WHERE " + " AND ".join(conditions)
+    sql = f"SELECT accessory_id, label, brand, model, category, stock_qty, location_hint FROM accessories{where} ORDER BY label"
     try:
         df = _run_query(sql, params)
     except RuntimeError as e:
@@ -2945,26 +2958,34 @@ def create_accessory(
 def list_consumables(
     q: Optional[str] = None,
     low_stock: bool = False,
+    archived: Optional[bool] = None,
     _: None = Security(_require_token),
 ) -> ConsumableListResponse:
     """Retourne tous les consommables (forets, abrasifs, visserie…).
+    Par défaut (archived non spécifié), seuls les consommables non-archivés sont retournés.
     Paramètre `low_stock=true` pour n'afficher que ceux en alerte de stock."""
-    sql = """
-        SELECT consumable_id, label, brand, reference, category, unit,
-               stock_qty, stock_min_alert, location_hint
-        FROM consumables
-    """
-    conditions = []
+    conditions: List[str] = []
     params: List[Any] = []
+
+    # Filtre archived : par défaut on exclut les archivés
+    if archived is None:
+        conditions.append("(archived IS NULL OR archived = FALSE)")
+    else:
+        conditions.append("archived = ?")
+        params.append(archived)
+
     if q and q.strip():
         like = f"%{q.strip()}%"
         conditions.append("(LOWER(label) LIKE LOWER(?) OR LOWER(brand) LIKE LOWER(?) OR LOWER(reference) LIKE LOWER(?))")
         params += [like, like, like]
     if low_stock:
         conditions.append("stock_qty <= stock_min_alert")
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
-    sql += " ORDER BY label"
+
+    sql = """
+        SELECT consumable_id, label, brand, reference, category, unit,
+               stock_qty, stock_min_alert, location_hint
+        FROM consumables
+        WHERE """ + " AND ".join(conditions) + " ORDER BY label"
     try:
         df = _run_query(sql, params or None)
     except RuntimeError as e:
