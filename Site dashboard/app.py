@@ -2491,12 +2491,15 @@ def show_accessory_modal(accessory_id: str):
             col_yes, col_no = st.columns(2)
             if col_yes.button("✓ Confirmer", key=f"acc_del_yes_{accessory_id}",
                               use_container_width=True):
-                run_write(
+                ok = run_write(
                     "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
                     [datetime.utcnow().isoformat(), accessory_id],
                 )
-                st.session_state.pop(del_key, None)
-                st.rerun()
+                if ok:
+                    st.session_state.pop(del_key, None)
+                    st.rerun()
+                else:
+                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
             if col_no.button("✗ Annuler", key=f"acc_del_no_{accessory_id}",
                              use_container_width=True):
                 st.session_state.pop(del_key, None)
@@ -2775,12 +2778,15 @@ def show_consumable_modal(consumable_id: str):
             col_yes, col_no = st.columns(2)
             if col_yes.button("✓ Confirmer", key=f"con_del_yes_{consumable_id}",
                               use_container_width=True):
-                run_write(
+                ok = run_write(
                     "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
                     [datetime.utcnow().isoformat(), consumable_id],
                 )
-                st.session_state.pop(del_key, None)
-                st.rerun()
+                if ok:
+                    st.session_state.pop(del_key, None)
+                    st.rerun()
+                else:
+                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
             if col_no.button("✗ Annuler", key=f"con_del_no_{consumable_id}",
                              use_container_width=True):
                 st.session_state.pop(del_key, None)
