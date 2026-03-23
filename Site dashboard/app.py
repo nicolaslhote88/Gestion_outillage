@@ -41,6 +41,7 @@ KIOSK_STATE_FILE = Path(DB_PATH).parent / "kiosk_state.json"
 # Renseigner dans les variables d'environnement du container.
 SIGA_ACCESSORIES_FOLDER_ID = os.environ.get("SIGA_ACCESSORIES_FOLDER_ID", "")
 SIGA_CONSUMABLES_FOLDER_ID = os.environ.get("SIGA_CONSUMABLES_FOLDER_ID", "")
+SIGA_EQUIPEMENTS_FOLDER_ID = os.environ.get("SIGA_EQUIPEMENTS_FOLDER_ID", "")
 
 st.set_page_config(
     page_title="SIGA — Gestion Outillage",
@@ -726,8 +727,25 @@ def _get_or_create_entity_folder(
     Si aucun dossier n'existe, en crée un nouveau sous parent_folder_id.
     entity_type : 'accessory' | 'consumable'
     Retourne '' si impossible."""
-    # 1. Chercher un dossier existant dans la table media
-    if entity_type == "accessory":
+    # 1. Chercher un dossier existant
+    if entity_type == "equipment":
+        # Pour les équipements, final_drive_folder_id est sur la table equipment
+        df = run_query(
+            "SELECT final_drive_folder_id FROM equipment"
+            " WHERE equipment_id = ? LIMIT 1",
+            [entity_id],
+        )
+        if not df.empty:
+            fid = df.iloc[0]["final_drive_folder_id"]
+            if fid and str(fid) not in ("", "nan", "None"):
+                return str(fid)
+        # Fallback : chercher dans equipment_media
+        df = run_query(
+            "SELECT final_drive_folder_id FROM equipment_media"
+            " WHERE equipment_id = ? AND final_drive_folder_id IS NOT NULL LIMIT 1",
+            [entity_id],
+        )
+    elif entity_type == "accessory":
         df = run_query(
             "SELECT final_drive_folder_id FROM accessory_media"
             " WHERE accessory_id = ? AND final_drive_folder_id IS NOT NULL LIMIT 1",
@@ -2015,6 +2033,54 @@ def show_equipment_modal(equipment_id: str):
                                 cols[j].warning(f"⚠️ Image corrompue (`{fid2}`)")
         else:
             st.info("Aucune image disponible.")
+
+        # ── Ajouter une photo (upload local → Drive) — admins ──
+        if is_admin():
+            with st.expander("➕ Ajouter une photo"):
+                uploaded_file = st.file_uploader(
+                    "Choisir une image depuis l'ordinateur",
+                    type=["jpg", "jpeg", "png", "webp", "gif"],
+                    key=f"eq_upload_{equipment_id}",
+                )
+                new_role = st.selectbox("Rôle", ["overview", "detail", "label", "autre"],
+                                        key=f"eq_new_role_{equipment_id}")
+                if uploaded_file is not None:
+                    if st.button("☁️ Uploader sur Drive", key=f"eq_add_photo_{equipment_id}"):
+                        with st.spinner("Recherche du dossier Drive…"):
+                            folder_id = _get_or_create_entity_folder(
+                                "equipment", equipment_id, SIGA_EQUIPEMENTS_FOLDER_ID
+                            )
+                        if not folder_id:
+                            st.error(
+                                "Impossible de déterminer le dossier Drive de cet équipement. "
+                                "Vérifiez que la variable d'environnement **SIGA_EQUIPEMENTS_FOLDER_ID** "
+                                "est configurée dans le container."
+                            )
+                        else:
+                            with st.spinner("Upload en cours…"):
+                                mime = uploaded_file.type or "image/jpeg"
+                                file_id, web_link = _drive_upload_file(
+                                    uploaded_file.read(), uploaded_file.name, mime, folder_id
+                                )
+                            if not file_id:
+                                st.error("Échec de l'upload vers Google Drive.")
+                            else:
+                                next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
+                                ok = run_write(
+                                    """INSERT INTO equipment_media
+                                           (media_id, equipment_id, final_drive_file_id,
+                                            final_drive_folder_id, filename, mime_type,
+                                            image_role, image_index, attached_by)
+                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
+                                    [str(uuid.uuid4()), equipment_id, file_id,
+                                     folder_id, uploaded_file.name, mime,
+                                     new_role, next_idx],
+                                )
+                                if ok:
+                                    st.success("Photo uploadée et enregistrée.")
+                                    st.rerun()
+                                else:
+                                    st.error("Fichier uploadé sur Drive mais enregistrement DB échoué.")
 
     # ── Détails ───────────────────────────────────────────────
     with right_col:
