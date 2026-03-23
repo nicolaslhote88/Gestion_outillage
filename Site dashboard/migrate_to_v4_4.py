@@ -52,7 +52,7 @@ def migrate(db_path: str = DEFAULT_DB_PATH) -> None:
     with duckdb.connect(db_path, read_only=False) as conn:
 
         # ── 1. Table accessory_media ──────────────────────────────────────────
-        print("[1] Création table accessory_media…")
+        print("[1] Création / mise à jour table accessory_media…")
         ok = _run(
             conn,
             """
@@ -73,13 +73,27 @@ def migrate(db_path: str = DEFAULT_DB_PATH) -> None:
                 created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """,
-            "table accessory_media",
+            "table accessory_media (CREATE IF NOT EXISTS)",
         )
         if not ok:
             errors += 1
 
+        # Colonnes ajoutées en v4.4 (peut-être absentes si la table existait déjà)
+        for sql, label in [
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT FALSE",
+             "accessory_media.is_primary"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS attached_by VARCHAR DEFAULT 'api'",
+             "accessory_media.attached_by"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+             "accessory_media.attached_at"),
+            ("ALTER TABLE accessory_media ADD COLUMN IF NOT EXISTS source_drive_folder_id VARCHAR",
+             "accessory_media.source_drive_folder_id"),
+        ]:
+            if not _run(conn, sql, label):
+                errors += 1
+
         # ── 2. Table consumable_media ─────────────────────────────────────────
-        print("\n[2] Création table consumable_media…")
+        print("\n[2] Création / mise à jour table consumable_media…")
         ok = _run(
             conn,
             """
@@ -100,10 +114,24 @@ def migrate(db_path: str = DEFAULT_DB_PATH) -> None:
                 created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """,
-            "table consumable_media",
+            "table consumable_media (CREATE IF NOT EXISTS)",
         )
         if not ok:
             errors += 1
+
+        # Colonnes ajoutées en v4.4 (peut-être absentes si la table existait déjà)
+        for sql, label in [
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS is_primary BOOLEAN DEFAULT FALSE",
+             "consumable_media.is_primary"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS attached_by VARCHAR DEFAULT 'api'",
+             "consumable_media.attached_by"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+             "consumable_media.attached_at"),
+            ("ALTER TABLE consumable_media ADD COLUMN IF NOT EXISTS source_drive_folder_id VARCHAR",
+             "consumable_media.source_drive_folder_id"),
+        ]:
+            if not _run(conn, sql, label):
+                errors += 1
 
         # ── 3. Backfill accessory_media depuis drive_file_id ─────────────────
         print("\n[3] Backfill accessory_media depuis accessories.drive_file_id…")
