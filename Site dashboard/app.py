@@ -4512,6 +4512,15 @@ def render_sidebar():
                 unsafe_allow_html=True,
             )
 
+        # ── Accès écran kiosque ───────────────────────────
+        st.markdown("---")
+        st.link_button(
+            "🖥 Écran Kiosque (API)",
+            url="?kiosk=true",
+            use_container_width=True,
+            help="Ouvre la page d'affichage pilotée par l'API",
+        )
+
         # ── Panier Kit ────────────────────────────────────
         basket: dict = st.session_state.get("kit_basket", {})
         st.markdown("---")
