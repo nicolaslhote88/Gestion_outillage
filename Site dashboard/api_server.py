@@ -82,6 +82,7 @@ ou
 
 import json
 import os
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -117,6 +118,12 @@ SCORE_MIN  = 0.25
 MAX_RESULTS = 20
 
 VALID_MOVEMENT_TYPES = {"LOAN", "RENTAL", "MAINTENANCE"}
+
+# Verrou global pour sérialiser les écritures DuckDB dans le même processus.
+# DuckDB n'accepte qu'une seule connexion d'écriture à la fois ; sans ce verrou
+# des requêtes concurrentes peuvent provoquer des conflits de handle de fichier
+# ou des erreurs CHECKPOINT.
+_db_write_lock = threading.Lock()
 
 # Fichier JSON partagé avec le kiosque Streamlit — élimine tout polling DuckDB
 KIOSK_STATE_FILE = Path(DB_PATH).parent / "kiosk_state.json"
@@ -183,13 +190,13 @@ def _run_write(sql: str, params=None, _retries: int = 5) -> None:
     last_err = None
     for attempt in range(_retries):
         try:
-            with duckdb.connect(DB_PATH, read_only=False) as conn:
-                if params:
-                    conn.execute(sql, params)
-                else:
-                    conn.execute(sql)
-                conn.commit()
-                conn.execute("CHECKPOINT")
+            with _db_write_lock:
+                with duckdb.connect(DB_PATH, read_only=False) as conn:
+                    if params:
+                        conn.execute(sql, params)
+                    else:
+                        conn.execute(sql)
+                    conn.commit()
             return
         except duckdb.IOException as e:
             last_err = e
@@ -209,11 +216,11 @@ def _run_write_many(statements: list[tuple], _retries: int = 5) -> None:
     last_err = None
     for attempt in range(_retries):
         try:
-            with duckdb.connect(DB_PATH, read_only=False) as conn:
-                for sql, params in statements:
-                    conn.execute(sql, params)
-                conn.commit()
-                conn.execute("CHECKPOINT")
+            with _db_write_lock:
+                with duckdb.connect(DB_PATH, read_only=False) as conn:
+                    for sql, params in statements:
+                        conn.execute(sql, params)
+                    conn.commit()
             return
         except duckdb.IOException as e:
             last_err = e
@@ -3702,8 +3709,10 @@ def delete_accessory(
         raise HTTPException(status_code=404, detail=f"Accessoire {accessory_id} introuvable.")
     try:
         if hard:
-            _run_write("DELETE FROM links_compatibility WHERE accessory_id = ?", [accessory_id])
-            _run_write("DELETE FROM accessories WHERE accessory_id = ?", [accessory_id])
+            _run_write_many([
+                ("DELETE FROM links_compatibility WHERE accessory_id = ?", [accessory_id]),
+                ("DELETE FROM accessories WHERE accessory_id = ?", [accessory_id]),
+            ])
             return {"ok": True, "accessory_id": accessory_id, "message": "Accessoire supprimé définitivement."}
         else:
             _run_write(
@@ -3817,8 +3826,10 @@ def delete_consumable(
         raise HTTPException(status_code=404, detail=f"Consommable {consumable_id} introuvable.")
     try:
         if hard:
-            _run_write("DELETE FROM links_consumables WHERE consumable_id = ?", [consumable_id])
-            _run_write("DELETE FROM consumables WHERE consumable_id = ?", [consumable_id])
+            _run_write_many([
+                ("DELETE FROM links_consumables WHERE consumable_id = ?", [consumable_id]),
+                ("DELETE FROM consumables WHERE consumable_id = ?", [consumable_id]),
+            ])
             return {"ok": True, "consumable_id": consumable_id, "message": "Consommable supprimé définitivement."}
         else:
             _run_write(
@@ -3876,10 +3887,10 @@ def put_equipment_photos(
     ingestion_id = eq_rows[0].get("ingestion_id")
 
     try:
-        _run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
+        statements = [("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])]
         for i, photo in enumerate(body.photos):
             media_id = str(uuid.uuid4())
-            _run_write(
+            statements.append((
                 """INSERT INTO equipment_media
                    (media_id, equipment_id, ingestion_id,
                     final_drive_file_id, final_drive_folder_id,
@@ -3906,7 +3917,8 @@ def put_equipment_photos(
                     photo.sort_order if photo.sort_order is not None else i,
                     photo.is_primary,
                 ],
-            )
+            ))
+        _run_write_many(statements)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
@@ -4036,19 +4048,20 @@ def attach_accessory_photo(
     role = body.role or "overview"
     now = datetime.utcnow().isoformat()
     try:
-        _run_write(
+        statements = [(
             """INSERT INTO accessory_media
                (media_id, accessory_id, final_drive_file_id, image_role, image_index, is_primary,
                 attached_by, attached_at)
                VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
             [media_id, accessory_id, body.file_id, role, next_idx, is_primary, now],
-        )
+        )]
         # Rétrocompatibilité : mettre à jour drive_file_id si photo primaire
         if is_primary:
-            _run_write(
+            statements.append((
                 "UPDATE accessories SET drive_file_id = ?, updated_at = ? WHERE accessory_id = ?",
                 [body.file_id, now, accessory_id],
-            )
+            ))
+        _run_write_many(statements)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
@@ -4100,19 +4113,20 @@ def attach_consumable_photo(
     role = body.role or "overview"
     now = datetime.utcnow().isoformat()
     try:
-        _run_write(
+        statements = [(
             """INSERT INTO consumable_media
                (media_id, consumable_id, final_drive_file_id, image_role, image_index, is_primary,
                 attached_by, attached_at)
                VALUES (?, ?, ?, ?, ?, ?, 'api', ?)""",
             [media_id, consumable_id, body.file_id, role, next_idx, is_primary, now],
-        )
+        )]
         # Rétrocompatibilité : mettre à jour drive_file_id si photo primaire
         if is_primary:
-            _run_write(
+            statements.append((
                 "UPDATE consumables SET drive_file_id = ?, updated_at = ? WHERE consumable_id = ?",
                 [body.file_id, now, consumable_id],
-            )
+            ))
+        _run_write_many(statements)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
@@ -5261,9 +5275,12 @@ def health() -> dict:
 # ─── Lancement direct ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    # workers=1 obligatoire : DuckDB n'accepte qu'un seul processus écrivain
+    # à la fois sur le même fichier .duckdb
     uvicorn.run(
         "api_server:app",
         host="0.0.0.0",
         port=API_PORT,
         log_level="info",
+        workers=1,
     )
