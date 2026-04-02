@@ -1,6 +1,6 @@
 # Notice d'utilisation de l'API SIGA pour OpenClaw
 
-**Version :** 4.5 — Mars 2026
+**Version :** 4.6 — Avril 2026
 **Audience :** skill OpenClaw (chat principal + WhatsApp)
 **Base URL :** variable d'environnement `SIGA_API_BASE_URL`
 **Auth :** header `Authorization: Bearer $SIGA_API_TOKEN`
@@ -77,6 +77,8 @@ OpenClaw est l'opérateur intelligent de SIGA. Il dispose de tous les outils pou
 - Archiver et nettoyer les données obsolètes
 
 OpenClaw **ne doit jamais** laisser la base DuckDB et Google Drive dans un état incohérent.
+
+> **Architecture v4.6 — Single-writer :** Le serveur FastAPI (`api_server.py`) est le **seul processus autorisé à écrire** dans la base DuckDB. Toutes les opérations de modification (POST, PUT, PATCH, DELETE) passent exclusivement par l'API. Le dashboard Streamlit accède à la base en lecture seule. OpenClaw doit donc toujours utiliser les endpoints API pour modifier les données — **jamais accéder directement à DuckDB**.
 
 ---
 
@@ -1340,6 +1342,12 @@ DELETE /api/links/consumables/{link_id}
 | GET | `/api/consumables/{id}/photos` | Oui | Lister les photos d'un consommable (consumable_media) |
 | PUT | `/api/consumables/{id}/photos` | Oui | Remplacer la galerie photos d'un consommable |
 | POST | `/api/consumables/{id}/photos/attach` | Oui | Attacher une photo orpheline à un consommable (sans effacer) |
+| **Suppression & audit v4.6** | | | |
+| DELETE | `/api/equipment/{id}` | Oui | Suppression physique définitive d'un équipement (+ ses entrées media) |
+| POST | `/api/equipment/{id}/audit` | Oui | Ajouter une entrée dans l'audit trail de l'équipement |
+| DELETE | `/api/equipment/{id}/photos/{media_id}` | Oui | Supprimer une photo d'équipement par son media_id |
+| DELETE | `/api/accessories/{id}/photos/{media_id}` | Oui | Supprimer une photo d'accessoire par son media_id |
+| DELETE | `/api/consumables/{id}/photos/{media_id}` | Oui | Supprimer une photo de consommable par son media_id |
 
 ---
 
@@ -2035,6 +2043,41 @@ POST /api/equipment/{equipment_id}/unarchive
 
 Soft-delete : met `archived=true/false` et `migration_status=ARCHIVED/REVIEWED`. Aucune donnée n'est supprimée.
 
+### 9.4bis Suppression définitive d'un équipement *(v4.6)*
+
+```
+DELETE /api/equipment/{equipment_id}
+```
+
+**Suppression physique irréversible** : supprime toutes les entrées `equipment_media` puis la fiche équipement dans une seule transaction atomique.
+
+> ⚠️ **Opération destructive.** Toujours archiver d'abord (`POST /api/equipment/{id}/archive`) sauf si la fiche est clairement erronée (doublon, test). Confirmer avec l'utilisateur avant d'exécuter.
+
+**Corps de la requête :** aucun (DELETE sans body)
+
+**Réponse 200 :**
+```json
+{ "deleted": true, "equipment_id": "uuid-eq-..." }
+```
+
+**Ce que cet endpoint ne fait PAS :**
+- Il ne supprime pas les fichiers physiques sur Google Drive — c'est à OpenClaw de le faire manuellement si nécessaire
+- Il ne supprime pas les liaisons accessoires/consommables — les désarchiver avant si besoin
+
+**Séquence recommandée avant suppression définitive :**
+```
+1. Vérifier que l'équipement est bien archivé :
+   GET /api/admin/migrations?status=ARCHIVED&id={id}
+
+2. Vérifier les photos liées :
+   GET /api/equipment/{id}/photos  → noter les final_drive_file_id
+
+3. (Optionnel) Supprimer les fichiers Drive correspondants
+
+4. Supprimer la fiche :
+   DELETE /api/equipment/{id}
+```
+
 ### 9.5 CRUD Accessoires *(v4.1)*
 
 ```
@@ -2070,12 +2113,15 @@ DELETE /api/consumables/{consumable_id}?hard=true  → suppression physique
 | `GET /api/equipment/{id}/photos` | Équipement | `equipment_media` | Lister les photos |
 | `PUT /api/equipment/{id}/photos` | Équipement | `equipment_media` | Remplacer toute la galerie |
 | `POST /api/equipment/{id}/photos/attach` | Équipement | `equipment_media` | Ajouter une photo orpheline |
+| `DELETE /api/equipment/{id}/photos/{media_id}` | Équipement | `equipment_media` | **v4.6** Supprimer une photo par son media_id |
 | `GET /api/accessories/{id}/photos` | Accessoire | `accessory_media` | Lister les photos |
 | `PUT /api/accessories/{id}/photos` | Accessoire | `accessory_media` | Remplacer toute la galerie |
 | `POST /api/accessories/{id}/photos/attach` | Accessoire | `accessory_media` | Ajouter une photo orpheline |
+| `DELETE /api/accessories/{id}/photos/{media_id}` | Accessoire | `accessory_media` | **v4.6** Supprimer une photo par son media_id |
 | `GET /api/consumables/{id}/photos` | Consommable | `consumable_media` | Lister les photos |
 | `PUT /api/consumables/{id}/photos` | Consommable | `consumable_media` | Remplacer toute la galerie |
 | `POST /api/consumables/{id}/photos/attach` | Consommable | `consumable_media` | Ajouter une photo orpheline |
+| `DELETE /api/consumables/{id}/photos/{media_id}` | Consommable | `consumable_media` | **v4.6** Supprimer une photo par son media_id |
 
 #### GET /api/{entity}/{id}/photos
 
@@ -2136,6 +2182,29 @@ Body (identique pour equipment, accessory, consumable) :
    (action manuelle — ne pas supprimer sans confirmation utilisateur)
    Si la photo doit être déplacée vers une autre fiche : suivre Situation U
 ```
+
+#### DELETE /api/{entity}/{id}/photos/{media_id} *(v4.6)*
+
+Supprime une seule entrée de la table `*_media` à partir de son `media_id` (UUID). **Ne supprime pas le fichier sur Google Drive.**
+
+```
+DELETE /api/equipment/{equipment_id}/photos/{media_id}
+DELETE /api/accessories/{accessory_id}/photos/{media_id}
+DELETE /api/consumables/{consumable_id}/photos/{media_id}
+```
+
+**Corps de la requête :** aucun
+
+**Réponse 200 :**
+```json
+{ "deleted": true, "media_id": "uuid-med-..." }
+```
+
+**Quand utiliser cet endpoint vs `PUT /api/{entity}/{id}/photos` :**
+- `DELETE /photos/{media_id}` → supprimer **une seule photo** de manière ciblée (plus simple, moins risqué)
+- `PUT /photos` → **remplacer toute la galerie** (à préférer quand on réorganise plusieurs photos en même temps)
+
+> ⚠️ Après un DELETE photo, le fichier Drive reste en place. Si la photo doit aussi être effacée de Drive, le faire manuellement avec confirmation utilisateur.
 
 ### 9.8 Bridge Google Drive
 
@@ -2287,10 +2356,41 @@ Opération de migration complète en une seule transaction. Avec `?dry_run=true`
 ### 9.11 Journal d'audit
 
 ```
-GET /api/admin/migrations/logs
+GET  /api/admin/migrations/logs
+POST /api/equipment/{equipment_id}/audit   ← v4.6
 ```
 
+#### GET /api/admin/migrations/logs
+
 **Paramètres query :** `operator`, `operation`, `source_entity_id`, `limit` (défaut 100)
+
+Retourne les entrées du journal de migration/audit triées par date décroissante.
+
+#### POST /api/equipment/{equipment_id}/audit *(v4.6)*
+
+Insère manuellement une entrée dans la table `equipment_audit` pour tracer une action effectuée par OpenClaw ou un opérateur humain.
+
+**Body :**
+```json
+{
+  "action": "VALIDATED",
+  "changed_fields": "review_required → false",
+  "operator": "OpenClaw"
+}
+```
+
+| Champ | Type | Requis | Description |
+|---|---|---|---|
+| `action` | string | Oui | Libellé de l'action (ex. `VALIDATED`, `ARCHIVED`, `PHOTO_DELETED`, `SPECS_UPDATED`) |
+| `changed_fields` | string | Non | Description lisible des champs modifiés |
+| `operator` | string | Non | Qui a déclenché l'action (`OpenClaw`, `UI`, `n8n`, etc.) |
+
+**Réponse 200 :**
+```json
+{ "audit_id": "uuid-aud-...", "equipment_id": "uuid-eq-...", "action": "VALIDATED" }
+```
+
+**Utilisation typique :** appeler cet endpoint après toute modification significative d'un équipement (validation de fiche, suppression de photo, correction de specs) pour garder une trace dans l'audit trail.
 
 ### 9.12 Traçabilité legacy → canonical
 
