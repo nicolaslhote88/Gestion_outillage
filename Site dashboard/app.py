@@ -259,7 +259,7 @@ def run_query(sql: str, params=None) -> pd.DataFrame:
     les écritures concurrentes de n8n (DuckDB file-lock).
     """
     try:
-        with duckdb.connect(DB_PATH, read_only=True) as conn:
+        with duckdb.connect(DB_PATH) as conn:
             if params:
                 return conn.execute(sql, params).df()
             return conn.execute(sql).df()
@@ -399,7 +399,7 @@ def allowed_pages() -> list[str]:
 def db_is_reachable() -> bool:
     """Vérifie la disponibilité de la DB sans garder la connexion ouverte."""
     try:
-        with duckdb.connect(DB_PATH, read_only=True) as conn:
+        with duckdb.connect(DB_PATH) as conn:
             conn.execute("SELECT 1")
         return True
     except Exception:
@@ -5262,7 +5262,11 @@ def main():
         st.session_state["kit_basket"] = {}
     if "loan_basket" not in st.session_state:
         st.session_state["loan_basket"] = {}
-    init_db_tables()
+    # init_db_tables est coûteux (ALTER TABLE × N) et doit tourner une seule
+    # fois par session, pas à chaque rerun Streamlit.
+    if not st.session_state.get("_db_initialized"):
+        init_db_tables()
+        st.session_state["_db_initialized"] = True
 
     # ── Dispatch modal différé (navigation depuis l'arbre de dépendances) ──
     # Les dialogs Streamlit ne peuvent pas être imbriqués. Quand l'utilisateur

@@ -146,7 +146,7 @@ def _require_token(
 
 def _run_query(sql: str, params=None) -> pd.DataFrame:
     try:
-        with duckdb.connect(DB_PATH, read_only=True) as conn:
+        with duckdb.connect(DB_PATH) as conn:
             if params:
                 return conn.execute(sql, params).df()
             return conn.execute(sql).df()
