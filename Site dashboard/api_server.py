@@ -871,6 +871,12 @@ class ArchiveResponse(BaseModel):
     message: str
 
 
+class AuditLogRequest(BaseModel):
+    action: str                       # VALIDATE | UPDATE | DELETE | …
+    changed_fields: Optional[str] = None
+    operator: Optional[str] = None
+
+
 # — v4.1 Photo management ─────────────────────────────────────
 
 class PhotoRefInput(BaseModel):
@@ -3609,6 +3615,56 @@ def unarchive_equipment(
     return ArchiveResponse(ok=True, equipment_id=equipment_id, archived=False, message="Équipement désarchivé.")
 
 
+@app.delete(
+    "/api/equipment/{equipment_id}",
+    tags=["v4.1 Équipement"],
+    summary="Suppression physique d'un équipement et de ses médias",
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_equipment(
+    equipment_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    """Hard-delete : supprime l'équipement et toutes ses lignes equipment_media."""
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+    try:
+        _run_write_many([
+            ("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id]),
+            ("DELETE FROM equipment WHERE equipment_id = ?", [equipment_id]),
+        ])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "equipment_id": equipment_id, "message": "Équipement supprimé définitivement."}
+
+
+@app.post(
+    "/api/equipment/{equipment_id}/audit",
+    tags=["v4.1 Équipement"],
+    summary="Écrire une entrée dans l'audit trail équipement",
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def write_equipment_audit(
+    equipment_id: str,
+    body: AuditLogRequest,
+    _: None = Security(_require_token),
+) -> dict:
+    """Insère un log d'audit pour un équipement (VALIDATE, UPDATE, DELETE…)."""
+    if not _rows("SELECT equipment_id FROM equipment WHERE equipment_id = ?", [equipment_id]):
+        raise HTTPException(status_code=404, detail=f"Équipement {equipment_id} introuvable.")
+    try:
+        _run_write(
+            """INSERT INTO equipment_audit
+               (audit_id, equipment_id, action, changed_fields, operator)
+               VALUES (?, ?, ?, ?, ?)""",
+            [str(uuid.uuid4()), equipment_id, body.action,
+             body.changed_fields, body.operator],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "equipment_id": equipment_id, "action": body.action}
+
+
 # ─── v4.1 : Accessoires CRUD complet ─────────────────────────
 
 @app.get("/api/accessories/{accessory_id}", tags=["v4.1 Accessoires"], summary="Fiche complète accessoire")
@@ -4012,6 +4068,29 @@ def attach_equipment_photo(
     }
 
 
+@app.delete(
+    "/api/equipment/{equipment_id}/photos/{media_id}",
+    tags=["v4.4 Multi-photos"],
+    summary="Supprimer une photo d'un équipement",
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_equipment_photo(
+    equipment_id: str,
+    media_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    if not _rows(
+        "SELECT media_id FROM equipment_media WHERE media_id = ? AND equipment_id = ?",
+        [media_id, equipment_id],
+    ):
+        raise HTTPException(status_code=404, detail=f"Photo {media_id} introuvable pour l'équipement {equipment_id}.")
+    try:
+        _run_write("DELETE FROM equipment_media WHERE media_id = ?", [media_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "media_id": media_id}
+
+
 @app.post(
     "/api/accessories/{accessory_id}/photos/attach",
     tags=["v4.4 Multi-photos"],
@@ -4077,6 +4156,29 @@ def attach_accessory_photo(
     }
 
 
+@app.delete(
+    "/api/accessories/{accessory_id}/photos/{media_id}",
+    tags=["v4.4 Multi-photos"],
+    summary="Supprimer une photo d'un accessoire",
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_accessory_photo(
+    accessory_id: str,
+    media_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    if not _rows(
+        "SELECT media_id FROM accessory_media WHERE media_id = ? AND accessory_id = ?",
+        [media_id, accessory_id],
+    ):
+        raise HTTPException(status_code=404, detail=f"Photo {media_id} introuvable pour l'accessoire {accessory_id}.")
+    try:
+        _run_write("DELETE FROM accessory_media WHERE media_id = ?", [media_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "media_id": media_id}
+
+
 @app.post(
     "/api/consumables/{consumable_id}/photos/attach",
     tags=["v4.4 Multi-photos"],
@@ -4140,6 +4242,29 @@ def attach_consumable_photo(
         "is_primary": is_primary,
         "message": f"Photo attachée au consommable (role={role}, index={next_idx}).",
     }
+
+
+@app.delete(
+    "/api/consumables/{consumable_id}/photos/{media_id}",
+    tags=["v4.4 Multi-photos"],
+    summary="Supprimer une photo d'un consommable",
+    responses={404: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+)
+def delete_consumable_photo(
+    consumable_id: str,
+    media_id: str,
+    _: None = Security(_require_token),
+) -> dict:
+    if not _rows(
+        "SELECT media_id FROM consumable_media WHERE media_id = ? AND consumable_id = ?",
+        [media_id, consumable_id],
+    ):
+        raise HTTPException(status_code=404, detail=f"Photo {media_id} introuvable pour le consommable {consumable_id}.")
+    try:
+        _run_write("DELETE FROM consumable_media WHERE media_id = ?", [media_id])
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"ok": True, "media_id": media_id}
 
 
 @app.get(

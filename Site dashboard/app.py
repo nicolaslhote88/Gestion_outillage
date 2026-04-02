@@ -37,6 +37,31 @@ DB_PATH = "/files/duckdb/siga_v1.duckdb"
 # Fichier JSON écrit par l'API pour piloter le kiosque sans polling DuckDB
 KIOSK_STATE_FILE = Path(DB_PATH).parent / "kiosk_state.json"
 
+# ── API interne SIGA — seul point d'écriture DuckDB ───────────
+_API_PORT    = int(os.environ.get("SIGA_API_PORT", "8001"))
+_API_BASE    = f"http://localhost:{_API_PORT}"
+_API_TOKEN   = os.environ.get("SIGA_API_TOKEN", "siga-secret-token-change-me")
+_API_HEADERS = {"Authorization": f"Bearer {_API_TOKEN}"}
+
+
+def _api(method: str, path: str, **kwargs) -> tuple[bool, dict]:
+    """Appelle l'API SIGA interne.
+    Retourne (True, json_data) en cas de succès, (False, {}) sinon.
+    Affiche l'erreur dans l'UI Streamlit automatiquement."""
+    try:
+        r = requests.request(
+            method, f"{_API_BASE}{path}",
+            headers=_API_HEADERS, timeout=15, **kwargs,
+        )
+        if r.ok:
+            return True, (r.json() if r.content else {})
+        detail = r.json().get("detail", r.text) if r.content else r.text
+        st.error(f"Erreur SQL écriture : {detail}")
+        return False, {}
+    except Exception as e:
+        st.error(f"Erreur SQL écriture : {e}")
+        return False, {}
+
 # Dossiers Drive parents pour les entités sans photo existante.
 # Renseigner dans les variables d'environnement du container.
 SIGA_ACCESSORIES_FOLDER_ID = os.environ.get("SIGA_ACCESSORIES_FOLDER_ID", "")
@@ -259,7 +284,7 @@ def run_query(sql: str, params=None) -> pd.DataFrame:
     les écritures concurrentes de n8n (DuckDB file-lock).
     """
     try:
-        with duckdb.connect(DB_PATH) as conn:
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
             if params:
                 return conn.execute(sql, params).df()
             return conn.execute(sql).df()
@@ -399,7 +424,7 @@ def allowed_pages() -> list[str]:
 def db_is_reachable() -> bool:
     """Vérifie la disponibilité de la DB sans garder la connexion ouverte."""
     try:
-        with duckdb.connect(DB_PATH) as conn:
+        with duckdb.connect(DB_PATH, read_only=True) as conn:
             conn.execute("SELECT 1")
         return True
     except Exception:
@@ -1406,16 +1431,14 @@ def render_validation():
                 quick_validate_key = f"quick_validate_{eq_id}"
                 if st.button("✅ Valider directement (sans modification)",
                              key=quick_validate_key, use_container_width=True):
-                    ok = run_write("""
-                        UPDATE equipment SET review_required = false
-                        WHERE equipment_id = ?
-                    """, [eq_id])
+                    ok, _ = _api("patch", f"/api/equipment/{eq_id}",
+                                 json={"review_required": False})
                     if ok:
-                        run_write("""
-                            INSERT INTO equipment_audit
-                                (audit_id, equipment_id, action, changed_fields, operator)
-                            VALUES (?, ?, 'VALIDATE', 'review_required', ?)
-                        """, [str(uuid.uuid4()), eq_id, get_current_user()])
+                        _api("post", f"/api/equipment/{eq_id}/audit", json={
+                            "action": "VALIDATE",
+                            "changed_fields": "review_required",
+                            "operator": get_current_user(),
+                        })
                         st.success("✅ Fiche validée.")
                         _finish_edit()
                         st.rerun()
@@ -1512,10 +1535,11 @@ def render_validation():
                     else:
                         st.caption("Aucune spécification technique.")
                     if st.button("🗑 Tout effacer les specs", key=f"clear_specs_{eq_id}"):
-                        run_write("UPDATE equipment SET technical_specs_json = '{}' WHERE equipment_id = ?",
-                                  [eq_id])
-                        st.session_state.pop(_del_specs_key, None)
-                        st.rerun()
+                        ok, _ = _api("patch", f"/api/equipment/{eq_id}",
+                                     json={"technical_specs_json": "{}"})
+                        if ok:
+                            st.session_state.pop(_del_specs_key, None)
+                            st.rerun()
 
                 # ── Édition contexte métier (accessoires, consommables, éléments) ──
                 biz = safe_json(row.get("business_context_json"), {})
@@ -1559,11 +1583,12 @@ def render_validation():
                         if st.button(f"🗑 Tout vider", key=f"clear_biz_{eq_id}_{section_key}"):
                             _new_biz = dict(biz)
                             _new_biz[section_key] = []
-                            run_write(
-                                "UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
-                                [json.dumps(_new_biz, ensure_ascii=False), eq_id])
-                            st.session_state.pop(_del_biz_key, None)
-                            st.rerun()
+                            ok, _ = _api("patch", f"/api/equipment/{eq_id}",
+                                         json={"business_context_json":
+                                               json.dumps(_new_biz, ensure_ascii=False)})
+                            if ok:
+                                st.session_state.pop(_del_biz_key, None)
+                                st.rerun()
 
                 _edit_biz_list("accessories",    "✦", "Accessoires livrés")
                 _edit_biz_list("consumables",    "⚙", "Consommables associés")
@@ -1587,85 +1612,88 @@ def render_validation():
                         st.session_state.get(f"main_photo_{eq_id}", ""), f_main_photo_fid
                     ) if photo_options else f_main_photo_fid
 
-                    # Sauvegarde champs de base
-                    ok = run_write("""
-                        UPDATE equipment SET
-                            label           = ?,
-                            brand           = ?,
-                            model           = ?,
-                            serial_number   = ?,
-                            subtype         = ?,
-                            condition_label = ?,
-                            location_hint   = ?,
-                            notes           = ?,
-                            review_required = false
-                        WHERE equipment_id = ?
-                    """, [
-                        sv_label or None, sv_brand or None, sv_model or None,
-                        sv_serial or None, sv_subtype or None, sv_cond,
-                        sv_loc or None, sv_notes or None, eq_id,
-                    ])
+                    # Calcul des specs techniques
+                    _del_s = st.session_state.get(_del_specs_key, set())
+                    _new_specs = {}
+                    for _orig_k, _orig_v in specs.items():
+                        if _orig_k in _del_s:
+                            continue
+                        _nk = st.session_state.get(f"sk_{eq_id}_{_orig_k}", _orig_k)
+                        _nv = st.session_state.get(f"sv_{eq_id}_{_orig_k}", str(_orig_v))
+                        if _nk.strip():
+                            _new_specs[_nk.strip()] = _nv
+                    st.session_state.pop(_del_specs_key, None)
 
-                    # Sauvegarde vignette principale
-                    if ok and sv_photo:
-                        run_write("""
-                            UPDATE equipment_media
-                            SET image_role = CASE
-                                WHEN final_drive_file_id = ? THEN 'overview'
-                                WHEN image_role = 'overview' THEN 'detail'
-                                ELSE image_role
-                            END
-                            WHERE equipment_id = ?
-                        """, [sv_photo, eq_id])
-
-                    # Sauvegarde spécifications techniques
-                    if ok:
-                        _del_s = st.session_state.get(_del_specs_key, set())
-                        _new_specs = {}
-                        for _orig_k, _orig_v in specs.items():
-                            if _orig_k in _del_s:
+                    # Calcul contexte métier
+                    _new_biz = dict(biz)
+                    for _sk_biz in ("accessories", "consumables", "associated_items", "condition_notes"):
+                        _del_biz_key = f"del_biz_{eq_id}_{_sk_biz}"
+                        _del_b = st.session_state.get(_del_biz_key, set())
+                        _alt_keys2 = {"accessories": "accessoires",
+                                      "consumables": "consommables",
+                                      "associated_items": "elements_associes",
+                                      "condition_notes": "constats"}
+                        _items_b = biz.get(_sk_biz) or biz.get(_alt_keys2.get(_sk_biz, ""), [])
+                        if isinstance(_items_b, str):
+                            _items_b = [_items_b] if _items_b else []
+                        if not isinstance(_items_b, list):
+                            _items_b = []
+                        _new_list = []
+                        for _i_b in range(len(_items_b)):
+                            if _i_b in _del_b:
                                 continue
-                            _nk = st.session_state.get(f"sk_{eq_id}_{_orig_k}", _orig_k)
-                            _nv = st.session_state.get(f"sv_{eq_id}_{_orig_k}", str(_orig_v))
-                            if _nk.strip():
-                                _new_specs[_nk.strip()] = _nv
-                        run_write("UPDATE equipment SET technical_specs_json = ? WHERE equipment_id = ?",
-                                  [json.dumps(_new_specs, ensure_ascii=False), eq_id])
-                        st.session_state.pop(_del_specs_key, None)
+                            _raw_val = st.session_state.get(
+                                f"biz_{eq_id}_{_sk_biz}_{_i_b}",
+                                _items_b[_i_b] if isinstance(_items_b[_i_b], str)
+                                else json.dumps(_items_b[_i_b], ensure_ascii=False)
+                            ).strip()
+                            if _raw_val:
+                                try:
+                                    _new_list.append(json.loads(_raw_val))
+                                except Exception:
+                                    _new_list.append(_raw_val)
+                        _new_biz[_sk_biz] = _new_list
+                        st.session_state.pop(_del_biz_key, None)
 
-                    # Sauvegarde contexte métier
-                    if ok:
-                        _new_biz = dict(biz)
-                        for _sk_biz in ("accessories", "consumables", "associated_items", "condition_notes"):
-                            _del_biz_key = f"del_biz_{eq_id}_{_sk_biz}"
-                            _del_b = st.session_state.get(_del_biz_key, set())
-                            _alt_keys2 = {"accessories": "accessoires",
-                                          "consumables": "consommables",
-                                          "associated_items": "elements_associes",
-                                          "condition_notes": "constats"}
-                            _items_b = biz.get(_sk_biz) or biz.get(_alt_keys2.get(_sk_biz, ""), [])
-                            if isinstance(_items_b, str):
-                                _items_b = [_items_b] if _items_b else []
-                            if not isinstance(_items_b, list):
-                                _items_b = []
-                            _new_list = []
-                            for _i_b in range(len(_items_b)):
-                                if _i_b in _del_b:
-                                    continue
-                                _raw_val = st.session_state.get(
-                                    f"biz_{eq_id}_{_sk_biz}_{_i_b}",
-                                    _items_b[_i_b] if isinstance(_items_b[_i_b], str)
-                                    else json.dumps(_items_b[_i_b], ensure_ascii=False)
-                                ).strip()
-                                if _raw_val:
-                                    try:
-                                        _new_list.append(json.loads(_raw_val))
-                                    except Exception:
-                                        _new_list.append(_raw_val)
-                            _new_biz[_sk_biz] = _new_list
-                            st.session_state.pop(_del_biz_key, None)
-                        run_write("UPDATE equipment SET business_context_json = ? WHERE equipment_id = ?",
-                                  [json.dumps(_new_biz, ensure_ascii=False), eq_id])
+                    # Envoi PATCH API (champs de base + specs + biz en une seule requête)
+                    patch_payload = {
+                        "label": sv_label or None,
+                        "brand": sv_brand or None,
+                        "model": sv_model or None,
+                        "serial_number": sv_serial or None,
+                        "subtype": sv_subtype or None,
+                        "condition_label": sv_cond,
+                        "location_hint": sv_loc or None,
+                        "notes": sv_notes or None,
+                        "review_required": False,
+                        "technical_specs_json": json.dumps(_new_specs, ensure_ascii=False),
+                        "business_context_json": json.dumps(_new_biz, ensure_ascii=False),
+                    }
+                    ok, _ = _api("patch", f"/api/equipment/{eq_id}", json=patch_payload)
+
+                    # Sauvegarde vignette principale via PUT photos
+                    if ok and sv_photo and not media_df.empty:
+                        photos_payload = []
+                        for _, pm in media_df.iterrows():
+                            fid = pm.get("final_drive_file_id") or ""
+                            if not fid:
+                                continue
+                            role = "overview" if fid == sv_photo else (
+                                "detail" if pm.get("image_role") == "overview" else
+                                null_str(pm.get("image_role"), "detail")
+                            )
+                            photos_payload.append({
+                                "file_id": fid,
+                                "folder_id": null_str(pm.get("final_drive_folder_id")),
+                                "filename": null_str(pm.get("filename")),
+                                "mime_type": null_str(pm.get("mime_type")),
+                                "role": role,
+                                "sort_order": int(pm.get("image_index") or 0),
+                                "is_primary": fid == sv_photo,
+                            })
+                        if photos_payload:
+                            _api("put", f"/api/equipment/{eq_id}/photos",
+                                 json={"photos": photos_payload})
 
                     if ok:
                         _changed = ", ".join(filter(None, [
@@ -1679,11 +1707,11 @@ def render_validation():
                             "notes"         if sv_notes    != null_str(row.get("notes"),          "") else "",
                             "specs/biz",
                         ])) or "aucun changement détecté"
-                        run_write("""
-                            INSERT INTO equipment_audit
-                                (audit_id, equipment_id, action, changed_fields, operator)
-                            VALUES (?, ?, 'UPDATE', ?, ?)
-                        """, [str(uuid.uuid4()), eq_id, _changed, get_current_user()])
+                        _api("post", f"/api/equipment/{eq_id}/audit", json={
+                            "action": "UPDATE",
+                            "changed_fields": _changed,
+                            "operator": get_current_user(),
+                        })
                         st.success("✅ Équipement validé et mis à jour.")
                         _finish_edit()
                         st.rerun()
@@ -1705,8 +1733,7 @@ def render_validation():
                     )
                     c1, c2 = st.columns(2)
                     if c1.button("✅ Confirmer la suppression", key=f"del_yes_{eq_id}", type="primary"):
-                        run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [eq_id])
-                        run_write("DELETE FROM equipment WHERE equipment_id = ?", [eq_id])
+                        _api("delete", f"/api/equipment/{eq_id}")
                         if folder_id_for_del:
                             drive_ok = call_delete_equipment_webhook(
                                 folder_id_for_del, eq_id,
@@ -2065,15 +2092,18 @@ def show_equipment_modal(equipment_id: str):
                                 st.error("Échec de l'upload vers Google Drive.")
                             else:
                                 next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
-                                ok = run_write(
-                                    """INSERT INTO equipment_media
-                                           (media_id, equipment_id, final_drive_file_id,
-                                            final_drive_folder_id, filename, mime_type,
-                                            image_role, image_index, attached_by)
-                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
-                                    [str(uuid.uuid4()), equipment_id, file_id,
-                                     folder_id, uploaded_file.name, mime,
-                                     new_role, next_idx],
+                                ok, _ = _api(
+                                    "post", f"/api/equipment/{equipment_id}/photos/attach",
+                                    json={
+                                        "file_id": file_id,
+                                        "folder_id": folder_id,
+                                        "filename": uploaded_file.name,
+                                        "mime_type": mime,
+                                        "role": new_role,
+                                        "sort_order": next_idx,
+                                        "is_primary": next_idx == 0,
+                                        "attached_by": "dashboard",
+                                    },
                                 )
                                 if ok:
                                     st.success("Photo uploadée et enregistrée.")
@@ -2259,20 +2289,14 @@ def show_equipment_modal(equipment_id: str):
             if not borrower.strip():
                 st.error("Le nom de l'emprunteur est obligatoire.")
             else:
-                ok = run_write("""
-                    INSERT INTO equipment_movements
-                        (movement_id, equipment_id, movement_type, borrower_name,
-                         borrower_contact, out_date, expected_return_date, notes)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-                """, [
-                    str(uuid.uuid4()),
-                    equipment_id,
-                    mv_type,
-                    borrower.strip(),
-                    contact.strip() or None,
-                    datetime.combine(ret_date, datetime.min.time()) if ret_date else None,
-                    notes_out.strip() or None,
-                ])
+                ok, _ = _api("post", "/api/movements/checkout", json={
+                    "equipment_ids": [equipment_id],
+                    "movement_type": mv_type,
+                    "borrower_name": borrower.strip(),
+                    "borrower_contact": contact.strip() or None,
+                    "expected_return_date": ret_date.isoformat() if ret_date else None,
+                    "notes": notes_out.strip() or None,
+                })
                 if ok:
                     st.success(f"✅ Sortie enregistrée pour {borrower.strip()}.")
                     st.rerun()
@@ -2304,11 +2328,7 @@ def show_equipment_modal(equipment_id: str):
 
         mv_id = mv.get("movement_id")
         if st.button("🔙 Déclarer le retour", key=f"checkin_btn_{equipment_id}", use_container_width=True):
-            ok = run_write("""
-                UPDATE equipment_movements
-                SET actual_return_date = CURRENT_TIMESTAMP
-                WHERE movement_id = ?
-            """, [mv_id])
+            ok, _ = _api("post", "/api/movements/checkin", json={"movement_ids": [mv_id]})
             if ok:
                 st.success("✅ Retour enregistré.")
                 st.rerun()
@@ -2378,8 +2398,7 @@ def show_equipment_modal(equipment_id: str):
             col_yes, col_no = footer_del.columns(2)
             if col_yes.button("✓", key=f"del_yes_{equipment_id}", use_container_width=True):
                 folder_id = null_str(row.get("final_drive_folder_id"), "")
-                run_write("DELETE FROM equipment_media WHERE equipment_id = ?", [equipment_id])
-                run_write("DELETE FROM equipment WHERE equipment_id = ?", [equipment_id])
+                _api("delete", f"/api/equipment/{equipment_id}")
                 if folder_id and folder_id != "—":
                     call_delete_equipment_webhook(
                         folder_id, equipment_id,
@@ -2514,16 +2533,16 @@ def show_accessory_modal(accessory_id: str):
                             st.error("Échec de l'upload vers Google Drive.")
                         else:
                             next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
-                            ok = run_write(
-                                """INSERT INTO accessory_media
-                                       (media_id, accessory_id, final_drive_file_id,
-                                        final_drive_folder_id, filename, mime_type,
-                                        image_role, image_index, attached_by)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
-                                [str(uuid.uuid4()), accessory_id, file_id,
-                                 folder_id, uploaded_file.name, mime,
-                                 new_role, next_idx],
-                            )
+                            ok, _ = _api("post", f"/api/accessories/{accessory_id}/photos/attach", json={
+                                "file_id": file_id,
+                                "folder_id": folder_id,
+                                "filename": uploaded_file.name,
+                                "mime_type": mime,
+                                "role": new_role,
+                                "sort_order": next_idx,
+                                "is_primary": next_idx == 0,
+                                "attached_by": "dashboard",
+                            })
                             if ok:
                                 st.success("Photo uploadée et enregistrée.")
                                 st.rerun()
@@ -2543,9 +2562,10 @@ def show_accessory_modal(accessory_id: str):
                                          key=f"acc_del_sel_{accessory_id}")
                 if st.button("🗑 Supprimer", key=f"acc_del_photo_{accessory_id}",
                              type="primary"):
-                    run_write("DELETE FROM accessory_media WHERE media_id = ?",
-                              [del_options[del_label]])
-                    st.rerun()
+                    media_id_to_del = del_options[del_label]
+                    ok, _ = _api("delete", f"/api/accessories/{accessory_id}/photos/{media_id_to_del}")
+                    if ok:
+                        st.rerun()
 
     # ── Identification ────────────────────────────────────────
     with right_col:
@@ -2634,17 +2654,15 @@ def show_accessory_modal(accessory_id: str):
                                       key=f"acc_edit_notes_{accessory_id}")
             if st.button("💾 Enregistrer", key=f"acc_save_{accessory_id}",
                          type="primary", use_container_width=True):
-                ok = run_write("""
-                    UPDATE accessories SET
-                        label=?, brand=?, model=?, category=?,
-                        location_hint=?, stock_qty=?, notes=?, updated_at=?
-                    WHERE accessory_id=?
-                """, [f_label.strip() or None, f_brand.strip() or None,
-                      f_model.strip() or None, f_category.strip() or None,
-                      f_location.strip() or None, int(f_stock),
-                      f_notes.strip() or None,
-                      datetime.utcnow().isoformat(),
-                      accessory_id])
+                ok, _ = _api("patch", f"/api/accessories/{accessory_id}", json={
+                    "label": f_label.strip() or None,
+                    "brand": f_brand.strip() or None,
+                    "model": f_model.strip() or None,
+                    "category": f_category.strip() or None,
+                    "location_hint": f_location.strip() or None,
+                    "stock_qty": int(f_stock),
+                    "notes": f_notes.strip() or None,
+                })
                 if ok:
                     st.success("✅ Fiche mise à jour.")
                     st.rerun()
@@ -2659,15 +2677,12 @@ def show_accessory_modal(accessory_id: str):
             col_yes, col_no = st.columns(2)
             if col_yes.button("✓ Confirmer", key=f"acc_del_yes_{accessory_id}",
                               use_container_width=True):
-                ok = run_write(
-                    "UPDATE accessories SET archived = TRUE, updated_at = ? WHERE accessory_id = ?",
-                    [datetime.utcnow().isoformat(), accessory_id],
-                )
+                ok, _ = _api("delete", f"/api/accessories/{accessory_id}")
                 if ok:
                     st.session_state.pop(del_key, None)
                     st.rerun()
                 else:
-                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
+                    st.error("❌ Suppression échouée. Réessaie dans quelques secondes.")
             if col_no.button("✗ Annuler", key=f"acc_del_no_{accessory_id}",
                              use_container_width=True):
                 st.session_state.pop(del_key, None)
@@ -2798,16 +2813,16 @@ def show_consumable_modal(consumable_id: str):
                             st.error("Échec de l'upload vers Google Drive.")
                         else:
                             next_idx = int(media_df["image_index"].max() + 1) if not media_df.empty else 0
-                            ok = run_write(
-                                """INSERT INTO consumable_media
-                                       (media_id, consumable_id, final_drive_file_id,
-                                        final_drive_folder_id, filename, mime_type,
-                                        image_role, image_index, attached_by)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dashboard')""",
-                                [str(uuid.uuid4()), consumable_id, file_id,
-                                 folder_id, uploaded_file.name, mime,
-                                 new_role, next_idx],
-                            )
+                            ok, _ = _api("post", f"/api/consumables/{consumable_id}/photos/attach", json={
+                                "file_id": file_id,
+                                "folder_id": folder_id,
+                                "filename": uploaded_file.name,
+                                "mime_type": mime,
+                                "role": new_role,
+                                "sort_order": next_idx,
+                                "is_primary": next_idx == 0,
+                                "attached_by": "dashboard",
+                            })
                             if ok:
                                 st.success("Photo uploadée et enregistrée.")
                                 st.rerun()
@@ -2827,9 +2842,10 @@ def show_consumable_modal(consumable_id: str):
                                          key=f"con_del_sel_{consumable_id}")
                 if st.button("🗑 Supprimer", key=f"con_del_photo_{consumable_id}",
                              type="primary"):
-                    run_write("DELETE FROM consumable_media WHERE media_id = ?",
-                              [del_options[del_label]])
-                    st.rerun()
+                    media_id_to_del = del_options[del_label]
+                    ok, _ = _api("delete", f"/api/consumables/{consumable_id}/photos/{media_id_to_del}")
+                    if ok:
+                        st.rerun()
 
     # ── Identification & Stock ────────────────────────────────
     with right_col:
@@ -2945,19 +2961,17 @@ def show_consumable_modal(consumable_id: str):
                                        key=f"con_edit_notes_{consumable_id}")
             if st.button("💾 Enregistrer", key=f"con_save_{consumable_id}",
                          type="primary", use_container_width=True):
-                ok = run_write("""
-                    UPDATE consumables SET
-                        label=?, brand=?, reference=?, category=?, unit=?,
-                        location_hint=?, stock_qty=?, stock_min_alert=?,
-                        notes=?, updated_at=?
-                    WHERE consumable_id=?
-                """, [f_label.strip() or None, f_brand.strip() or None,
-                      f_reference.strip() or None, f_category.strip() or None,
-                      f_unit.strip() or None, f_location.strip() or None,
-                      f_stock, f_alert,
-                      f_notes.strip() or None,
-                      datetime.utcnow().isoformat(),
-                      consumable_id])
+                ok, _ = _api("patch", f"/api/consumables/{consumable_id}", json={
+                    "label": f_label.strip() or None,
+                    "brand": f_brand.strip() or None,
+                    "reference": f_reference.strip() or None,
+                    "category": f_category.strip() or None,
+                    "unit": f_unit.strip() or None,
+                    "location_hint": f_location.strip() or None,
+                    "stock_qty": f_stock,
+                    "stock_min_alert": f_alert,
+                    "notes": f_notes.strip() or None,
+                })
                 if ok:
                     st.success("✅ Fiche mise à jour.")
                     st.rerun()
@@ -2972,15 +2986,12 @@ def show_consumable_modal(consumable_id: str):
             col_yes, col_no = st.columns(2)
             if col_yes.button("✓ Confirmer", key=f"con_del_yes_{consumable_id}",
                               use_container_width=True):
-                ok = run_write(
-                    "UPDATE consumables SET archived = TRUE, updated_at = ? WHERE consumable_id = ?",
-                    [datetime.utcnow().isoformat(), consumable_id],
-                )
+                ok, _ = _api("delete", f"/api/consumables/{consumable_id}")
                 if ok:
                     st.session_state.pop(del_key, None)
                     st.rerun()
                 else:
-                    st.error("❌ Suppression échouée (base verrouillée ?). Réessaie dans quelques secondes.")
+                    st.error("❌ Suppression échouée. Réessaie dans quelques secondes.")
             if col_no.button("✗ Annuler", key=f"con_del_no_{consumable_id}",
                              use_container_width=True):
                 st.session_state.pop(del_key, None)
@@ -3315,15 +3326,14 @@ def render_parc_materiel():
                     if is_admin() and item.get("review_required"):
                         if st.button("⚡ Valider", key=f"qval_{eid}", use_container_width=True,
                                      help="Valider cette fiche directement"):
-                            ok = run_write(
-                                "UPDATE equipment SET review_required = false WHERE equipment_id = ?", [eid]
-                            )
+                            ok, _ = _api("patch", f"/api/equipment/{eid}",
+                                         json={"review_required": False})
                             if ok:
-                                run_write("""
-                                    INSERT INTO equipment_audit
-                                        (audit_id, equipment_id, action, changed_fields, operator)
-                                    VALUES (?, ?, 'VALIDATE', 'review_required', ?)
-                                """, [str(uuid.uuid4()), eid, get_current_user()])
+                                _api("post", f"/api/equipment/{eid}/audit", json={
+                                    "action": "VALIDATE",
+                                    "changed_fields": "review_required",
+                                    "operator": get_current_user(),
+                                })
                                 st.rerun()
 
                 elif etype == "accessory":
@@ -3634,38 +3644,19 @@ def render_suivi_mouvements():
                     st.error("Le nom de l'emprunteur est obligatoire.")
                 else:
                     sel_kit_id = kit_ids[sel_kit_idx]
-                    items_df = run_query(
-                        "SELECT equipment_id FROM kit_items WHERE kit_id = ?", [sel_kit_id]
-                    )
-                    if items_df.empty:
-                        st.warning("Ce kit ne contient aucun outil. Composez-le d'abord.")
-                    else:
-                        batch_id = str(uuid.uuid4())
-                        exp_dt   = (datetime.combine(ret_date_kit, datetime.min.time())
-                                    if ret_date_kit else None)
-                        errors = 0
-                        for eid in items_df["equipment_id"].tolist():
-                            ok = run_write("""
-                                INSERT INTO equipment_movements
-                                    (movement_id, equipment_id, movement_type,
-                                     borrower_name, borrower_contact,
-                                     out_date, expected_return_date, notes,
-                                     batch_id, kit_id)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
-                            """, [str(uuid.uuid4()), eid, mv_type_kit,
-                                  borrower_kit.strip(), contact_kit.strip() or None,
-                                  exp_dt, notes_kit.strip() or None,
-                                  batch_id, sel_kit_id])
-                            if not ok:
-                                errors += 1
-                        if errors == 0:
-                            st.success(
-                                f"✅ {len(items_df)} outil(s) du kit **{kit_labels[sel_kit_idx]}** "
-                                f"sortis pour **{borrower_kit.strip()}**."
-                            )
-                            st.rerun()
-                        else:
-                            st.error(f"{errors} insertion(s) échouée(s).")
+                    ok, resp = _api("post", f"/api/kits/{sel_kit_id}/checkout", json={
+                        "borrower_name": borrower_kit.strip(),
+                        "borrower_contact": contact_kit.strip() or None,
+                        "expected_return_date": ret_date_kit.isoformat() if ret_date_kit else None,
+                        "notes": notes_kit.strip() or None,
+                        "movement_type": mv_type_kit,
+                    })
+                    if ok:
+                        st.success(
+                            f"✅ Kit **{kit_labels[sel_kit_idx]}** "
+                            f"sorti pour **{borrower_kit.strip()}**."
+                        )
+                        st.rerun()
 
     st.markdown("---")
 
@@ -3785,11 +3776,7 @@ def render_suivi_mouvements():
             )
             mv_id = row.get("movement_id")
             if st.button("🔙 Retour", key=f"ret_{mv_id}", use_container_width=True):
-                ok = run_write("""
-                    UPDATE equipment_movements
-                    SET actual_return_date = CURRENT_TIMESTAMP
-                    WHERE movement_id = ?
-                """, [mv_id])
+                ok, _ = _api("post", "/api/movements/checkin", json={"movement_ids": [mv_id]})
                 if ok:
                     st.success(f"✅ Retour enregistré pour {borrower}.")
                     st.rerun()
@@ -3913,18 +3900,15 @@ def checkin_kit_dialog(batch_id: str, borrower_name: str) -> None:
     if st.button("✅ Valider le retour", type="primary", use_container_width=True):
         returned = [mid for mid, c in checked.items() if c]
         missing  = len(checked) - len(returned)
-        for mid in returned:
-            run_write("""
-                UPDATE equipment_movements
-                SET actual_return_date = CURRENT_TIMESTAMP
-                WHERE movement_id = ?
-            """, [mid])
-        if missing:
-            st.warning(f"✅ {len(returned)} outil(s) retourné(s). "
-                       f"⚠️ {missing} outil(s) manquant(s) restent en cours.")
-        else:
-            st.success(f"✅ {len(returned)} outil(s) retourné(s). Kit soldé.")
-        st.rerun()
+        if returned:
+            ok, _ = _api("post", "/api/movements/checkin", json={"movement_ids": returned})
+            if ok:
+                if missing:
+                    st.warning(f"✅ {len(returned)} outil(s) retourné(s). "
+                               f"⚠️ {missing} outil(s) manquant(s) restent en cours.")
+                else:
+                    st.success(f"✅ {len(returned)} outil(s) retourné(s). Kit soldé.")
+                st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3948,10 +3932,10 @@ def render_gestion_kits() -> None:
             if not kit_name.strip():
                 st.error("Le nom est obligatoire.")
             else:
-                ok = run_write(
-                    "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
-                    [str(uuid.uuid4()), kit_name.strip(), kit_desc.strip() or None],
-                )
+                ok, _ = _api("post", "/api/kits", json={
+                    "name": kit_name.strip(),
+                    "description": kit_desc.strip() or None,
+                })
                 if ok:
                     st.success(f"✅ Kit **{kit_name.strip()}** créé.")
                     st.rerun()
@@ -4000,21 +3984,17 @@ def render_gestion_kits() -> None:
         with col_save:
             if st.button("💾 Mettre à jour le contenu", use_container_width=True):
                 sel_ids = [eq_by_name[n] for n in sel_names]
-                ok = run_write("DELETE FROM kit_items WHERE kit_id = ?", [sel_kit_id])
-                for eid in sel_ids:
-                    ok = ok and run_write(
-                        "INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)",
-                        [sel_kit_id, eid],
-                    )
+                ok, _ = _api("put", f"/api/kits/{sel_kit_id}/content",
+                             json={"equipment_ids": sel_ids})
                 if ok:
                     st.success(f"✅ Kit mis à jour ({len(sel_ids)} outil(s)).")
                     st.rerun()
         with col_del:
             if st.button("🗑 Supprimer ce kit", use_container_width=True):
-                run_write("DELETE FROM kit_items WHERE kit_id = ?", [sel_kit_id])
-                run_write("DELETE FROM kits WHERE kit_id = ?", [sel_kit_id])
-                st.success("Kit supprimé.")
-                st.rerun()
+                ok, _ = _api("delete", f"/api/kits/{sel_kit_id}")
+                if ok:
+                    st.success("Kit supprimé.")
+                    st.rerun()
 
         # ── Aperçu visuel ─────────────────────────────────
         if current_ids:
@@ -4103,15 +4083,15 @@ def render_accessoires_consommables() -> None:
                 if not acc_label.strip():
                     st.error("La désignation est obligatoire.")
                 else:
-                    ok = run_write(
-                        """INSERT INTO accessories
-                           (accessory_id, label, brand, model, category,
-                            stock_qty, location_hint, notes)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        [str(uuid.uuid4()), acc_label.strip(), acc_brand or None,
-                         acc_model or None, acc_category or None,
-                         int(acc_stock), acc_location or None, acc_notes or None],
-                    )
+                    ok, _ = _api("post", "/api/accessories", json={
+                        "label": acc_label.strip(),
+                        "brand": acc_brand or None,
+                        "model": acc_model or None,
+                        "category": acc_category or None,
+                        "stock_qty": int(acc_stock),
+                        "location_hint": acc_location or None,
+                        "notes": acc_notes or None,
+                    })
                     if ok:
                         st.success(f"✅ Accessoire '{acc_label.strip()}' ajouté.")
                         st.rerun()
@@ -4159,15 +4139,17 @@ def render_accessoires_consommables() -> None:
                 if not con_label.strip():
                     st.error("La désignation est obligatoire.")
                 else:
-                    ok = run_write(
-                        """INSERT INTO consumables
-                           (consumable_id, label, brand, reference, category, unit,
-                            stock_qty, stock_min_alert, location_hint, notes)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        [str(uuid.uuid4()), con_label.strip(), con_brand or None,
-                         con_ref or None, con_category or None, con_unit,
-                         float(con_stock), float(con_alert), con_location or None, con_notes or None],
-                    )
+                    ok, _ = _api("post", "/api/consumables", json={
+                        "label": con_label.strip(),
+                        "brand": con_brand or None,
+                        "reference": con_ref or None,
+                        "category": con_category or None,
+                        "unit": con_unit,
+                        "stock_qty": float(con_stock),
+                        "stock_min_alert": float(con_alert),
+                        "location_hint": con_location or None,
+                        "notes": con_notes or None,
+                    })
                     if ok:
                         st.success(f"✅ Consommable '{con_label.strip()}' ajouté.")
                         st.rerun()
@@ -4207,12 +4189,11 @@ def render_accessoires_consommables() -> None:
                                            key="link_acc_acc")
                     link_note = st.text_input("Note (optionnelle)", key="link_acc_note")
                     if st.button("🔗 Lier", key="btn_link_acc"):
-                        ok = run_write(
-                            """INSERT INTO links_compatibility (link_id, equipment_id, accessory_id, note)
-                               VALUES (?, ?, ?, ?)
-                               ON CONFLICT (equipment_id, accessory_id) DO NOTHING""",
-                            [str(uuid.uuid4()), sel_eq, sel_acc, link_note or None],
-                        )
+                        ok, _ = _api("post", "/api/links/compatibility", json={
+                            "equipment_id": sel_eq,
+                            "accessory_id": sel_acc,
+                            "note": link_note or None,
+                        })
                         if ok:
                             st.success("✅ Liaison créée.")
                             st.rerun()
@@ -4248,13 +4229,12 @@ def render_accessoires_consommables() -> None:
                     qty_use  = st.number_input("Quantité / usage", min_value=0.0, value=1.0, step=0.5, key="link_con_qty")
                     link_note2 = st.text_input("Note (optionnelle)", key="link_con_note")
                     if st.button("🔗 Lier", key="btn_link_con"):
-                        ok = run_write(
-                            """INSERT INTO links_consumables
-                               (link_id, equipment_id, consumable_id, qty_per_use, note)
-                               VALUES (?, ?, ?, ?, ?)
-                               ON CONFLICT (equipment_id, consumable_id) DO NOTHING""",
-                            [str(uuid.uuid4()), sel_eq2, sel_con, float(qty_use), link_note2 or None],
-                        )
+                        ok, _ = _api("post", "/api/links/consumables", json={
+                            "equipment_id": sel_eq2,
+                            "consumable_id": sel_con,
+                            "qty_per_use": float(qty_use),
+                            "note": link_note2 or None,
+                        })
                         if ok:
                             st.success("✅ Liaison consommable créée.")
                             st.rerun()
@@ -4559,16 +4539,11 @@ def render_sidebar():
                     if not kit_name_input.strip():
                         st.error("Nom obligatoire.")
                     else:
-                        kid = str(uuid.uuid4())
-                        ok  = run_write(
-                            "INSERT INTO kits (kit_id, name, description) VALUES (?, ?, ?)",
-                            [kid, kit_name_input.strip(), kit_desc_input.strip() or None],
-                        )
-                        for eid in list(basket.keys()):
-                            ok = ok and run_write(
-                                "INSERT OR IGNORE INTO kit_items (kit_id, equipment_id) VALUES (?, ?)",
-                                [kid, eid],
-                            )
+                        ok, _ = _api("post", "/api/kits", json={
+                            "name": kit_name_input.strip(),
+                            "description": kit_desc_input.strip() or None,
+                            "equipment_ids": list(basket.keys()),
+                        })
                         if ok:
                             st.success(f"✅ Kit **{kit_name_input.strip()}** créé ({n_basket} outil(s)).")
                             st.session_state["kit_basket"] = {}
@@ -4635,23 +4610,15 @@ def render_sidebar():
                     if not loan_borrower.strip():
                         st.error("Emprunteur obligatoire.")
                     else:
-                        batch_id = str(uuid.uuid4())
-                        exp_dt   = (datetime.combine(loan_ret, datetime.min.time())
-                                    if loan_ret else None)
-                        errors = 0
-                        for eid in list(loan.keys()):
-                            ok = run_write("""
-                                INSERT INTO equipment_movements
-                                    (movement_id, equipment_id, movement_type,
-                                     borrower_name, borrower_contact,
-                                     out_date, expected_return_date, notes, batch_id)
-                                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-                            """, [str(uuid.uuid4()), eid, loan_type,
-                                  loan_borrower.strip(), loan_contact.strip() or None,
-                                  exp_dt, loan_notes.strip() or None, batch_id])
-                            if not ok:
-                                errors += 1
-                        if errors == 0:
+                        ok, _ = _api("post", "/api/movements/checkout", json={
+                            "equipment_ids": list(loan.keys()),
+                            "movement_type": loan_type,
+                            "borrower_name": loan_borrower.strip(),
+                            "borrower_contact": loan_contact.strip() or None,
+                            "expected_return_date": loan_ret.isoformat() if loan_ret else None,
+                            "notes": loan_notes.strip() or None,
+                        })
+                        if ok:
                             st.success(
                                 f"✅ {n_loan} outil(s) sortis pour "
                                 f"**{loan_borrower.strip()}**."
