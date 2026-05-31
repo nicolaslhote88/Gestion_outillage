@@ -1,0 +1,672 @@
+{
+  "updatedAt": "2026-05-31T06:35:06.0193677Z",
+  "createdAt": "2026-05-30T20:51:37.752Z",
+  "id": "8ktbbkVySbjkeaA9",
+  "name": "SIGA - Telegram vers Drive (brief terrain)",
+  "description": null,
+  "active": true,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message"
+        ],
+        "additionalFields": {
+          "download": true
+        }
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "Reception Telegram",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        "-760",
+        304
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "pVqYKOVuJrq3njUz",
+          "name": "Telegram Jarvis Bot"
+        }
+      },
+      "webhookId": "siga-brief-telegram-trigger"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const msg = $json.message || $json;\nconst d = new Date();\nconst pad = (n) => String(n).padStart(2, '0');\nconst stamp = `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;\nconst text = (msg.text || msg.caption || '').trim();\nconst hasPhoto = Array.isArray(msg.photo) && msg.photo.length > 0;\nconst messageId = msg.message_id;\nconst chatId = msg.chat ? msg.chat.id : null;\nconst mediaGroupId = msg.media_group_id || null;\nconst isAlbum = Boolean(mediaGroupId);\nconst safeGroup = String(mediaGroupId || '').replace(/[^a-zA-Z0-9_-]/g, '_');\nconst safeChat = String(chatId || 'chat').replace(/[^a-zA-Z0-9_-]/g, '_');\nconst folderName = isAlbum ? `album_${safeChat}_${safeGroup}` : `${stamp}_msg${messageId}`;\nconst photoFileName = `photo_${messageId}.jpg`;\nconst binIn = $input.item.binary || {};\nconst firstKey = Object.keys(binIn)[0];\nlet binaryOut = {};\nif (hasPhoto && firstKey) { binaryOut = { data: binIn[firstKey] }; }\nreturn {\n  json: {\n    folder_name: folderName,\n    brief_id: folderName,\n    created_at: d.toISOString(),\n    text,\n    has_photo: hasPhoto,\n    photo_filename: photoFileName,\n    is_album: isAlbum,\n    album_key: isAlbum ? `${safeChat}:${safeGroup}` : null,\n    album_quiet_window_sec: 8,\n    telegram: {\n      chat_id: chatId,\n      message_id: messageId,\n      media_group_id: mediaGroupId,\n      user_id: msg.from ? msg.from.id : null,\n      username: msg.from ? (msg.from.username || null) : null,\n      first_name: msg.from ? (msg.from.first_name || null) : null\n    }\n  },\n  binary: binaryOut\n};"
+      },
+      "id": "22222222-2222-2222-2222-222222222222",
+      "name": "Normalisation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        "-560",
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'1e6OipL7R8HlG5LV1Lp8Z_AMlFQMTxaRC' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder' and name = '\" + String($json.folder_name || '').replace(/'/g, \"\\\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,webViewLink,createdTime,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "10"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "corpora",
+              "value": "allDrives"
+            },
+            {
+              "name": "spaces",
+              "value": "drive"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "33333333-3333-3333-3333-333333333333",
+      "name": "Search Brief Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        "-360",
+        304
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-folder",
+              "leftValue": "={{ Array.isArray($json.files) && $json.files.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "44444444-4444-4444-4444-444444444444",
+      "name": "Dossier existe ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        "-160",
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const n = $('Normalisation').item.json;\nconst files = Array.isArray($json.files) ? $json.files : [];\nconst folder = files[0] || {};\nif (!folder.id) throw new Error(`Drive folder search returned no folder for ${n.folder_name}`);\nreturn {\n  json: {\n    ...n,\n    folder_id: folder.id,\n    folder_url: folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`,\n    folder_was_created: false\n  }\n};"
+      },
+      "id": "55555555-5555-5555-5555-555555555555",
+      "name": "Adopt Existing Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        64,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{ $('Normalisation').item.json.folder_name }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "1e6OipL7R8HlG5LV1Lp8Z_AMlFQMTxaRC",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "66666666-6666-6666-6666-666666666666",
+      "name": "Creer dossier brief",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        64,
+        432
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const n = $('Normalisation').item.json;\nconst folder = $json || {};\nif (!folder.id) throw new Error(`Drive folder creation returned no id for ${n.folder_name}`);\nreturn {\n  json: {\n    ...n,\n    folder_id: folder.id,\n    folder_url: folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`,\n    folder_was_created: true\n  }\n};"
+      },
+      "id": "77777777-7777-7777-7777-777777777777",
+      "name": "Adopt Created Folder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-photo",
+              "leftValue": "={{ $json.has_photo }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "88888888-8888-8888-8888-888888888888",
+      "name": "A une photo ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        512,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const norm = $('Normalisation').item;\nreturn {\n  json: {\n    ...$json,\n    folder_id: $json.folder_id,\n    photo_filename: norm.json.photo_filename\n  },\n  binary: norm.binary\n};"
+      },
+      "id": "99999999-9999-9999-9999-999999999999",
+      "name": "Prep upload photo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "name": "={{ $json.photo_filename }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.folder_id }}"
+        },
+        "options": {}
+      },
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "name": "Upload photo",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        960,
+        176
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const n = $('Prep upload photo').item.json;\nconst uploaded = $json || {};\nconst photo = {\n  filename: n.photo_filename,\n  drive_file_id: uploaded.id || null,\n  mime: uploaded.mimeType || 'image/jpeg',\n  telegram_message_id: n.telegram ? n.telegram.message_id : null\n};\nconst out = {\n  ...n,\n  photos: [photo],\n  folder_url: n.folder_url || `https://drive.google.com/drive/folders/${n.folder_id}`\n};\nif (n.is_album) {\n  const data = $getWorkflowStaticData('global');\n  data.telegram_album_buffer = data.telegram_album_buffer || {};\n  const key = n.album_key;\n  const existing = data.telegram_album_buffer[key] || {};\n  const photos = existing.photos || {};\n  photos[String(photo.telegram_message_id || n.photo_filename)] = photo;\n  const token = `${n.telegram.message_id}-${Date.now()}`;\n  data.telegram_album_buffer[key] = {\n    brief_id: existing.brief_id || n.brief_id,\n    created_at: existing.created_at || n.created_at,\n    folder_id: existing.folder_id || n.folder_id,\n    folder_name: existing.folder_name || n.folder_name,\n    folder_url: existing.folder_url || out.folder_url,\n    text: existing.text || n.text || '',\n    telegram: existing.telegram || n.telegram,\n    photos,\n    latest_token: token,\n    last_seen_at: new Date().toISOString()\n  };\n  out.album_token = token;\n}\nreturn { json: out };"
+      },
+      "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      "name": "Register Uploaded Photo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1168,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-album",
+              "leftValue": "={{ $json.is_album }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      "name": "Album Telegram ?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1376,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "timeInterval",
+        "amount": 8,
+        "unit": "seconds"
+      },
+      "id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+      "name": "Wait Album Settlement",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1600,
+        80
+      ],
+      "webhookId": "siga-telegram-album-settlement"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const current = $input.first().json || {};\nif (!current.is_album || !current.album_key || !current.album_token) return [];\nconst data = $getWorkflowStaticData('global');\nconst buffer = data.telegram_album_buffer || {};\nconst album = buffer[current.album_key];\nif (!album || album.latest_token !== current.album_token) return [];\nconst photos = Object.values(album.photos || {}).sort((a, b) => (a.telegram_message_id || 0) - (b.telegram_message_id || 0));\ndelete buffer[current.album_key];\ndata.telegram_album_buffer = buffer;\nreturn [{\n  json: {\n    brief_id: album.brief_id,\n    created_at: album.created_at,\n    text: album.text || '',\n    photos,\n    folder_id: album.folder_id,\n    folder_name: album.folder_name,\n    folder_url: album.folder_url || `https://drive.google.com/drive/folders/${album.folder_id}`,\n    telegram: album.telegram,\n    album_finalized: true\n  }\n}];"
+      },
+      "id": "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee",
+      "name": "Finalize Album Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1824,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const j = $json || {};\nreturn {\n  json: {\n    brief_id: j.brief_id,\n    created_at: j.created_at,\n    text: j.text || '',\n    photos: Array.isArray(j.photos) ? j.photos : [],\n    folder_id: j.folder_id,\n    folder_name: j.folder_name,\n    folder_url: j.folder_url || (j.folder_id ? `https://drive.google.com/drive/folders/${j.folder_id}` : null),\n    telegram: j.telegram\n  }\n};"
+      },
+      "id": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      "name": "Build Single Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const c = $json || {};\nconst folderUrl = c.folder_url || (c.folder_id ? `https://drive.google.com/drive/folders/${c.folder_id}` : null);\nconst brief = {\n  brief_id: c.brief_id,\n  created_at: c.created_at,\n  source: 'telegram',\n  status: 'pending',\n  text: c.text || '',\n  photos: Array.isArray(c.photos) ? c.photos : [],\n  drive: { folder_id: c.folder_id, folder_name: c.folder_name, folder_url: folderUrl },\n  telegram: c.telegram || {},\n  siga: { action: null, items: [], processed_at: null, notes: null }\n};\nconst content = JSON.stringify(brief, null, 2);\nconst b64 = Buffer.from(content, 'utf8').toString('base64');\nreturn { json: brief, binary: { data: { data: b64, mimeType: 'application/json', fileName: 'brief.json' } } };"
+      },
+      "id": "12121212-1212-1212-1212-121212121212",
+      "name": "Construire brief.json",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2048,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "name": "brief.json",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.drive.folder_id }}"
+        },
+        "options": {}
+      },
+      "id": "13131313-1313-1313-1313-131313131313",
+      "name": "Upload brief.json",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2264,
+        304
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Construire brief.json').item.json.telegram.chat_id }}",
+        "text": "=Brief SIGA enregistre.\n\nDossier: {{ $('Construire brief.json').item.json.drive.folder_name }}\nPhotos: {{ $('Construire brief.json').item.json.photos.length }}\nTexte: {{ $('Construire brief.json').item.json.text || '(aucun)' }}\n\nLien: {{ $('Construire brief.json').item.json.drive.folder_url }}\n\nA traiter dans Cowork (statut: pending).",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "14141414-1414-1414-1414-141414141414",
+      "name": "Confirmation Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        2480,
+        304
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "pVqYKOVuJrq3njUz",
+          "name": "Telegram Jarvis Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Reception Telegram": {
+      "main": [
+        [
+          {
+            "node": "Normalisation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalisation": {
+      "main": [
+        [
+          {
+            "node": "Search Brief Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Brief Folder": {
+      "main": [
+        [
+          {
+            "node": "Dossier existe ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dossier existe ?": {
+      "main": [
+        [
+          {
+            "node": "Adopt Existing Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Creer dossier brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Existing Folder": {
+      "main": [
+        [
+          {
+            "node": "A une photo ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Creer dossier brief": {
+      "main": [
+        [
+          {
+            "node": "Adopt Created Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Created Folder": {
+      "main": [
+        [
+          {
+            "node": "A une photo ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "A une photo ?": {
+      "main": [
+        [
+          {
+            "node": "Prep upload photo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Single Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep upload photo": {
+      "main": [
+        [
+          {
+            "node": "Upload photo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload photo": {
+      "main": [
+        [
+          {
+            "node": "Register Uploaded Photo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Register Uploaded Photo": {
+      "main": [
+        [
+          {
+            "node": "Album Telegram ?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Album Telegram ?": {
+      "main": [
+        [
+          {
+            "node": "Wait Album Settlement",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Single Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait Album Settlement": {
+      "main": [
+        [
+          {
+            "node": "Finalize Album Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Album Context": {
+      "main": [
+        [
+          {
+            "node": "Construire brief.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Single Context": {
+      "main": [
+        [
+          {
+            "node": "Construire brief.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Construire brief.json": {
+      "main": [
+        [
+          {
+            "node": "Upload brief.json",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload brief.json": {
+      "main": [
+        [
+          {
+            "node": "Confirmation Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateDescription": "SIGA - Telegram (texte+photo) -> dossier horodate sous SIGA_ATELIER avec brief.json (pending) + photos. Code 'Prep upload photo' re-attache le binaire perdu apres la creation du dossier Drive."
+  },
+  "pinData": {},
+  "versionId": "ec46da8e-e69c-4fcd-8568-ef277b293fac",
+  "activeVersionId": "ec46da8e-e69c-4fcd-8568-ef277b293fac",
+  "versionCounter": 17,
+  "triggerCount": 1,
+  "tags": [],
+  "shared": [
+    {
+      "updatedAt": "2026-05-30T20:51:37.76Z",
+      "createdAt": "2026-05-30T20:51:37.76Z",
+      "role": "workflow:owner",
+      "workflowId": "8ktbbkVySbjkeaA9",
+      "projectId": "ksaxzZwZY6PsA6jp",
+      "project": {
+        "updatedAt": "2025-08-19T20:06:03.793Z",
+        "createdAt": "2025-08-19T20:05:08.903Z",
+        "id": "ksaxzZwZY6PsA6jp",
+        "name": "Nicolas L'HOTE <nicolas.lhote.88@gmail.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "creatorId": "81c13a48-6847-445c-927f-81c1c25a72f4"
+      }
+    }
+  ]
+}

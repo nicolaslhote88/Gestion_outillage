@@ -1,53 +1,92 @@
 # Etat actuel SIGA
 
-## Verdict synthetique
+Date de référence: 2026-05-31
 
-Le projet SIGA est bien cadre et deja partiellement implemente. Le risque principal n'est plus conceptuel: il est dans la stabilisation operationnelle du pipeline live.
+## Verdict
 
-La consigne de travail retenue pour ce depot est simple:
+Le projet SIGA a été recentré. Le flux cible n'est plus une ingestion automatique complète au moment de l'envoi terrain. Le bon modèle est maintenant:
 
-1. ne pas repartir en design abstrait,
-2. prouver le run reel WhatsApp -> fin de traitement,
-3. corriger les ruptures observees,
-4. ensuite seulement reduire la dette n8n.
+1. Telegram sert à capturer vite un brief terrain et des photos.
+2. n8n dépose ces éléments dans Google Drive, sans décider à la place de Nicolas.
+3. Un agent SIGA traite plus tard le dossier Drive, avec le contexte métier et les règles de `docs/SIGA-API-OpenClaw-Notice.md`.
+4. L'agent agit sur la base SIGA et sur Drive en respectant la cohérence DuckDB + fichiers.
 
-## Snapshot du workflow versionne
+## Etat réel n8n
 
-- Nom du workflow: `SIGA - Ingestion Atelier V1`
-- Statut exporte: `active = true`
-- Webhook d'entree: `POST siga-ingestion-v1`
-- Nombre de noeuds: `71`
-- Principales briques: `Webhook`, `Code`, `If`, `HTTP Request`, `Google Drive`, `OpenAI`
-- Stockage local reference dans les scripts: `/files/duckdb/siga_v1.duckdb`
+| Workflow | Etat | Rôle |
+|---|---:|---|
+| `SIGA - Telegram Collector Buffer v2` | actif | Reçoit les messages Telegram et bufferise les parts d'album |
+| `SIGA - Telegram Batch Processor v8 (Loop Clean)` | actif | Regroupe les parts, crée le dossier final Drive, écrit `brief.json`, confirme Telegram |
+| `SIGA - Claude Media Upload` | actif | Endpoint support pour uploader un média dans Drive depuis un agent |
+| `SIGA - Global Error Handler` | actif | Gestion d'erreur n8n |
+| `SIGA - Delete Equipment Drive Folder` | actif | Utilitaire de suppression de dossier Drive depuis le portail/API |
+| `SIGA - Ingestion Atelier V1` | désactivé | Ancien workflow automatique complet, conservé en archive |
 
-Le flux couvre deja les etapes suivantes:
+Exports associés:
 
-1. reception et normalisation du message entrant,
-2. journalisation initiale dans DuckDB,
-3. resolution ou creation du dossier temporaire Google Drive,
-4. decoupage des images et OCR inline via OpenAI,
-5. construction d'un draft equipement v2,
-6. resolution ou creation de l'arborescence finale Drive,
-7. deplacement et renommage des medias finaux,
-8. ecriture des tables `equipment`, `equipment_media` et mise a jour du log,
-9. preparation du message de completion WhatsApp.
+- flux actif: `workflows/live/`
+- utilitaires: `workflows/support/`
+- ancien monolithe: `workflows/archive/legacy-auto-ingestion/`
 
-## Decision front-end a jour
+## Etat du portail SIGA
 
-La cible front mobile ne repose plus sur Glide.
+Le portail `https://siga.nlhconsulting.fr` est restauré derrière Traefik.
 
-Hypothese de travail retenue:
+Le service Docker `siga-dashboard` lance:
 
-- n8n pousse les donnees dans Google Sheet,
-- AppSheet lit ce Google Sheet et genere l'application mobile,
-- la phase actuelle du depot reste concentree sur le pipeline live d'ingestion, pas sur une refonte UX.
+- Streamlit sur `8501`
+- l'API SIGA interne sur `8001`
+- le serveur MCP SIGA
 
-L'export n8n versionne ici ne contient pas encore une preuve suffisante du maillon Google Sheet -> AppSheet. Ce point reste a confirmer dans les prochaines validations.
+La base utilisée est `/local-files/duckdb/siga_v1.duckdb`.
 
-## Risques operationnels a verifier en priorite
+## Dossier Drive d'entrée
 
-- conformite du payload WhatsApp reel recu par le webhook,
-- droits Google Drive pour creer, retrouver, deplacer et renommer les fichiers,
-- comportement du noeud OCR OpenAI en cas de fichier non lisible ou volumineux,
-- robustesse du verrouillage DuckDB lors des ecritures successives,
-- qualite du message de completion retourne en fin de run.
+Le dépôt terrain se fait dans `SIGA_ATELIER`.
+
+Pour un message simple:
+
+```text
+SIGA_ATELIER/<YYYYMMDD-HHmmss>_msg<message_id>/
+  brief.json
+  photo_<...>.jpg
+```
+
+Pour un album Telegram:
+
+```text
+SIGA_ATELIER/album_<chat_id>_<media_group_id>/
+  brief.json
+  photo_1.jpg
+  photo_2.jpg
+  ...
+```
+
+Le `brief.json` doit rester en `status: "pending"` tant que l'agent SIGA ne l'a pas traité.
+
+## Ce qui est archivé
+
+Les exports locaux dispersés, anciennes versions de collector et batch processor, notes intermédiaires et anciens essais ont été rangés dans:
+
+```text
+archive/2026-05-31-local-sprawl/
+```
+
+Ils restent consultables, mais ne sont plus la source de vérité.
+
+## Risques à surveiller
+
+- Le batch processor doit rester actif, sinon les messages Telegram restent uniquement en buffer.
+- Telegram envoie chaque photo d'un album comme un message séparé: le regroupement dépend de `media_group_id`.
+- L'agent SIGA ne doit jamais créer ou modifier une fiche sans maintenir la cohérence Drive + DuckDB.
+- Les anciens workflows automatiques ne doivent pas être réactivés sans décision explicite.
+
+## Prochaine validation
+
+Faire un test réel Telegram:
+
+1. envoyer un brief avec plusieurs photos;
+2. vérifier qu'un seul dossier final est créé dans Drive;
+3. vérifier que toutes les photos sont présentes;
+4. vérifier que `brief.json` contient le texte, les photos, les métadonnées Telegram et `status: "pending"`;
+5. traiter manuellement ce dossier avec l'agent SIGA.

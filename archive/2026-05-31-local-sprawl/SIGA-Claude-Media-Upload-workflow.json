@@ -1,0 +1,134 @@
+{
+  "name": "SIGA - Claude Media Upload",
+  "nodes": [
+    {
+      "id": "wh-siga-001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [100, 300],
+      "webhookId": "siga-claude-media-upload",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "siga-media-upload",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "js-validate-001",
+      "name": "Validate & Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 300],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// ── Auth ─────────────────────────────────────────────────────\nconst body = $input.first().json.body || $input.first().json;\nconst expected = process.env.SIGA_CLAUDE_WEBHOOK_TOKEN || '';\nif (expected && body.siga_token !== expected) {\n  throw new Error('Unauthorized: invalid SIGA token');\n}\n\n// ── Validate required fields ──────────────────────────────────\nconst { entity_type, entity_id, data_base64 } = body;\nif (!entity_type || !entity_id || !data_base64) {\n  throw new Error('Missing required: entity_type, entity_id, data_base64');\n}\nif (!['equipment', 'accessory', 'consumable'].includes(entity_type)) {\n  throw new Error(`Invalid entity_type: ${entity_type}`);\n}\n\n// ── Prepare context ───────────────────────────────────────────\nconst ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);\nconst role = body.role || 'overview';\nconst origFilename = body.filename || 'photo.jpg';\nconst ext = origFilename.split('.').pop().toLowerCase();\nconst drive_filename = `${entity_type}_${entity_id}_${role}_${ts}.${ext}`;\nconst ingestion_id = body.ingestion_id || `CLAUDE-${new Date().toISOString().replace(/[-T:.Z]/g,'').slice(0,14)}`;\nconst folder_id = process.env.SIGA_CLAUDE_FOLDER_ID || '';\nif (!folder_id) {\n  throw new Error('SIGA_CLAUDE_FOLDER_ID not set in n8n environment variables');\n}\n\nreturn [{\n  json: {\n    entity_type,\n    entity_id,\n    role,\n    filename: origFilename,\n    mime_type: body.mime_type || 'image/jpeg',\n    data_base64: body.data_base64,\n    ingestion_id,\n    drive_filename,\n    folder_id\n  }\n}];"
+      }
+    },
+    {
+      "id": "js-decode-001",
+      "name": "Decode Base64",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const item = $input.first();\nconst buffer = Buffer.from(item.json.data_base64, 'base64');\nconst binary = await this.helpers.prepareBinaryData(\n  buffer,\n  item.json.drive_filename,\n  item.json.mime_type\n);\nreturn [{\n  json: {\n    entity_type: item.json.entity_type,\n    entity_id: item.json.entity_id,\n    role: item.json.role,\n    filename: item.json.filename,\n    mime_type: item.json.mime_type,\n    ingestion_id: item.json.ingestion_id,\n    drive_filename: item.json.drive_filename,\n    folder_id: item.json.folder_id\n  },\n  binary: { data: binary }\n}];"
+      }
+    },
+    {
+      "id": "gd-upload-001",
+      "name": "Upload to Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [700, 300],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      },
+      "parameters": {
+        "name": "={{ $json.drive_filename }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.folder_id }}"
+        },
+        "options": {
+          "keepRevisionForever": false
+        }
+      }
+    },
+    {
+      "id": "js-merge-001",
+      "name": "Merge Upload Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "// Recombine Drive upload result with original context\nconst driveResult = $input.first().json;\nconst ctx = $('Decode Base64').item.json;\n\nconst file_id = driveResult.id || '';\nconst web_view_link = driveResult.webViewLink ||\n  (file_id ? `https://drive.google.com/file/d/${file_id}/view?usp=drivesdk` : '');\n\nreturn [{\n  json: {\n    entity_type: ctx.entity_type,\n    entity_id: ctx.entity_id,\n    role: ctx.role,\n    filename: ctx.drive_filename,\n    mime_type: ctx.mime_type,\n    ingestion_id: ctx.ingestion_id,\n    folder_id: ctx.folder_id,\n    file_id,\n    web_view_link\n  }\n}];"
+      }
+    },
+    {
+      "id": "py-duckdb-001",
+      "name": "Register in DuckDB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300],
+      "parameters": {
+        "language": "pythonNative",
+        "pythonCode": "import duckdb, uuid, time\nfrom contextlib import contextmanager\nfrom datetime import datetime\n\nDB_PATH = '/files/duckdb/siga_v1.duckdb'\n\n@contextmanager\ndef db_con():\n    con = None\n    for attempt in range(5):\n        try:\n            con = duckdb.connect(DB_PATH)\n            break\n        except Exception as e:\n            if 'lock' in str(e).lower() and attempt < 4:\n                time.sleep(0.3 * (2 ** attempt))\n            else:\n                raise\n    try:\n        yield con\n    finally:\n        if con:\n            con.close()\n\nitem = _input.first().json\nentity_type = item.get('entity_type', 'equipment')\nentity_id = item.get('entity_id', '')\nrole = item.get('role', 'overview')\nfilename = item.get('filename', 'photo.jpg')\nmime_type = item.get('mime_type', 'image/jpeg')\ningestion_id = item.get('ingestion_id', '')\nfile_id = item.get('file_id', '')\nfolder_id = item.get('folder_id', '')\nweb_view_link = item.get('web_view_link', '')\n\nmedia_id = str(uuid.uuid4())\nnow = datetime.now()\n\nwith db_con() as con:\n    if entity_type == 'equipment':\n        table = 'equipment_media'\n        fk = 'equipment_id'\n    elif entity_type == 'accessory':\n        table = 'accessory_media'\n        fk = 'accessory_id'\n    else:\n        table = 'consumable_media'\n        fk = 'consumable_id'\n\n    row = con.execute(\n        f'SELECT COALESCE(MAX(image_index), 0) FROM {table} WHERE {fk} = ?',\n        [entity_id]\n    ).fetchone()\n    image_index = (row[0] if row else 0) + 1\n    is_primary = (image_index == 1)\n\n    if entity_type == 'equipment':\n        con.execute(\"\"\"\n            INSERT INTO equipment_media (\n                media_id, equipment_id, ingestion_id, image_index, image_role,\n                original_filename, drive_file_name, mime_type,\n                final_drive_file_id, final_drive_web_view_link,\n                final_drive_folder_id, filename, is_primary, web_view_link,\n                attached_by, attached_at, processing_status, created_at, updated_at\n            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)\n        \"\"\", [\n            media_id, entity_id, ingestion_id, image_index, role,\n            filename, filename, mime_type,\n            file_id, web_view_link,\n            folder_id, filename, is_primary, web_view_link,\n            'claude-cowork', now, 'finalized', now, now\n        ])\n    else:\n        con.execute(f\"\"\"\n            INSERT INTO {table} (\n                media_id, {fk}, final_drive_file_id, image_role, image_index,\n                created_at, is_primary, attached_by, attached_at,\n                final_drive_folder_id, filename, mime_type, web_view_link\n            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)\n        \"\"\", [\n            media_id, entity_id, file_id, role, image_index,\n            now, is_primary, 'claude-cowork', now,\n            folder_id, filename, mime_type, web_view_link\n        ])\n\nreturn [{'json': {\n    'ok': True,\n    'media_id': media_id,\n    'entity_type': entity_type,\n    'entity_id': entity_id,\n    'role': role,\n    'file_id': file_id,\n    'web_view_link': web_view_link,\n    'image_index': image_index,\n    'is_primary': is_primary\n}}]"
+      }
+    },
+    {
+      "id": "resp-ok-001",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1300, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{"node": "Validate & Prepare", "type": "main", "index": 0}]]
+    },
+    "Validate & Prepare": {
+      "main": [[{"node": "Decode Base64", "type": "main", "index": 0}]]
+    },
+    "Decode Base64": {
+      "main": [[{"node": "Upload to Drive", "type": "main", "index": 0}]]
+    },
+    "Upload to Drive": {
+      "main": [[{"node": "Merge Upload Context", "type": "main", "index": 0}]]
+    },
+    "Merge Upload Context": {
+      "main": [[{"node": "Register in DuckDB", "type": "main", "index": 0}]]
+    },
+    "Register in DuckDB": {
+      "main": [[{"node": "Respond OK", "type": "main", "index": 0}]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "siga-claude-media-v1",
+  "meta": {
+    "description": "Reçoit une photo en base64 depuis Claude Cowork, l'uploade sur Google Drive dans SIGA_CLAUDE_INGEST, et enregistre le média dans DuckDB. Nécessite SIGA_CLAUDE_FOLDER_ID et SIGA_CLAUDE_WEBHOOK_TOKEN dans les variables d'environnement n8n."
+  }
+}

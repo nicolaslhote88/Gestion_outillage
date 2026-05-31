@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SIGA Brief terrain",
+  "description": "Contrat de donnees entre n8n et l'agent SIGA. Un brief correspond a une saisie terrain Telegram.",
+  "type": "object",
+  "required": ["brief_id", "created_at", "source", "status", "text", "photos"],
+  "properties": {
+    "brief_id": {
+      "type": "string",
+      "description": "Identifiant unique du brief."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Horodatage ISO 8601 de reception."
+    },
+    "source": {
+      "type": "string",
+      "enum": ["telegram"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "processing", "processed", "error"],
+      "description": "pending = a traiter par l'agent SIGA."
+    },
+    "text": {
+      "type": "string",
+      "description": "Texte brut saisi dans Telegram."
+    },
+    "photos": {
+      "type": "array",
+      "description": "Photos jointes, deposees dans le meme dossier Drive que ce brief.json.",
+      "items": {
+        "type": "object",
+        "required": ["filename"],
+        "properties": {
+          "filename": { "type": "string" },
+          "drive_file_id": { "type": "string" },
+          "mime": { "type": "string" }
+        }
+      }
+    },
+    "drive": {
+      "type": "object",
+      "properties": {
+        "folder_id": { "type": "string" },
+        "folder_name": { "type": "string" },
+        "folder_url": { "type": "string", "format": "uri" }
+      }
+    },
+    "telegram": {
+      "type": "object",
+      "properties": {
+        "chat_id": { "type": ["integer", "string"] },
+        "message_id": { "type": ["integer", "string"] },
+        "media_group_id": { "type": ["string", "null"] },
+        "user_id": { "type": ["integer", "string"] },
+        "username": { "type": ["string", "null"] },
+        "first_name": { "type": ["string", "null"] }
+      }
+    },
+    "siga": {
+      "type": "object",
+      "description": "Zone reservee a l'agent SIGA apres traitement.",
+      "properties": {
+        "action": { "type": ["string", "null"] },
+        "items": { "type": "array", "items": { "type": "object" } },
+        "processed_at": { "type": ["string", "null"], "format": "date-time" },
+        "notes": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

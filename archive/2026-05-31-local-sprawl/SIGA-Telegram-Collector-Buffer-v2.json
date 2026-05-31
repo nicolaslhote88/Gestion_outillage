@@ -1,0 +1,900 @@
+{
+  "name": "SIGA - Telegram Collector Buffer v2",
+  "nodes": [
+    {
+      "id": "5d94b4f9-48dc-46ed-8bff-9b60519cab47",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "position": [
+        240,
+        -80
+      ],
+      "typeVersion": 1.2,
+      "parameters": {
+        "updates": [
+          "message",
+          "channel_post",
+          "edited_message",
+          "poll"
+        ],
+        "additionalFields": {
+          "download": true,
+          "imageSize": "extraLarge"
+        }
+      },
+      "credentials": {
+        "telegramApi": {
+          "id": "pVqYKOVuJrq3njUz",
+          "name": "Telegram Jarvis Bot"
+        }
+      }
+    },
+    {
+      "id": "6231e9e6-10e1-4695-955a-a20ab74e5047",
+      "name": "Normalize Telegram Intake",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        480,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nfunction pickMessage(root) {\n  return root.message || root.edited_message || root.channel_post || null;\n}\nfunction sanitize(value) {\n  return String(value || '')\n    .normalize('NFKD')\n    .replace(/[^\\w.\\-]+/g, '_')\n    .replace(/_+/g, '_')\n    .replace(/^_+|_+$/g, '')\n    .slice(0, 120) || 'file';\n}\nconst nowIso = new Date().toISOString();\nconst msg = pickMessage($json);\nif (!msg) {\n  return [{ json: {\n    ok: false,\n    stage: 'ignored',\n    reason: 'unsupported_update_type',\n    source: 'telegram',\n    raw_update: $json\n  }}];\n}\nconst chatId = msg.chat?.id ?? null;\nconst chatType = msg.chat?.type ?? null;\nconst messageId = msg.message_id ?? null;\nconst mediaGroupId = msg.media_group_id ?? null;\nconst caption = typeof msg.caption === 'string' ? msg.caption.trim() : '';\nconst text = typeof msg.text === 'string' ? msg.text.trim() : '';\nconst messageText = caption || text || '';\nconst binaryKeys = Object.keys($binary || {});\nconst binaryKey = binaryKeys[0] || null;\nconst binaryMeta = binaryKey ? ($binary[binaryKey] || {}) : {};\nlet partKind = 'text';\nlet originalFileName = '';\nlet mimeType = '';\nlet telegramFileId = null;\nlet telegramFileUniqueId = null;\nif (msg.document) {\n  partKind = 'document';\n  originalFileName = msg.document.file_name || binaryMeta.fileName || 'document.bin';\n  mimeType = msg.document.mime_type || binaryMeta.mimeType || 'application/octet-stream';\n  telegramFileId = msg.document.file_id || null;\n  telegramFileUniqueId = msg.document.file_unique_id || null;\n} else if (Array.isArray(msg.photo) && msg.photo.length > 0) {\n  partKind = 'photo';\n  const best = msg.photo[msg.photo.length - 1] || {};\n  originalFileName = binaryMeta.fileName || `photo_${messageId || 'unknown'}.jpg`;\n  mimeType = binaryMeta.mimeType || 'image/jpeg';\n  telegramFileId = best.file_id || null;\n  telegramFileUniqueId = best.file_unique_id || null;\n} else if (msg.video) {\n  partKind = 'video';\n  originalFileName = binaryMeta.fileName || `video_${messageId || 'unknown'}.mp4`;\n  mimeType = msg.video.mime_type || binaryMeta.mimeType || 'video/mp4';\n  telegramFileId = msg.video.file_id || null;\n  telegramFileUniqueId = msg.video.file_unique_id || null;\n} else if (msg.audio) {\n  partKind = 'audio';\n  originalFileName = binaryMeta.fileName || `audio_${messageId || 'unknown'}.bin`;\n  mimeType = msg.audio.mime_type || binaryMeta.mimeType || 'application/octet-stream';\n  telegramFileId = msg.audio.file_id || null;\n  telegramFileUniqueId = msg.audio.file_unique_id || null;\n}\nconst groupKey = mediaGroupId\n  ? `tg_${chatId}_${mediaGroupId}`\n  : `tg_${chatId}_msg_${messageId}`;\nconst safeGroupKey = sanitize(groupKey);\nconst safeOriginalName = sanitize(originalFileName || `${partKind}_${messageId || 'unknown'}`);\nconst partJsonName = `${safeGroupKey}__part_${messageId || 'unknown'}.json`;\nconst bufferFileName = binaryKey ? `${safeGroupKey}__part_${messageId || 'unknown'}__${safeOriginalName}` : null;\nconst quietWindowSec = 5;\nreturn [{\n  json: {\n    ok: true,\n    stage: 'accepted',\n    source: 'telegram',\n    trigger_source: 'telegram_trigger',\n    chat_id: chatId,\n    chat_type: chatType,\n    media_group_id: mediaGroupId || null,\n    group_key: groupKey,\n    safe_group_key: safeGroupKey,\n    buffer_prefix: `${safeGroupKey}__`,\n    message_id: messageId,\n    message_date_unix: msg.date || null,\n    message_received_at: nowIso,\n    sender: {\n      id: msg.from?.id || null,\n      username: msg.from?.username || null,\n      first_name: msg.from?.first_name || null,\n      last_name: msg.from?.last_name || null\n    },\n    caption_text: caption || null,\n    text: text || null,\n    message_text: messageText || null,\n    part_kind: partKind,\n    binary_key: binaryKey,\n    has_binary: !!binaryKey,\n    original_filename: originalFileName || null,\n    mime_type: mimeType || null,\n    telegram_file_id: telegramFileId,\n    telegram_file_unique_id: telegramFileUniqueId,\n    part_json_name: partJsonName,\n    buffer_file_name: bufferFileName,\n    quiet_window_sec: quietWindowSec,\n    quiet_until: new Date(Date.now() + quietWindowSec * 1000).toISOString(),\n    raw_update: $json\n  },\n  binary: $binary\n}];\n"
+      }
+    },
+    {
+      "id": "df7bb1d5-0fce-4540-9460-126a855f1c0a",
+      "name": "Telegram Intake Gate",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        720,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.ok}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7cae1fe3-ac9d-421b-a477-81ab3906ab3d",
+      "name": "Search Temp Root Folder",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        960,
+        -80
+      ],
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "name = 'SIGA_TEMP' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,createdTime,webViewLink)"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "763ff751-f56f-4198-9fb7-a9d48bcb303c",
+      "name": "Resolve Temp Root Folder",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1200,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nconst input = $json || {};\nconst files = Array.isArray(input.files) ? [...input.files] : [];\nfiles.sort((a,b) => {\n  const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  if (ta !== tb) return ta - tb;\n  return String(a.id || '').localeCompare(String(b.id || ''));\n});\nconst selected = files[0] || null;\nconst root = $('Normalize Telegram Intake').first().json || {};\nreturn [{\n  json: {\n    ...root,\n    temp_root_search: {\n      searched_name: 'SIGA_TEMP',\n      candidate_count: files.length,\n      candidates: files.map(f => ({\n        id: f.id || null,\n        name: f.name || null,\n        parents: f.parents || [],\n        createdTime: f.createdTime || null,\n        webViewLink: f.webViewLink || null\n      })),\n      reused_existing_folder: !!selected,\n      resolution: selected ? 'reused_existing_oldest_created' : 'create_new',\n      selected_folder_id: selected?.id || null\n    },\n    temp_root_folder_id: selected?.id || null,\n    temp_root_folder_name: selected?.name || 'SIGA_TEMP',\n    temp_root_folder_web_view_link: selected?.webViewLink || null\n  },\n  binary: $('Normalize Telegram Intake').first().binary || {}\n}];\n"
+      }
+    },
+    {
+      "id": "817de108-8cdb-4ab8-a1ef-46f9b4d70795",
+      "name": "If Temp Root Folder Exists",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        1440,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.temp_root_folder_id}}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "ffcc65a2-ca69-45cf-b01c-b09b512ad110",
+      "name": "Create Temp Root Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        1680,
+        0
+      ],
+      "typeVersion": 3,
+      "parameters": {
+        "resource": "folder",
+        "name": "SIGA_TEMP",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "root",
+          "cachedResultName": "/ (Root folder)"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "905478e0-23aa-4ca5-8ddf-3fe98e8eecf4",
+      "name": "Adopt Temp Root Folder",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        1920,
+        0
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nconst root = $('Normalize Telegram Intake').first().json || {};\nconst created = $json || {};\nreturn [{\n  json: {\n    ...root,\n    temp_root_folder_id: created.id || null,\n    temp_root_folder_name: created.name || 'SIGA_TEMP',\n    temp_root_folder_web_view_link: created.webViewLink || null,\n    temp_root_search: {\n      searched_name: 'SIGA_TEMP',\n      candidate_count: created.id ? 1 : 0,\n      candidates: created.id ? [{\n        id: created.id || null,\n        name: created.name || 'SIGA_TEMP',\n        parents: created.parents || [],\n        createdTime: created.createdTime || null,\n        webViewLink: created.webViewLink || null\n      }] : [],\n      reused_existing_folder: false,\n      resolution: created.id ? 'created_new' : 'create_failed',\n      selected_folder_id: created.id || null\n    }\n  },\n  binary: $('Normalize Telegram Intake').first().binary || {}\n}];\n"
+      }
+    },
+    {
+      "id": "8f1e0761-601a-45ba-a987-20f0d7e60283",
+      "name": "Build Buffer Context",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2160,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const j = $json || {};\nconst folderId = j.buffer_folder_id || null;\nconst folderName = j.buffer_folder_name || 'SIGA_TELEGRAM_BUFFER';\nreturn [{\n  json: {\n    ...j,\n    temp_drive_folder_id: folderId,\n    temp_drive_folder_name: folderName,\n    temp_drive_folder_path: `SIGA_TEMP/${folderName}`,\n    telegram_buffer_folder_id: folderId,\n    telegram_buffer_folder_name: folderName,\n    telegram_buffer_folder_path: `SIGA_TEMP/${folderName}`,\n    part_manifest_search_name: j.part_json_name,\n    media_search_name: j.buffer_file_name,\n    buffer_strategy: 'flat_files_in_static_subfolder',\n    next_step_hint: 'Later processor should aggregate all files in SIGA_TEMP/SIGA_TELEGRAM_BUFFER sharing buffer_prefix after quiet window.'\n  },\n  binary: $('Normalize Telegram Intake').first().binary || {}\n}];"
+      }
+    },
+    {
+      "id": "16ed45b2-ce93-4662-a924-e4cf42e76ee7",
+      "name": "Search Existing Part JSON",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        2400,
+        -200
+      ],
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{\"name = '\" + $json.part_json_name.replace(/'/g, \"\\\\'\") + \"' and trashed = false and '\" + $json.temp_drive_folder_id + \"' in parents\"}}"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,createdTime,webViewLink)"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "58ee00f7-dac9-4aab-a3d3-5b7528db58a3",
+      "name": "Resolve Existing Part JSON",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        2640,
+        -200
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nconst root = $('Build Buffer Context').first().json || {};\nconst files = Array.isArray($json.files) ? [...$json.files] : [];\nfiles.sort((a,b) => {\n  const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  if (ta !== tb) return ta - tb;\n  return String(a.id || '').localeCompare(String(b.id || ''));\n});\nconst selected = files[0] || null;\nreturn [{\n  json: {\n    ...root,\n    existing_part_manifest: selected ? {\n      id: selected.id || null,\n      name: selected.name || null,\n      webViewLink: selected.webViewLink || null,\n      createdTime: selected.createdTime || null\n    } : null,\n    existing_part_manifest_found: !!selected\n  },\n  binary: $('Normalize Telegram Intake').first().binary || {}\n}];\n"
+      }
+    },
+    {
+      "id": "94a2421d-e099-4e38-8bd0-cca1503bb615",
+      "name": "If Part JSON Exists",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        2880,
+        -200
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.existing_part_manifest_found}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "698d0003-85f4-4419-a5e2-83962a2ba7da",
+      "name": "Build Part JSON",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        3120,
+        -280
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const j = $json || {};\nconst payload = {\n  source: 'telegram',\n  trigger_source: 'telegram_trigger',\n  group_key: j.group_key,\n  safe_group_key: j.safe_group_key,\n  buffer_prefix: j.buffer_prefix,\n  chat_id: j.chat_id,\n  chat_type: j.chat_type,\n  media_group_id: j.media_group_id,\n  message_id: j.message_id,\n  message_date_unix: j.message_date_unix,\n  message_received_at: j.message_received_at,\n  quiet_window_sec: j.quiet_window_sec,\n  quiet_until: j.quiet_until,\n  sender: j.sender || {},\n  message_text: j.message_text || null,\n  caption_text: j.caption_text || null,\n  text: j.text || null,\n  part_kind: j.part_kind,\n  has_binary: !!j.has_binary,\n  original_filename: j.original_filename || null,\n  mime_type: j.mime_type || null,\n  telegram_file_id: j.telegram_file_id || null,\n  telegram_file_unique_id: j.telegram_file_unique_id || null,\n  buffer_file_name: j.buffer_file_name || null,\n  temp_drive_folder_id: j.temp_drive_folder_id || null,\n  temp_drive_folder_path: j.temp_drive_folder_path || 'SIGA_TEMP/SIGA_TELEGRAM_BUFFER'\n};\nconst content = JSON.stringify(payload, null, 2);\nconst binaryData = Buffer.from(content, 'utf8').toString('base64');\nreturn [{\n  json: {\n    ...j,\n    part_json_text: content\n  },\n  binary: {\n    data: {\n      data: binaryData,\n      mimeType: 'application/json',\n      fileExtension: 'json',\n      fileName: j.part_json_name || 'part.json'\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "f95ba056-3e5d-4839-afb9-9d282120e8ce",
+      "name": "Convert Part JSON To File",
+      "type": "n8n-nodes-base.convertToFile",
+      "position": [
+        3360,
+        -280
+      ],
+      "typeVersion": 1.1,
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "part_json_text",
+        "options": {
+          "fileName": "={{$json.part_json_name}}",
+          "mimeType": "application/json"
+        }
+      }
+    },
+    {
+      "id": "8265ec2b-8d25-4bf5-8d86-2ce5d89ef442",
+      "name": "Upload Part JSON",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        3600,
+        -280
+      ],
+      "typeVersion": 3,
+      "parameters": {
+        "name": "={{$json.part_json_name}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.temp_drive_folder_id}}"
+        },
+        "options": {
+          "binaryData": true,
+          "inputDataFieldName": "data"
+        }
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "51e4496d-712f-47f6-acdf-c23aa285aed2",
+      "name": "Has Binary",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        3840,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.has_binary}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9c0336cb-1c48-4691-809c-7833ceb27355",
+      "name": "Prepare Media Binary",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4080,
+        -160
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nconst j = $json || {};\nlet triggerBinary = {};\ntry { triggerBinary = $('Telegram Trigger').first().binary || {}; } catch {}\nlet selected = null;\nif (j.binary_key && triggerBinary[j.binary_key]) {\n  selected = triggerBinary[j.binary_key];\n} else if (triggerBinary.data) {\n  selected = triggerBinary.data;\n} else {\n  const keys = Object.keys(triggerBinary || {});\n  if (keys.length) selected = triggerBinary[keys[0]];\n}\nif (!selected) {\n  return [{ json: { ...j, _binary_ready: false, media_upload_error: 'No binary found on Telegram Trigger item' } }];\n}\nif (!selected.fileName && j.original_filename) selected.fileName = j.original_filename;\nif (!selected.mimeType && j.mime_type) selected.mimeType = j.mime_type;\nreturn [{\n  json: { ...j, _binary_ready: true },\n  binary: { data: selected }\n}];\n"
+      }
+    },
+    {
+      "id": "6d0782c3-e17f-47e5-ac62-8c6d60184707",
+      "name": "Search Existing Media File",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        4320,
+        -160
+      ],
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{\"name = '\" + $json.buffer_file_name.replace(/'/g, \"\\\\'\") + \"' and trashed = false and '\" + $json.temp_drive_folder_id + \"' in parents\"}}"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,parents,createdTime,webViewLink)"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "0fcca38b-86d3-49b3-87ea-b688e8a3274b",
+      "name": "Resolve Existing Media File",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        4560,
+        -160
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "\nconst root = $('Prepare Media Binary').first()?.json || $('Build Buffer Context').first().json || {};\nconst files = Array.isArray($json.files) ? [...$json.files] : [];\nfiles.sort((a,b) => {\n  const ta = Date.parse(a.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  const tb = Date.parse(b.createdTime || '9999-12-31T23:59:59.999Z') || Number.MAX_SAFE_INTEGER;\n  if (ta !== tb) return ta - tb;\n  return String(a.id || '').localeCompare(String(b.id || ''));\n});\nconst selected = files[0] || null;\nreturn [{\n  json: {\n    ...root,\n    existing_media_file: selected ? {\n      id: selected.id || null,\n      name: selected.name || null,\n      webViewLink: selected.webViewLink || null,\n      createdTime: selected.createdTime || null\n    } : null,\n    existing_media_file_found: !!selected\n  },\n  binary: $('Prepare Media Binary').first()?.binary || {}\n}];\n"
+      }
+    },
+    {
+      "id": "fe55c778-a153-4cd2-a24a-8166157bbfa0",
+      "name": "If Media File Exists",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        4800,
+        -160
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.existing_media_file_found}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d6e89c33-64d6-4498-90cf-06381d986f64",
+      "name": "Upload Media Buffer File",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        5040,
+        -240
+      ],
+      "typeVersion": 3,
+      "parameters": {
+        "name": "={{$json.buffer_file_name}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.temp_drive_folder_id}}"
+        },
+        "options": {
+          "binaryData": true,
+          "inputDataFieldName": "data"
+        }
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "id": "8b6d6455-fa0c-47fc-bb91-e5218099ecb1",
+      "name": "Finalize Buffer Result",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        5280,
+        -80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "function safeFirst(name) { try { return $(name).first().json || {}; } catch { return {}; } }\nconst intake = safeFirst('Build Buffer Context');\nconst partUpload = safeFirst('Upload Part JSON');\nconst mediaUpload = safeFirst('Upload Media Buffer File');\nconst mediaExisting = safeFirst('Resolve Existing Media File');\nreturn [{\n  json: {\n    ok: true,\n    stage: 'buffered',\n    source: intake.source || 'telegram',\n    trigger_source: intake.trigger_source || 'telegram_trigger',\n    group_key: intake.group_key || null,\n    safe_group_key: intake.safe_group_key || null,\n    buffer_prefix: intake.buffer_prefix || null,\n    temp_root_folder_id: intake.temp_root_folder_id || null,\n    telegram_buffer_folder_id: intake.telegram_buffer_folder_id || intake.temp_drive_folder_id || null,\n    telegram_buffer_folder_name: intake.telegram_buffer_folder_name || intake.temp_drive_folder_name || null,\n    telegram_buffer_folder_path: intake.telegram_buffer_folder_path || intake.temp_drive_folder_path || null,\n    part_json_name: intake.part_json_name || null,\n    part_json_file_id: partUpload.id || null,\n    part_json_file_name: partUpload.name || intake.part_json_name || null,\n    media_buffer_file_id: mediaUpload.id || mediaExisting.selected_file_id || null,\n    media_buffer_file_name: mediaUpload.name || mediaExisting.selected_file_name || intake.buffer_file_name || null,\n    media_uploaded: !!(mediaUpload.id || mediaExisting.selected_file_id),\n    has_binary: !!intake.has_binary,\n    quiet_until: intake.quiet_until || null\n  }\n}];"
+      }
+    },
+    {
+      "id": "1455f690-ccda-4c4e-af21-de50b8413f4e",
+      "name": "Ignored Update Output",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        960,
+        80
+      ],
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{ json: $json }];"
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Telegram Intake",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Telegram Intake": {
+      "main": [
+        [
+          {
+            "node": "Telegram Intake Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram Intake Gate": {
+      "main": [
+        [
+          {
+            "node": "Search Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignored Update Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "If Temp Root Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Temp Root Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Search Telegram Buffer Folder",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Temp Root Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Temp Root Folder": {
+      "main": [
+        [
+          {
+            "node": "Search Telegram Buffer Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Buffer Context": {
+      "main": [
+        [
+          {
+            "node": "Search Existing Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Existing Part JSON": {
+      "main": [
+        [
+          {
+            "node": "Resolve Existing Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Existing Part JSON": {
+      "main": [
+        [
+          {
+            "node": "If Part JSON Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Part JSON Exists": {
+      "main": [
+        [
+          {
+            "node": "Has Binary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Part JSON": {
+      "main": [
+        [
+          {
+            "node": "Upload Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Part JSON": {
+      "main": [
+        [
+          {
+            "node": "Has Binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Binary": {
+      "main": [
+        [
+          {
+            "node": "Prepare Media Binary",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Buffer Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Media Binary": {
+      "main": [
+        [
+          {
+            "node": "Search Existing Media File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Existing Media File": {
+      "main": [
+        [
+          {
+            "node": "Resolve Existing Media File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Existing Media File": {
+      "main": [
+        [
+          {
+            "node": "If Media File Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Media File Exists": {
+      "main": [
+        [
+          {
+            "node": "Finalize Buffer Result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Upload Media Buffer File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Media Buffer File": {
+      "main": [
+        [
+          {
+            "node": "Finalize Buffer Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Telegram Buffer Folder": {
+      "main": [
+        [
+          {
+            "node": "Resolve Telegram Buffer Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Telegram Buffer Folder": {
+      "main": [
+        [
+          {
+            "node": "If Telegram Buffer Folder Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Telegram Buffer Folder Exists": {
+      "main": [
+        [
+          {
+            "node": "Build Buffer Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create Telegram Buffer Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Telegram Buffer Folder": {
+      "main": [
+        [
+          {
+            "node": "Adopt Telegram Buffer Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Adopt Telegram Buffer Folder": {
+      "main": [
+        [
+          {
+            "node": "Build Buffer Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "093ba1266e85fcaaa6abca411d9f7941951737b3920bfaa6e2db89226df2c82d"
+  }
+}
