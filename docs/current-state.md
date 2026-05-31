@@ -81,6 +81,17 @@ Ils restent consultables, mais ne sont plus la source de vérité.
 - L'agent SIGA ne doit jamais créer ou modifier une fiche sans maintenir la cohérence Drive + DuckDB.
 - Les anciens workflows automatiques ne doivent pas être réactivés sans décision explicite.
 
+## Correctif batch processor du 31/05/2026
+
+Le batch processor avait un défaut critique: il créait le dossier final Drive, puis pouvait échouer sur la confirmation Telegram avant d'écrire le marqueur de traitement et avant de nettoyer le buffer. Résultat: le même groupe pouvait être retraité au run suivant et créer plusieurs dossiers packages.
+
+Correctif appliqué:
+
+- la confirmation Telegram est non bloquante;
+- le nettoyage du buffer s'exécute même si un groupe est déjà marqué traité;
+- les fichiers `__part_*.json`, médias bufferisés et marqueur `processed` du groupe courant sont supprimés après création du package;
+- le marqueur est supprimé en dernier pour éviter un retraitement si une suppression intermédiaire échoue.
+
 ## Prochaine validation
 
 Faire un test réel Telegram:
