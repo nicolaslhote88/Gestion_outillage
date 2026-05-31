@@ -75,9 +75,13 @@ Son rôle est de donner à un agent les règles opérationnelles pour traiter le
 - aucune écriture directe dans DuckDB;
 - aucune modification Drive hors des endpoints `/api/drive/*`;
 - vérification des doublons et confirmation utilisateur avant création ou liaison.
+- analyse enrichie des fiches: photos, photo principale, quantités/unités, liens, documentation
+  fabricant, stockage, entretien et dépannage.
 
 Ce skill est la matérialisation agent du flux cible décrit dans ce dépôt. Il ne remplace pas la
 notice API principale `docs/SIGA-API-OpenClaw-Notice.md`; il la rend actionnable côté agent.
+Le brief de démarrage d'une session agent est versionné dans
+`skills/siga-saisie-atelier/references/session-brief.md`.
 
 ## Ce qui est archivé
 

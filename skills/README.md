@@ -17,3 +17,11 @@ Il impose le chemin cible du projet :
 
 Règle centrale : aucune écriture directe dans DuckDB et aucune manipulation Drive hors des
 endpoints API prévus. Si un endpoint manque, l'agent doit le signaler au lieu d'improviser.
+
+Références importantes :
+
+- `references/session-brief.md` : brief à coller au début d'une session de traitement SIGA ;
+- `references/analysis-playbook.md` : méthode d'analyse riche des objets, photos, quantités,
+  liens et recherches web ;
+- `references/api-reference.md` : endpoints autorisés ;
+- `references/access.md` : accès technique à l'API locale.

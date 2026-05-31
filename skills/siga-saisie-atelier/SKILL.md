@@ -1,6 +1,6 @@
 ---
 name: siga-saisie-atelier
-description: Saisir des outils, accessoires et consommables dans l'inventaire d'atelier SIGA via son API. Utilise ce skill DÈS QUE l'utilisateur veut ajouter, enregistrer, créer, inventorier ou lier un outil/équipement/accessoire/consommable dans SIGA, qu'il fournisse des photos, un texte, ou qu'il demande de traiter les "briefs" déposés depuis Telegram dans le Drive. Déclenche aussi sur "ajoute ça dans SIGA", "enregistre cette perceuse", "inventorie ces forets", "traite les briefs en attente", "lie cet accessoire à tel outil". Toutes les écritures passent EXCLUSIVEMENT par l'API SIGA — jamais d'écriture directe en base.
+description: Saisir, enrichir et relier des outils, accessoires et consommables dans l'inventaire d'atelier SIGA via son API. Utilise ce skill DÈS QUE l'utilisateur veut traiter un brief Telegram/Drive, ajouter, enregistrer, créer, inventorier, renseigner, documenter, archiver des photos, choisir une photo principale, rechercher des informations web, ou lier un équipement/accessoire/consommable dans SIGA. Déclenche aussi sur "ajoute ça dans SIGA", "traite les briefs en attente", "analyse ce dossier SIGA", "lie cet accessoire à tel outil", "renseigne les consommables". Toutes les écritures passent EXCLUSIVEMENT par l'API SIGA — jamais d'écriture directe en base.
 ---
 
 # SIGA — Saisie atelier (via API)
@@ -8,6 +8,13 @@ description: Saisir des outils, accessoires et consommables dans l'inventaire d'
 Ce skill enregistre des éléments d'atelier (équipements, accessoires, consommables), leurs
 photos et leurs liaisons dans **SIGA**, en utilisant **uniquement l'API SIGA**. Aucune écriture
 directe dans DuckDB ni manipulation Drive hors API n'est autorisée.
+
+Pour une session de traitement complète, lire aussi :
+
+- `references/analysis-playbook.md` : méthode d'analyse intelligente, enrichissement, photos,
+  quantités, unités, liens et recherches web.
+- `references/session-brief.md` : brief de démarrage à utiliser quand une nouvelle session doit
+  traiter les dossiers Telegram/Drive.
 
 ## Règle d'or
 
@@ -66,6 +73,11 @@ informations utiles :
 
 Si la demande concerne des **briefs Telegram déjà déposés dans Drive** (dossiers `pending`),
 voir la section « Traiter les briefs en attente » plus bas.
+
+Si l'objectif est de construire une fiche riche, appliquer le playbook
+`references/analysis-playbook.md` avant de proposer le plan : identification visuelle,
+recherche web, choix de la photo principale, quantités/unités, compatibilités, entretien,
+stockage et dépannage.
 
 ### Étape 2 — Vérifier les doublons AVANT toute création
 
@@ -136,8 +148,8 @@ Le workflow n8n « brief terrain » dépose dans Drive des dossiers contenant `b
 (`status: "pending"`) + photos. Pour les traiter :
 
 1. lister les dossiers de briefs et lire les `brief.json` en `pending` ;
-2. pour chacun : analyser `text` + photos, puis suivre le workflow de saisie ci-dessus
-   (doublons → plan → confirmation → création/liaison via API) ;
+2. pour chacun : analyser `text` + photos avec `references/analysis-playbook.md`, puis suivre le
+   workflow de saisie ci-dessus (doublons → plan → confirmation → création/liaison via API) ;
 3. après traitement, marquer le brief `processed` (réécriture du `brief.json`) pour rendre
    l'opération **idempotente** — ne jamais retraiter deux fois le même brief.
 
