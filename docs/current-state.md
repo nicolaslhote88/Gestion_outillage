@@ -92,6 +92,12 @@ Correctif appliqué:
 - les fichiers `__part_*.json`, médias bufferisés et marqueur `processed` du groupe courant sont supprimés après création du package;
 - le marqueur est supprimé en dernier pour éviter un retraitement si une suppression intermédiaire échoue.
 
+Nettoyage effectué après incident:
+
+- 21 dossiers packages dupliqués avaient été créés pour `album_-4887456379_14241702979869292`;
+- le premier dossier a été conservé: `1Q9Bny2dCaQl9TxX8cE6P9w8hoA66D9rF`;
+- les 20 dossiers suivants ont été mis à la corbeille Drive via `SIGA — Delete Equipment Drive Folder`.
+
 ## Prochaine validation
 
 Faire un test réel Telegram:
