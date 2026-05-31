@@ -64,6 +64,21 @@ SIGA_ATELIER/album_<chat_id>_<media_group_id>/
 
 Le `brief.json` doit rester en `status: "pending"` tant que l'agent SIGA ne l'a pas traité.
 
+## Skill agent SIGA
+
+Claude a ajouté un skill local dans `skills/siga-saisie-atelier/`.
+
+Son rôle est de donner à un agent les règles opérationnelles pour traiter les briefs Drive:
+
+- accès API uniquement via SSH + `docker exec` dans le conteneur `siga-dashboard`;
+- token lu depuis `SIGA_API_TOKEN` dans le conteneur, jamais stocké dans le dépôt;
+- aucune écriture directe dans DuckDB;
+- aucune modification Drive hors des endpoints `/api/drive/*`;
+- vérification des doublons et confirmation utilisateur avant création ou liaison.
+
+Ce skill est la matérialisation agent du flux cible décrit dans ce dépôt. Il ne remplace pas la
+notice API principale `docs/SIGA-API-OpenClaw-Notice.md`; il la rend actionnable côté agent.
+
 ## Ce qui est archivé
 
 Les exports locaux dispersés, anciennes versions de collector et batch processor, notes intermédiaires et anciens essais ont été rangés dans:

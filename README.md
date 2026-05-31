@@ -17,6 +17,7 @@ L'ancien pipeline qui tentait de tout analyser automatiquement au moment de l'en
 | `docs/current-state.md` | Etat réel au 31/05/2026 |
 | `docs/SIGA-API-OpenClaw-Notice.md` | Notice API utilisée par l'agent SIGA |
 | `docs/brief.schema.json` | Contrat du `brief.json` déposé dans Drive |
+| `skills/siga-saisie-atelier/` | Skill agent pour traiter les briefs et saisir accessoires/consommables via l'API SIGA |
 | `workflows/live/` | Workflows n8n qui composent le flux cible |
 | `workflows/support/` | Workflows utilitaires conservés |
 | `workflows/archive/` | Workflows legacy exportés pour mémoire |
@@ -38,7 +39,7 @@ Puis, plus tard:
 Agent SIGA + docs/SIGA-API-OpenClaw-Notice.md
   -> lecture du dossier Drive
   -> analyse visuelle et décision
-  -> API SIGA / DuckDB / Drive
+  -> API SIGA uniquement pour les écritures
   -> brief.json passe de pending a processed
 ```
 
