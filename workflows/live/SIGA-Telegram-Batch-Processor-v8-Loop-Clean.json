@@ -1,1 +1,1245 @@
-[{"updatedAt":"2026-05-31T13:22:22.000Z","createdAt":"2026-03-16T17:03:18.499Z","id":"fNFsT1JoloWVTLa0Q8z_E","name":"SIGA - Telegram Batch Processor v8 (Loop Clean)","description":null,"active":true,"isArchived":false,"nodes":[{"parameters":{},"id":"82d75926-9b63-409a-873b-4398e3b08510","name":"Manual Trigger","type":"n8n-nodes-base.manualTrigger","position":[30048,5312],"typeVersion":1},{"parameters":{"jsCode":"const readEnv = (name) => {\n  try {\n    const v = process?.env?.[name];\n    return typeof v === 'string' && v.trim() ? v.trim() : '';\n  } catch { return ''; }\n};\nconst bufferFolderId = readEnv('SIGA_TELEGRAM_BUFFER_FOLDER_ID') || '1tbyhFwLBWm5jh605vngOqpHN-Gpb-9yf';\nconst sharedSecret = readEnv('SIGA_WEBHOOK_SECRET') || readEnv('SIGA_SHARED_SECRET') || readEnv('N8N_SIGA_WEBHOOK_SECRET') || readEnv('N8N_SIGA_SHARED_SECRET') || '';\nreturn [{ json: { now: new Date().toISOString(), buffer_folder_id: bufferFolderId, buffer_folder_path: 'SIGA_TEMP/SIGA_TELEGRAM_BUFFER', shared_secret: sharedSecret, quiet_window_sec_default: 5, processor_source: 'telegram_buffer_to_drive_brief', final_drive_root_id: '1e6OipL7R8HlG5LV1Lp8Z_AMlFQMTxaRC', min_message_received_at: '2026-05-31T07:06:52.8281810Z' } }];"},"id":"93a18cbf-a2b0-45f5-9783-1f78b05f19bc","name":"Init Processor Config","type":"n8n-nodes-base.code","position":[30272,5216],"typeVersion":2},{"parameters":{"url":"https://www.googleapis.com/drive/v3/files","authentication":"predefinedCredentialType","nodeCredentialType":"googleDriveOAuth2Api","sendQuery":true,"queryParameters":{"parameters":[{"name":"q","value":"={{ \"'\" + $json.buffer_folder_id + \"' in parents and mimeType = 'application/json' and trashed = false\" }}"},{"name":"fields","value":"files(id,name,createdTime,mimeType,webViewLink,parents)"},{"name":"pageSize","value":"1000"},{"name":"supportsAllDrives","value":"true"},{"name":"includeItemsFromAllDrives","value":"true"}]},"options":{}},"id":"ac7ccb2c-e263-4174-8766-6e277937cb26","name":"Search Buffered JSON Parts","type":"n8n-nodes-base.httpRequest","position":[30496,5216],"typeVersion":4.2,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const root = $('Init Processor Config').first().json || {};\nconst files = Array.isArray($json.files) ? [...$json.files] : [];\nconst partFiles = files.filter(f => /__part_\\d+\\.json$/i.test(String(f.name || '')));\nreturn [{\n  json: {\n    ...root,\n    part_json_files: partFiles,\n    part_json_count: partFiles.length\n  }\n}];"},"id":"559731fb-035e-4dc3-8649-62cf49fd4700","name":"Resolve Part JSON Candidates","type":"n8n-nodes-base.code","position":[30720,5216],"typeVersion":2},{"parameters":{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":2},"conditions":[{"leftValue":"={{$json.part_json_count}}","rightValue":0,"operator":{"type":"number","operation":"gt"}}],"combinator":"and"},"options":{}},"id":"4966c1d5-6fe9-4015-b12d-4924ce9a8ae6","name":"If Part JSON Exists","type":"n8n-nodes-base.if","position":[30944,5216],"typeVersion":2},{"parameters":{"jsCode":"const root = $json;\nreturn root.part_json_files.map(f => ({\n  json: { ...root, part_json_file_id: f.id, part_json_name: f.name }\n}));"},"id":"1190adc8-9245-43e4-8953-53a737cb3573","name":"Split Part JSON Files","type":"n8n-nodes-base.code","position":[31168,5144],"typeVersion":2},{"parameters":{"operation":"download","fileId":{"__rl":true,"value":"={{ $json.part_json_file_id }}","mode":"id"},"options":{"binaryPropertyName":"data"}},"id":"1bcd17d8-2887-4c0c-8d20-1634a168c30a","name":"Download Part JSON","type":"n8n-nodes-base.googleDrive","position":[31392,5144],"typeVersion":3,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const items = $input.all();\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  let txt = '';\n  try {\n    const buf = await this.helpers.getBinaryDataBuffer(i, 'data');\n    txt = Buffer.from(buf).toString('utf8');\n  } catch (e) { continue; }\n  txt = String(txt || '').replace(/^\\uFEFF/, '').trim();\n  const parsed = JSON.parse(txt);\n  out.push({\n    json: {\n      ...item.json,\n      part: parsed,\n      buffer_prefix: parsed.buffer_prefix || item.json.buffer_prefix || '',\n      group_key: parsed.group_key || ''\n    }\n  });\n}\nreturn out;"},"id":"0e6fbd1c-1486-48c9-9c38-5a07e35a88af","name":"Parse Part JSON","type":"n8n-nodes-base.code","position":[31616,5144],"typeVersion":2},{"parameters":{"jsCode":"const now = Date.now();\nconst minReceivedAt = Date.parse(($('Init Processor Config').first().json || {}).min_message_received_at || '') || 0;\nconst items = $input.all().map(i => i.json || {}).filter(j => {\n  const p = j.part || j;\n  const t = Date.parse(p.message_received_at || j.message_received_at || '') || 0;\n  return !minReceivedAt || !t || t >= minReceivedAt;\n});\nconst groups = new Map();\n\nconst firstNonEmpty = (arr, keys) => {\n  for (const x of arr) {\n    for(const key of keys) {\n        const val = x[key] || x.part?.[key];\n        if (val !== null && val !== undefined && val !== '') return val;\n    }\n  }\n  return null;\n};\n\nfor (const j of items) {\n  const prefix = j.buffer_prefix || '';\n  if (!prefix) continue;\n  const g = groups.get(prefix) || { parts: [], root: j, lastQuietUntil: 0, firstSeen: Number.MAX_SAFE_INTEGER };\n  const part = j.part || {};\n  g.parts.push(part);\n  const q = Date.parse(part.quiet_until || '') || 0;\n  const seen = Date.parse(part.message_received_at || '') || now;\n  if (q > g.lastQuietUntil) g.lastQuietUntil = q;\n  if (seen < g.firstSeen) g.firstSeen = seen;\n  if ((part.message_text || part.caption_text || part.text) && !(g.root.part?.message_text || g.root.part?.caption_text || g.root.part?.text)) g.root = j;\n  groups.set(prefix, g);\n}\n\nconst ready = [...groups.values()]\n  .filter(g => g.lastQuietUntil > 0 && g.lastQuietUntil <= now)\n  .sort((a, b) => a.firstSeen - b.firstSeen);\n\nif (!ready.length) return [{ json: { ready_group_found: false, reason: 'no_ready_group' } }];\n\nconst g = ready[0];\nconst parts = [...g.parts].sort((a, b) => Number(a.message_id || 0) - Number(b.message_id || 0));\nconst markerName = `${g.root.buffer_prefix}processed.json`;\n\nreturn [{\n  json: {\n    ...$('Init Processor Config').first().json,\n    ready_group_found: true,\n    buffer_prefix: g.root.buffer_prefix,\n    group_key: g.root.group_key,\n    media_group_id: firstNonEmpty(parts, ['media_group_id']),\n    chat_id: firstNonEmpty(parts, ['chat_id']),\n    chat_type: firstNonEmpty(parts, ['chat_type']),\n    sender: firstNonEmpty(parts, ['sender']) || {},\n    message_text: firstNonEmpty(parts, ['message_text', 'caption_text', 'text']) || '',\n    quiet_until: new Date(g.lastQuietUntil).toISOString(),\n    group_parts: parts,\n    processed_marker_name: markerName\n  }\n}];"},"id":"ba9cf997-ceb6-4f30-8110-a5ff1ac86810","name":"Select Oldest Ready Group","type":"n8n-nodes-base.code","position":[31840,5144],"typeVersion":2},{"parameters":{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":2},"conditions":[{"leftValue":"={{$json.ready_group_found}}","rightValue":true,"operator":{"type":"boolean","operation":"true","singleValue":true}}],"combinator":"and"},"options":{}},"id":"44f9b808-05bc-451d-8e2e-9d412e14d938","name":"If Ready Group Found","type":"n8n-nodes-base.if","position":[32064,5144],"typeVersion":2},{"parameters":{"url":"https://www.googleapis.com/drive/v3/files","authentication":"predefinedCredentialType","nodeCredentialType":"googleDriveOAuth2Api","sendQuery":true,"queryParameters":{"parameters":[{"name":"q","value":"={{ \"'\" + $json.buffer_folder_id + \"' in parents and name = '\" + String($json.processed_marker_name||'').replace(/'/g,\"\\\\'\") + \"' and trashed = false\" }}"},{"name":"fields","value":"files(id,name)"},{"name":"supportsAllDrives","value":"true"},{"name":"includeItemsFromAllDrives","value":"true"}]},"options":{}},"id":"d968ad3f-8e9e-46a8-a932-f1a7e218e928","name":"Search Processed Marker","type":"n8n-nodes-base.httpRequest","position":[32288,5072],"typeVersion":4.2,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const marker = $json || {};\nconst root = $('If Ready Group Found').first().json || {};\nreturn [{\n  json: {\n    ...root,\n    processed_marker_found: Array.isArray(marker.files) && marker.files.length > 0\n  }\n}];"},"id":"fa91ac3c-26bc-4383-a6e4-72831fcf6e57","name":"Attach Marker Context","type":"n8n-nodes-base.code","position":[32512,5072],"typeVersion":2},{"parameters":{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":2},"conditions":[{"leftValue":"={{$json.processed_marker_found}}","rightValue":false,"operator":{"type":"boolean","operation":"false","singleValue":true}}],"combinator":"and"},"options":{}},"id":"e6311845-f6eb-4406-bb34-02812d20a106","name":"If Not Processed","type":"n8n-nodes-base.if","position":[32736,5072],"typeVersion":2},{"parameters":{"url":"https://www.googleapis.com/drive/v3/files","authentication":"predefinedCredentialType","nodeCredentialType":"googleDriveOAuth2Api","sendQuery":true,"queryParameters":{"parameters":[{"name":"q","value":"={{ \"'\" + $json.buffer_folder_id + \"' in parents and trashed = false and mimeType != 'application/json' and name contains '\" + String($json.buffer_prefix||'').replace(/'/g,\"\\\\'\") + \"'\" }}"},{"name":"fields","value":"files(id,name,mimeType)"},{"name":"pageSize","value":"100"},{"name":"supportsAllDrives","value":"true"},{"name":"includeItemsFromAllDrives","value":"true"}]},"options":{}},"id":"2913a1e9-1c0d-4312-a1fd-3bb5f25dfafc","name":"Search Group Media","type":"n8n-nodes-base.httpRequest","position":[32960,4976],"typeVersion":4.2,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const root = $('If Not Processed').first().json;\nconst files = Array.isArray($json.files) ? $json.files : [];\nconst parts = Array.isArray(root.group_parts) ? root.group_parts : [];\nconst byName = new Map(files.map(f => [String(f.name || ''), f]));\nconst mediaItems = [];\n\nfor (const p of parts) {\n  const name = p.buffer_file_name;\n  if (!name) continue;\n  const f = byName.get(String(name));\n  if (!f) continue;\n  mediaItems.push({\n    ...root,\n    part: p,\n    drive_file_id: f.id,\n    drive_file_name: f.name,\n    computed_mime_type: f.mimeType || p.mime_type || 'application/octet-stream',\n    media_order: Number(p.message_id || mediaItems.length + 1)\n  });\n}\nreturn mediaItems;"},"id":"f60f998e-a1d9-4d3f-9a7d-f8928b5dccb8","name":"Build Media Plan","type":"n8n-nodes-base.code","position":[33184,4976],"typeVersion":2},{"parameters":{"operation":"download","fileId":{"__rl":true,"value":"={{ $json.drive_file_id }}","mode":"id"},"options":{"binaryPropertyName":"data"}},"id":"ab4e79c6-01f3-4b51-a219-11e871b75a07","name":"Download Media","type":"n8n-nodes-base.googleDrive","position":[33408,4976],"typeVersion":3,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const out = [];\nconst items = $input.all();\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const p = item.json.part || {};\n  const mime = String(item.json.computed_mime_type || item.binary?.data?.mimeType || 'application/octet-stream').toLowerCase();\n  const isImg = mime.startsWith('image/');\n  const bKey = isImg ? `image_upload${i}` : `document_upload${i}`;\n  \n  const row = {\n    index: i + 1,\n    order: item.json.media_order,\n    filename: p.original_filename || item.json.drive_file_name,\n    mime_type: mime,\n    binary_key: bKey\n  };\n\n  out.push({\n    json: {\n      ...item.json,\n      image_row: isImg ? row : null,\n      document_row: !isImg ? row : null\n    },\n    binary: item.binary\n  });\n}\nreturn out;"},"id":"4cf6686d-0c67-42af-b941-5919959fec67","name":"Classify Media (No Base64)","type":"n8n-nodes-base.code","position":[33632,4976],"typeVersion":2},{"parameters":{"jsCode":"const items = $input.all();\nif (!items.length) return [{ json: { payload_ready: false } }];\n\nconst root = items[0].json;\nconst sharedSecret = $('Init Processor Config').first().json.shared_secret || '';\n\nconst images = items.map(i => i.json.image_row).filter(Boolean).sort((a, b) => a.order - b.order);\nconst documents = items.map(i => i.json.document_row).filter(Boolean).sort((a, b) => a.order - b.order);\n\nimages.forEach((img, idx) => img.index = idx + 1);\ndocuments.forEach((doc, idx) => doc.index = idx + 1);\n\nconst sender = root.sender || {};\n\nconst payload = {\n  source: 'telegram_buffered',\n  trigger_source: 'telegram_buffer_batch',\n  project: 'SIGA',\n  entity_type: 'equipment',\n  message: {\n    text: root.message_text || '',\n    received_at: new Date().toISOString()\n  },\n  sender: {\n    id: sender.id || null,\n    display_name: sender.first_name || sender.username || sender.display_name || null\n  },\n  context: {\n    telegram: {\n      chat_id: root.chat_id ?? null,\n      chat_type: root.chat_type ?? null,\n      media_group_id: root.media_group_id || null,\n      group_key: root.group_key || null,\n      buffer_prefix: root.buffer_prefix || null\n    }\n  },\n  images: images.map(img => ({ index: img.index, filename: img.filename, mime_type: img.mime_type, binary_key: img.binary_key })),\n  documents: documents.map(doc => ({ index: doc.index, filename: doc.filename, mime_type: doc.mime_type, binary_key: doc.binary_key })),\n  headers: {\n    'x-siga-shared-secret': sharedSecret\n  },\n  processed_marker_name: root.processed_marker_name,\n  buffer_folder_id: root.buffer_folder_id,\n  group_key: root.group_key,\n  buffer_prefix: root.buffer_prefix,\n  payload_ready: true\n};\n\nconst outBinary = {};\nitems.forEach((item) => {\n  const row = item.json.image_row || item.json.document_row;\n  if (row && item.binary && item.binary.data) {\n    outBinary[row.binary_key] = item.binary.data;\n    outBinary[row.binary_key].fileName = row.filename;\n    outBinary[row.binary_key].mimeType = row.mime_type;\n  }\n});\n\nreturn [{\n  json: payload,\n  binary: Object.keys(outBinary).length ? outBinary : undefined\n}];"},"id":"ed278a88-c4f5-4080-a8d3-71a0b00fd2c3","name":"Aggregate Final Payload","type":"n8n-nodes-base.code","position":[33856,4976],"typeVersion":2},{"parameters":{"conditions":{"options":{"caseSensitive":true,"leftValue":"","typeValidation":"strict","version":2},"conditions":[{"leftValue":"={{$json.payload_ready}}","rightValue":true,"operator":{"type":"boolean","operation":"true","singleValue":true}}],"combinator":"and"},"options":{}},"id":"f7e611ef-047f-4146-8bf4-5e3462b9de70","name":"If Payload Ready","type":"n8n-nodes-base.if","position":[34080,4976],"typeVersion":2},{"parameters":{"name":"={{$json.marker_name}}","driveId":{"__rl":true,"mode":"list","value":"My Drive"},"folderId":{"__rl":true,"mode":"id","value":"={{$json.buffer_folder_id}}"},"options":{}},"id":"be14bdf6-1502-4688-957d-936aa1a81781","name":"Upload Processed Marker","type":"n8n-nodes-base.googleDrive","position":[34752,4832],"typeVersion":3,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"url":"https://www.googleapis.com/drive/v3/files","authentication":"predefinedCredentialType","nodeCredentialType":"googleDriveOAuth2Api","sendQuery":true,"queryParameters":{"parameters":[{"name":"q","value":"={{ \"'\" + $json.buffer_folder_id + \"' in parents and name contains '\" + String($json.buffer_prefix||'').replace(/'/g,\"\\\\'\") + \"' and trashed = false\" }}"},{"name":"fields","value":"files(id,name)"},{"name":"supportsAllDrives","value":"true"},{"name":"includeItemsFromAllDrives","value":"true"}]},"options":{}},"id":"54fee130-4259-43ca-8d16-97ed8e434cf2","name":"Search Files to Clean","type":"n8n-nodes-base.httpRequest","position":[34976,4832],"typeVersion":4.2,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const markerName = String($json.marker_name || '');\nconst prefix = String($json.buffer_prefix || '');\nconst files = Array.isArray($json.files) ? $json.files : [];\nconst toDelete = files\n  .filter(f => f.id && (!prefix || String(f.name || '').includes(prefix)))\n  // Le marqueur est supprime en dernier: s'il y a une erreur avant, il reste et evite un retraitement.\n  .sort((a, b) => {\n    const am = markerName && a.name === markerName ? 1 : 0;\n    const bm = markerName && b.name === markerName ? 1 : 0;\n    return am - bm;\n  });\nreturn toDelete.map(f => ({ json: { file_id: f.id, file_name: f.name, marker_name: markerName, buffer_prefix: prefix } }));"},"id":"4abbd8f8-fd2e-4642-aa34-c475c49616e2","name":"Filter Files to Clean","type":"n8n-nodes-base.code","position":[35200,4832],"typeVersion":2},{"parameters":{"options":{}},"id":"84ba702b-7b26-43c9-8a65-a541ebd8916b","name":"Loop Over Files","type":"n8n-nodes-base.splitInBatches","typeVersion":3,"position":[35424,4832]},{"parameters":{"operation":"deleteFile","fileId":{"__rl":true,"value":"={{ $json.file_id }}","mode":"id"},"options":{}},"id":"f07aba37-387c-4537-bccf-38733c943f5c","name":"Delete Original Files","type":"n8n-nodes-base.googleDrive","position":[35648,4880],"typeVersion":3,"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"return [{json: { cleanup_done: true }}];"},"id":"e24024b7-a03b-465d-aaa5-c842e7a8981b","name":"No Op","type":"n8n-nodes-base.code","position":[35648,5168],"typeVersion":2},{"parameters":{"rule":{"interval":[{"field":"minutes","minutesInterval":1}]}},"id":"schedule-telegram-buffer-every-minute","name":"Schedule Every Minute","type":"n8n-nodes-base.scheduleTrigger","typeVersion":1.2,"position":[30048,5024]},{"parameters":{"jsCode":"function sanitize(value) {\n  return String(value || '').normalize('NFKD').replace(/[^\\x00-\\x7F]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'brief';\n}\nfunction stampFromIso(iso) {\n  const d = new Date(iso || Date.now());\n  const pad = (n) => String(n).padStart(2, '0');\n  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;\n}\nconst payload = $json || {};\nconst selected = $('If Not Processed').first().json || {};\nconst parts = Array.isArray(selected.group_parts) ? [...selected.group_parts] : [];\nparts.sort((a, b) => Number(a.message_id || 0) - Number(b.message_id || 0));\nconst firstPart = parts[0] || {};\nconst telegram = payload.context?.telegram || {};\nconst chatId = telegram.chat_id ?? selected.chat_id ?? null;\nconst mediaGroupId = telegram.media_group_id || selected.media_group_id || null;\nconst folderName = mediaGroupId ? `album_${sanitize(chatId)}_${sanitize(mediaGroupId)}` : `${stampFromIso(firstPart.message_received_at || payload.message?.received_at)}_msg${firstPart.message_id || 'unknown'}`;\nreturn [{ json: { ...payload, group_parts: parts, brief_folder_name: folderName, brief_id: folderName, final_drive_root_id: $('Init Processor Config').first().json.final_drive_root_id }, binary: $input.first().binary }];"},"id":"brief-folder-context","name":"Build Brief Folder Context","type":"n8n-nodes-base.code","typeVersion":2,"position":[34304,4976]},{"parameters":{"resource":"folder","name":"={{ $json.brief_folder_name }}","driveId":{"__rl":true,"mode":"list","value":"My Drive"},"folderId":{"__rl":true,"mode":"id","value":"={{ $json.final_drive_root_id }}"},"options":{}},"id":"create-brief-drive-folder","name":"Create Brief Drive Folder","type":"n8n-nodes-base.googleDrive","typeVersion":3,"position":[34528,4976],"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"jsCode":"const ctx = $('Build Brief Folder Context').first().json;\nconst folder = $('Create Brief Drive Folder').first().json;\nconst payloadItem = $('Aggregate Final Payload').first();\nconst binary = payloadItem.binary || {};\nconst rows = [ ...((ctx.images || []).map(x => ({ ...x, kind: 'photo' }))), ...((ctx.documents || []).map(x => ({ ...x, kind: 'document' }))) ].sort((a, b) => Number(a.index || 0) - Number(b.index || 0));\nconst out = [];\nfor (const row of rows) {\n  const b = binary[row.binary_key];\n  if (!b) continue;\n  const ext = String(row.filename || '').split('.').pop() || (row.kind === 'photo' ? 'jpg' : 'bin');\n  const target = row.kind === 'photo' ? `photo_${String(row.index).padStart(2, '0')}.${ext}` : `document_${String(row.index).padStart(2, '0')}.${ext}`;\n  out.push({ json: { brief_id: ctx.brief_id, brief_folder_id: folder.id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`, target_filename: target, original_filename: row.filename || target, mime_type: row.mime_type || b.mimeType || 'application/octet-stream', kind: row.kind, index: row.index, telegram_message_id: (ctx.group_parts || [])[Number(row.index || 1) - 1]?.message_id || null }, binary: { data: { ...b, fileName: target, mimeType: row.mime_type || b.mimeType || 'application/octet-stream' } } });\n}\nreturn out;"},"id":"split-brief-upload-files","name":"Split Brief Upload Files","type":"n8n-nodes-base.code","typeVersion":2,"position":[34752,4976]},{"parameters":{"name":"={{ $json.target_filename }}","driveId":{"__rl":true,"mode":"list","value":"My Drive"},"folderId":{"__rl":true,"mode":"id","value":"={{ $json.brief_folder_id }}"},"options":{}},"id":"upload-brief-media","name":"Upload Brief Media","type":"n8n-nodes-base.googleDrive","typeVersion":3,"position":[34976,4976],"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"mode":"runOnceForAllItems","jsCode":"const uploads = $input.all();\nconst split = $('Split Brief Upload Files').all();\nconst ctx = $('Build Brief Folder Context').first().json;\nconst folder = $('Create Brief Drive Folder').first().json;\nconst folderUrl = folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`;\nconst photos = [];\nconst documents = [];\nfor (let i = 0; i < uploads.length; i++) {\n  const u = uploads[i].json || {};\n  const s = split[i]?.json || {};\n  const row = { filename: s.target_filename || u.name || null, original_filename: s.original_filename || null, drive_file_id: u.id || null, mime: s.mime_type || u.mimeType || null, telegram_message_id: s.telegram_message_id || null };\n  if (s.kind === 'document') documents.push(row); else photos.push(row);\n}\nconst telegram = ctx.context?.telegram || {};\nconst brief = { brief_id: ctx.brief_id, created_at: new Date().toISOString(), source: 'telegram', status: 'pending', text: ctx.message?.text || '', photos, documents, drive: { folder_id: folder.id, folder_name: ctx.brief_folder_name, folder_url: folderUrl }, telegram: { chat_id: telegram.chat_id ?? null, chat_type: telegram.chat_type ?? null, media_group_id: telegram.media_group_id || null, group_key: telegram.group_key || ctx.group_key || null, buffer_prefix: telegram.buffer_prefix || ctx.buffer_prefix || null }, siga: { action: null, items: [], processed_at: null, notes: null } };\nconst txt = JSON.stringify(brief, null, 2);\nreturn [{ json: { ...ctx, brief, brief_folder_id: folder.id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: folderUrl, telegram_chat_id: telegram.chat_id ?? null }, binary: { data: { data: Buffer.from(txt, 'utf8').toString('base64'), mimeType: 'application/json', fileName: 'brief.json' } } }];"},"id":"build-brief-json","name":"Build Brief JSON","type":"n8n-nodes-base.code","typeVersion":2,"position":[35200,4976]},{"parameters":{"name":"brief.json","driveId":{"__rl":true,"mode":"list","value":"My Drive"},"folderId":{"__rl":true,"mode":"id","value":"={{ $json.brief_folder_id }}"},"options":{}},"id":"upload-brief-json","name":"Upload Brief JSON","type":"n8n-nodes-base.googleDrive","typeVersion":3,"position":[35424,4976],"credentials":{"googleDriveOAuth2Api":{"id":"pfuF6ArTiTPmlpHG","name":"Google Drive account"}}},{"parameters":{"chatId":"={{ $json.telegram_chat_id }}","text":"=Brief SIGA enregistré. Dossier: {{ $json.brief_folder_name }} | Photos: {{ $json.brief.photos.length }} | Lien: {{ $json.brief_folder_url }}","additionalFields":{"parse_mode":"HTML","appendAttribution":false}},"id":"confirm-brief-telegram","name":"Confirm Brief Telegram","type":"n8n-nodes-base.telegram","typeVersion":1.2,"position":[35648,4976],"credentials":{"telegramApi":{"id":"pVqYKOVuJrq3njUz","name":"Telegram Jarvis Bot"}},"continueOnFail":true,"notes":"Non bloquant: le nettoyage du buffer doit continuer meme si Telegram refuse le chat_id."},{"parameters":{"jsCode":"const ctx = $('Build Brief JSON').first().json;\nconst txt = JSON.stringify({ group_key: ctx.group_key, buffer_prefix: ctx.buffer_prefix, processed_at: new Date().toISOString(), status: 'brief_created', brief_folder_id: ctx.brief_folder_id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: ctx.brief_folder_url, photo_count: ctx.brief?.photos?.length || 0, document_count: ctx.brief?.documents?.length || 0 }, null, 2);\nreturn [{ json: { marker_name: ctx.processed_marker_name, buffer_folder_id: ctx.buffer_folder_id, buffer_prefix: ctx.buffer_prefix, brief_folder_id: ctx.brief_folder_id, brief_folder_url: ctx.brief_folder_url }, binary: { data: { data: Buffer.from(txt, 'utf8').toString('base64'), mimeType: 'application/json', fileName: ctx.processed_marker_name } } }];"},"id":"build-marker-binary-brief","name":"Build Marker Binary","type":"n8n-nodes-base.code","typeVersion":2,"position":[35872,4976]},{"parameters":{"jsCode":"let ctx = {};\ntry {\n  ctx = $('Build Marker Binary').first().json || {};\n} catch (e) {\n  ctx = $input.first().json || {};\n}\nconst markerName = ctx.marker_name || ctx.processed_marker_name || (ctx.buffer_prefix ? ctx.buffer_prefix + 'processed.json' : '');\nconst bufferFolderId = ctx.buffer_folder_id || $('Init Processor Config').first().json.buffer_folder_id;\nconst bufferPrefix = ctx.buffer_prefix || '';\nif (!bufferFolderId || !bufferPrefix) {\n  throw new Error('Missing cleanup context: buffer_folder_id or buffer_prefix');\n}\nreturn [{\n  json: {\n    buffer_folder_id: bufferFolderId,\n    buffer_prefix: bufferPrefix,\n    marker_name: markerName,\n    cleanup_requested_at: new Date().toISOString()\n  }\n}];"},"id":"cf32e4f3-b107-4495-ad24-3e12df718c1b","name":"Build Cleanup Context","type":"n8n-nodes-base.code","typeVersion":2,"position":[2650,-40]}],"connections":{"Manual Trigger":{"main":[[{"node":"Init Processor Config","type":"main","index":0}]]},"Schedule Every Minute":{"main":[[{"node":"Init Processor Config","type":"main","index":0}]]},"Init Processor Config":{"main":[[{"node":"Search Buffered JSON Parts","type":"main","index":0}]]},"Search Buffered JSON Parts":{"main":[[{"node":"Resolve Part JSON Candidates","type":"main","index":0}]]},"Resolve Part JSON Candidates":{"main":[[{"node":"If Part JSON Exists","type":"main","index":0}]]},"If Part JSON Exists":{"main":[[{"node":"Split Part JSON Files","type":"main","index":0}],[{"node":"No Op","type":"main","index":0}]]},"Split Part JSON Files":{"main":[[{"node":"Download Part JSON","type":"main","index":0}]]},"Download Part JSON":{"main":[[{"node":"Parse Part JSON","type":"main","index":0}]]},"Parse Part JSON":{"main":[[{"node":"Select Oldest Ready Group","type":"main","index":0}]]},"Select Oldest Ready Group":{"main":[[{"node":"If Ready Group Found","type":"main","index":0}]]},"If Ready Group Found":{"main":[[{"node":"Search Processed Marker","type":"main","index":0}],[{"node":"No Op","type":"main","index":0}]]},"Search Processed Marker":{"main":[[{"node":"Attach Marker Context","type":"main","index":0}]]},"Attach Marker Context":{"main":[[{"node":"If Not Processed","type":"main","index":0}]]},"If Not Processed":{"main":[[{"node":"Search Group Media","type":"main","index":0}],[{"node":"Build Cleanup Context","type":"main","index":0}]]},"Search Group Media":{"main":[[{"node":"Build Media Plan","type":"main","index":0}]]},"Build Media Plan":{"main":[[{"node":"Download Media","type":"main","index":0}]]},"Download Media":{"main":[[{"node":"Classify Media (No Base64)","type":"main","index":0}]]},"Classify Media (No Base64)":{"main":[[{"node":"Aggregate Final Payload","type":"main","index":0}]]},"Aggregate Final Payload":{"main":[[{"node":"If Payload Ready","type":"main","index":0}]]},"If Payload Ready":{"main":[[{"node":"Build Brief Folder Context","type":"main","index":0}],[{"node":"No Op","type":"main","index":0}]]},"Build Brief Folder Context":{"main":[[{"node":"Create Brief Drive Folder","type":"main","index":0}]]},"Create Brief Drive Folder":{"main":[[{"node":"Split Brief Upload Files","type":"main","index":0}]]},"Split Brief Upload Files":{"main":[[{"node":"Upload Brief Media","type":"main","index":0}]]},"Upload Brief Media":{"main":[[{"node":"Build Brief JSON","type":"main","index":0}]]},"Build Brief JSON":{"main":[[{"node":"Upload Brief JSON","type":"main","index":0}]]},"Upload Brief JSON":{"main":[[{"node":"Confirm Brief Telegram","type":"main","index":0}]]},"Confirm Brief Telegram":{"main":[[{"node":"Build Marker Binary","type":"main","index":0}]]},"Build Marker Binary":{"main":[[{"node":"Upload Processed Marker","type":"main","index":0}]]},"Upload Processed Marker":{"main":[[{"node":"Build Cleanup Context","type":"main","index":0}]]},"Search Files to Clean":{"main":[[{"node":"Filter Files to Clean","type":"main","index":0}]]},"Filter Files to Clean":{"main":[[{"node":"Loop Over Files","type":"main","index":0}]]},"Loop Over Files":{"main":[[{"node":"No Op","type":"main","index":0}],[{"node":"Delete Original Files","type":"main","index":0}]]},"Delete Original Files":{"main":[[{"node":"Loop Over Files","type":"main","index":0}]]},"Build Cleanup Context":{"main":[[{"node":"Search Files to Clean","type":"main","index":0}]]}},"settings":{"executionOrder":"v1"},"staticData":null,"meta":{"templateCredsSetupCompleted":true,"instanceId":"093ba1266e85fcaaa6abca411d9f7941951737b3920bfaa6e2db89226df2c82d"},"pinData":{},"versionId":"7b914128-5b81-4860-8fe4-235dc7a713eb","activeVersionId":"7b914128-5b81-4860-8fe4-235dc7a713eb","versionCounter":52,"triggerCount":1,"tags":[],"shared":[{"updatedAt":"2026-03-16T17:03:18.509Z","createdAt":"2026-03-16T17:03:18.509Z","role":"workflow:owner","workflowId":"fNFsT1JoloWVTLa0Q8z_E","projectId":"ksaxzZwZY6PsA6jp","project":{"updatedAt":"2025-08-19T20:06:03.793Z","createdAt":"2025-08-19T20:05:08.903Z","id":"ksaxzZwZY6PsA6jp","name":"Nicolas L'HOTE <nicolas.lhote.88@gmail.com>","type":"personal","icon":null,"description":null,"creatorId":"81c13a48-6847-445c-927f-81c1c25a72f4"}}]}]
+{
+  "updatedAt": "2026-05-31T13:22:22Z",
+  "createdAt": "2026-03-16T17:03:18.499Z",
+  "id": "fNFsT1JoloWVTLa0Q8z_E",
+  "name": "SIGA - Telegram Batch Processor v8 (Loop Clean)",
+  "description": null,
+  "active": true,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "82d75926-9b63-409a-873b-4398e3b08510",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [
+        30048,
+        5312
+      ],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "jsCode": "const readEnv = (name) => {\n  try {\n    const v = process?.env?.[name];\n    return typeof v === 'string' && v.trim() ? v.trim() : '';\n  } catch { return ''; }\n};\nconst bufferFolderId = readEnv('SIGA_TELEGRAM_BUFFER_FOLDER_ID') || '1tbyhFwLBWm5jh605vngOqpHN-Gpb-9yf';\nconst sharedSecret = readEnv('SIGA_WEBHOOK_SECRET') || readEnv('SIGA_SHARED_SECRET') || readEnv('N8N_SIGA_WEBHOOK_SECRET') || readEnv('N8N_SIGA_SHARED_SECRET') || '';\nreturn [{ json: { now: new Date().toISOString(), buffer_folder_id: bufferFolderId, buffer_folder_path: 'SIGA_TEMP/SIGA_TELEGRAM_BUFFER', shared_secret: sharedSecret, quiet_window_sec_default: 5, processor_source: 'telegram_buffer_to_drive_brief', final_drive_root_id: '1e6OipL7R8HlG5LV1Lp8Z_AMlFQMTxaRC', min_message_received_at: '2026-05-31T07:06:52.8281810Z' } }];"
+      },
+      "id": "93a18cbf-a2b0-45f5-9783-1f78b05f19bc",
+      "name": "Init Processor Config",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        30272,
+        5216
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.buffer_folder_id + \"' in parents and mimeType = 'application/json' and trashed = false\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,createdTime,mimeType,webViewLink,parents)"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "ac7ccb2c-e263-4174-8766-6e277937cb26",
+      "name": "Search Buffered JSON Parts",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        30496,
+        5216
+      ],
+      "typeVersion": 4.2,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('Init Processor Config').first().json || {};\nconst files = Array.isArray($json.files) ? [...$json.files] : [];\nconst partFiles = files.filter(f => /__part_\\d+\\.json$/i.test(String(f.name || '')));\nreturn [{\n  json: {\n    ...root,\n    part_json_files: partFiles,\n    part_json_count: partFiles.length\n  }\n}];"
+      },
+      "id": "559731fb-035e-4dc3-8649-62cf49fd4700",
+      "name": "Resolve Part JSON Candidates",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        30720,
+        5216
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.part_json_count}}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4966c1d5-6fe9-4015-b12d-4924ce9a8ae6",
+      "name": "If Part JSON Exists",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        30944,
+        5216
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $json;\nreturn root.part_json_files.map(f => ({\n  json: { ...root, part_json_file_id: f.id, part_json_name: f.name }\n}));"
+      },
+      "id": "1190adc8-9245-43e4-8953-53a737cb3573",
+      "name": "Split Part JSON Files",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        31168,
+        5144
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.part_json_file_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "1bcd17d8-2887-4c0c-8d20-1634a168c30a",
+      "name": "Download Part JSON",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        31392,
+        5144
+      ],
+      "typeVersion": 3,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst out = [];\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  let txt = '';\n  try {\n    const buf = await this.helpers.getBinaryDataBuffer(i, 'data');\n    txt = Buffer.from(buf).toString('utf8');\n  } catch (e) { continue; }\n  txt = String(txt || '').replace(/^\\uFEFF/, '').trim();\n  const parsed = JSON.parse(txt);\n  out.push({\n    json: {\n      ...item.json,\n      part: parsed,\n      buffer_prefix: parsed.buffer_prefix || item.json.buffer_prefix || '',\n      group_key: parsed.group_key || ''\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "0e6fbd1c-1486-48c9-9c38-5a07e35a88af",
+      "name": "Parse Part JSON",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        31616,
+        5144
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = Date.now();\nconst minReceivedAt = Date.parse(($('Init Processor Config').first().json || {}).min_message_received_at || '') || 0;\nconst items = $input.all().map(i => i.json || {}).filter(j => {\n  const p = j.part || j;\n  const t = Date.parse(p.message_received_at || j.message_received_at || '') || 0;\n  return !minReceivedAt || !t || t >= minReceivedAt;\n});\nconst groups = new Map();\n\nconst firstNonEmpty = (arr, keys) => {\n  for (const x of arr) {\n    for(const key of keys) {\n        const val = x[key] || x.part?.[key];\n        if (val !== null && val !== undefined && val !== '') return val;\n    }\n  }\n  return null;\n};\n\nfor (const j of items) {\n  const prefix = j.buffer_prefix || '';\n  if (!prefix) continue;\n  const g = groups.get(prefix) || { parts: [], root: j, lastQuietUntil: 0, firstSeen: Number.MAX_SAFE_INTEGER };\n  const part = j.part || {};\n  g.parts.push(part);\n  const q = Date.parse(part.quiet_until || '') || 0;\n  const seen = Date.parse(part.message_received_at || '') || now;\n  if (q > g.lastQuietUntil) g.lastQuietUntil = q;\n  if (seen < g.firstSeen) g.firstSeen = seen;\n  if ((part.message_text || part.caption_text || part.text) && !(g.root.part?.message_text || g.root.part?.caption_text || g.root.part?.text)) g.root = j;\n  groups.set(prefix, g);\n}\n\nconst ready = [...groups.values()]\n  .filter(g => g.lastQuietUntil > 0 && g.lastQuietUntil <= now)\n  .sort((a, b) => a.firstSeen - b.firstSeen);\n\nif (!ready.length) return [{ json: { ready_group_found: false, reason: 'no_ready_group' } }];\n\nconst g = ready[0];\nconst parts = [...g.parts].sort((a, b) => Number(a.message_id || 0) - Number(b.message_id || 0));\nconst markerName = `${g.root.buffer_prefix}processed.json`;\n\nreturn [{\n  json: {\n    ...$('Init Processor Config').first().json,\n    ready_group_found: true,\n    buffer_prefix: g.root.buffer_prefix,\n    group_key: g.root.group_key,\n    media_group_id: firstNonEmpty(parts, ['media_group_id']),\n    chat_id: firstNonEmpty(parts, ['chat_id']),\n    chat_type: firstNonEmpty(parts, ['chat_type']),\n    sender: firstNonEmpty(parts, ['sender']) || {},\n    message_text: firstNonEmpty(parts, ['message_text', 'caption_text', 'text']) || '',\n    quiet_until: new Date(g.lastQuietUntil).toISOString(),\n    group_parts: parts,\n    processed_marker_name: markerName\n  }\n}];"
+      },
+      "id": "ba9cf997-ceb6-4f30-8110-a5ff1ac86810",
+      "name": "Select Oldest Ready Group",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        31840,
+        5144
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.ready_group_found}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "44f9b808-05bc-451d-8e2e-9d412e14d938",
+      "name": "If Ready Group Found",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        32064,
+        5144
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.buffer_folder_id + \"' in parents and name = '\" + String($json.processed_marker_name||'').replace(/'/g,\"\\\\'\") + \"' and trashed = false\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name)"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d968ad3f-8e9e-46a8-a932-f1a7e218e928",
+      "name": "Search Processed Marker",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        32288,
+        5072
+      ],
+      "typeVersion": 4.2,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const marker = $json || {};\nconst root = $('If Ready Group Found').first().json || {};\nreturn [{\n  json: {\n    ...root,\n    processed_marker_found: Array.isArray(marker.files) && marker.files.length > 0\n  }\n}];"
+      },
+      "id": "fa91ac3c-26bc-4383-a6e4-72831fcf6e57",
+      "name": "Attach Marker Context",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        32512,
+        5072
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.processed_marker_found}}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "e6311845-f6eb-4406-bb34-02812d20a106",
+      "name": "If Not Processed",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        32736,
+        5072
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.buffer_folder_id + \"' in parents and trashed = false and mimeType != 'application/json' and name contains '\" + String($json.buffer_prefix||'').replace(/'/g,\"\\\\'\") + \"'\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name,mimeType)"
+            },
+            {
+              "name": "pageSize",
+              "value": "100"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2913a1e9-1c0d-4312-a1fd-3bb5f25dfafc",
+      "name": "Search Group Media",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        32960,
+        4976
+      ],
+      "typeVersion": 4.2,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = $('If Not Processed').first().json;\nconst files = Array.isArray($json.files) ? $json.files : [];\nconst parts = Array.isArray(root.group_parts) ? root.group_parts : [];\nconst byName = new Map(files.map(f => [String(f.name || ''), f]));\nconst mediaItems = [];\n\nfor (const p of parts) {\n  const name = p.buffer_file_name;\n  if (!name) continue;\n  const f = byName.get(String(name));\n  if (!f) continue;\n  mediaItems.push({\n    ...root,\n    part: p,\n    drive_file_id: f.id,\n    drive_file_name: f.name,\n    computed_mime_type: f.mimeType || p.mime_type || 'application/octet-stream',\n    media_order: Number(p.message_id || mediaItems.length + 1)\n  });\n}\nreturn mediaItems;"
+      },
+      "id": "f60f998e-a1d9-4d3f-9a7d-f8928b5dccb8",
+      "name": "Build Media Plan",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        33184,
+        4976
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.drive_file_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "ab4e79c6-01f3-4b51-a219-11e871b75a07",
+      "name": "Download Media",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        33408,
+        4976
+      ],
+      "typeVersion": 3,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nconst items = $input.all();\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const p = item.json.part || {};\n  const mime = String(item.json.computed_mime_type || item.binary?.data?.mimeType || 'application/octet-stream').toLowerCase();\n  const isImg = mime.startsWith('image/');\n  const bKey = isImg ? `image_upload${i}` : `document_upload${i}`;\n  \n  const row = {\n    index: i + 1,\n    order: item.json.media_order,\n    filename: p.original_filename || item.json.drive_file_name,\n    mime_type: mime,\n    binary_key: bKey\n  };\n\n  out.push({\n    json: {\n      ...item.json,\n      image_row: isImg ? row : null,\n      document_row: !isImg ? row : null\n    },\n    binary: item.binary\n  });\n}\nreturn out;"
+      },
+      "id": "4cf6686d-0c67-42af-b941-5919959fec67",
+      "name": "Classify Media (No Base64)",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        33632,
+        4976
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nif (!items.length) return [{ json: { payload_ready: false } }];\n\nconst root = items[0].json;\nconst sharedSecret = $('Init Processor Config').first().json.shared_secret || '';\n\nconst images = items.map(i => i.json.image_row).filter(Boolean).sort((a, b) => a.order - b.order);\nconst documents = items.map(i => i.json.document_row).filter(Boolean).sort((a, b) => a.order - b.order);\n\nimages.forEach((img, idx) => img.index = idx + 1);\ndocuments.forEach((doc, idx) => doc.index = idx + 1);\n\nconst sender = root.sender || {};\n\nconst payload = {\n  source: 'telegram_buffered',\n  trigger_source: 'telegram_buffer_batch',\n  project: 'SIGA',\n  entity_type: 'equipment',\n  message: {\n    text: root.message_text || '',\n    received_at: new Date().toISOString()\n  },\n  sender: {\n    id: sender.id || null,\n    display_name: sender.first_name || sender.username || sender.display_name || null\n  },\n  context: {\n    telegram: {\n      chat_id: root.chat_id ?? null,\n      chat_type: root.chat_type ?? null,\n      media_group_id: root.media_group_id || null,\n      group_key: root.group_key || null,\n      buffer_prefix: root.buffer_prefix || null\n    }\n  },\n  images: images.map(img => ({ index: img.index, filename: img.filename, mime_type: img.mime_type, binary_key: img.binary_key })),\n  documents: documents.map(doc => ({ index: doc.index, filename: doc.filename, mime_type: doc.mime_type, binary_key: doc.binary_key })),\n  headers: {\n    'x-siga-shared-secret': sharedSecret\n  },\n  processed_marker_name: root.processed_marker_name,\n  buffer_folder_id: root.buffer_folder_id,\n  group_key: root.group_key,\n  buffer_prefix: root.buffer_prefix,\n  payload_ready: true\n};\n\nconst outBinary = {};\nitems.forEach((item) => {\n  const row = item.json.image_row || item.json.document_row;\n  if (row && item.binary && item.binary.data) {\n    outBinary[row.binary_key] = item.binary.data;\n    outBinary[row.binary_key].fileName = row.filename;\n    outBinary[row.binary_key].mimeType = row.mime_type;\n  }\n});\n\nreturn [{\n  json: payload,\n  binary: Object.keys(outBinary).length ? outBinary : undefined\n}];"
+      },
+      "id": "ed278a88-c4f5-4080-a8d3-71a0b00fd2c3",
+      "name": "Aggregate Final Payload",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        33856,
+        4976
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{$json.payload_ready}}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f7e611ef-047f-4146-8bf4-5e3462b9de70",
+      "name": "If Payload Ready",
+      "type": "n8n-nodes-base.if",
+      "position": [
+        34080,
+        4976
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "name": "={{$json.marker_name}}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{$json.buffer_folder_id}}"
+        },
+        "options": {}
+      },
+      "id": "be14bdf6-1502-4688-957d-936aa1a81781",
+      "name": "Upload Processed Marker",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        34752,
+        4832
+      ],
+      "typeVersion": 3,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://www.googleapis.com/drive/v3/files",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleDriveOAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ \"'\" + $json.buffer_folder_id + \"' in parents and name contains '\" + String($json.buffer_prefix||'').replace(/'/g,\"\\\\'\") + \"' and trashed = false\" }}"
+            },
+            {
+              "name": "fields",
+              "value": "files(id,name)"
+            },
+            {
+              "name": "supportsAllDrives",
+              "value": "true"
+            },
+            {
+              "name": "includeItemsFromAllDrives",
+              "value": "true"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "54fee130-4259-43ca-8d16-97ed8e434cf2",
+      "name": "Search Files to Clean",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [
+        34976,
+        4832
+      ],
+      "typeVersion": 4.2,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const cleanup = $('Build Cleanup Context').first().json || {};\nconst markerName = String(cleanup.marker_name || '');\nconst prefix = String(cleanup.buffer_prefix || '');\nconst files = Array.isArray($json.files) ? $json.files : [];\nconst toDelete = files\n  .filter(f => f.id && (!prefix || String(f.name || '').includes(prefix)))\n  // Le marqueur est supprime en dernier: s'il y a une erreur avant, il reste et evite un retraitement.\n  .sort((a, b) => {\n    const am = markerName && a.name === markerName ? 1 : 0;\n    const bm = markerName && b.name === markerName ? 1 : 0;\n    return am - bm;\n  });\nreturn toDelete.map(f => ({ json: { file_id: f.id, file_name: f.name, marker_name: markerName, buffer_prefix: prefix } }));"
+      },
+      "id": "4abbd8f8-fd2e-4642-aa34-c475c49616e2",
+      "name": "Filter Files to Clean",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        35200,
+        4832
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "84ba702b-7b26-43c9-8a65-a541ebd8916b",
+      "name": "Loop Over Files",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        35424,
+        4832
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "deleteFile",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.file_id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "f07aba37-387c-4537-bccf-38733c943f5c",
+      "name": "Delete Original Files",
+      "type": "n8n-nodes-base.googleDrive",
+      "position": [
+        35648,
+        4880
+      ],
+      "typeVersion": 3,
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: { cleanup_done: true }}];"
+      },
+      "id": "e24024b7-a03b-465d-aaa5-c842e7a8981b",
+      "name": "No Op",
+      "type": "n8n-nodes-base.code",
+      "position": [
+        35648,
+        5168
+      ],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "schedule-telegram-buffer-every-minute",
+      "name": "Schedule Every Minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        30048,
+        5024
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "function sanitize(value) {\n  return String(value || '').normalize('NFKD').replace(/[^\\x00-\\x7F]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '').slice(0, 120) || 'brief';\n}\nfunction stampFromIso(iso) {\n  const d = new Date(iso || Date.now());\n  const pad = (n) => String(n).padStart(2, '0');\n  return `${d.getUTCFullYear()}${pad(d.getUTCMonth()+1)}${pad(d.getUTCDate())}-${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;\n}\nconst payload = $json || {};\nconst selected = $('If Not Processed').first().json || {};\nconst parts = Array.isArray(selected.group_parts) ? [...selected.group_parts] : [];\nparts.sort((a, b) => Number(a.message_id || 0) - Number(b.message_id || 0));\nconst firstPart = parts[0] || {};\nconst telegram = payload.context?.telegram || {};\nconst chatId = telegram.chat_id ?? selected.chat_id ?? null;\nconst mediaGroupId = telegram.media_group_id || selected.media_group_id || null;\nconst folderName = mediaGroupId ? `album_${sanitize(chatId)}_${sanitize(mediaGroupId)}` : `${stampFromIso(firstPart.message_received_at || payload.message?.received_at)}_msg${firstPart.message_id || 'unknown'}`;\nreturn [{ json: { ...payload, group_parts: parts, brief_folder_name: folderName, brief_id: folderName, final_drive_root_id: $('Init Processor Config').first().json.final_drive_root_id }, binary: $input.first().binary }];"
+      },
+      "id": "brief-folder-context",
+      "name": "Build Brief Folder Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        34304,
+        4976
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{ $json.brief_folder_name }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.final_drive_root_id }}"
+        },
+        "options": {}
+      },
+      "id": "create-brief-drive-folder",
+      "name": "Create Brief Drive Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        34528,
+        4976
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Build Brief Folder Context').first().json;\nconst folder = $('Create Brief Drive Folder').first().json;\nconst payloadItem = $('Aggregate Final Payload').first();\nconst binary = payloadItem.binary || {};\nconst rows = [ ...((ctx.images || []).map(x => ({ ...x, kind: 'photo' }))), ...((ctx.documents || []).map(x => ({ ...x, kind: 'document' }))) ].sort((a, b) => Number(a.index || 0) - Number(b.index || 0));\nconst out = [];\nfor (const row of rows) {\n  const b = binary[row.binary_key];\n  if (!b) continue;\n  const ext = String(row.filename || '').split('.').pop() || (row.kind === 'photo' ? 'jpg' : 'bin');\n  const target = row.kind === 'photo' ? `photo_${String(row.index).padStart(2, '0')}.${ext}` : `document_${String(row.index).padStart(2, '0')}.${ext}`;\n  out.push({ json: { brief_id: ctx.brief_id, brief_folder_id: folder.id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`, target_filename: target, original_filename: row.filename || target, mime_type: row.mime_type || b.mimeType || 'application/octet-stream', kind: row.kind, index: row.index, telegram_message_id: (ctx.group_parts || [])[Number(row.index || 1) - 1]?.message_id || null }, binary: { data: { ...b, fileName: target, mimeType: row.mime_type || b.mimeType || 'application/octet-stream' } } });\n}\nreturn out;"
+      },
+      "id": "split-brief-upload-files",
+      "name": "Split Brief Upload Files",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        34752,
+        4976
+      ]
+    },
+    {
+      "parameters": {
+        "name": "={{ $json.target_filename }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.brief_folder_id }}"
+        },
+        "options": {}
+      },
+      "id": "upload-brief-media",
+      "name": "Upload Brief Media",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        34976,
+        4976
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const uploads = $input.all();\nconst split = $('Split Brief Upload Files').all();\nconst ctx = $('Build Brief Folder Context').first().json;\nconst folder = $('Create Brief Drive Folder').first().json;\nconst folderUrl = folder.webViewLink || `https://drive.google.com/drive/folders/${folder.id}`;\nconst photos = [];\nconst documents = [];\nfor (let i = 0; i < uploads.length; i++) {\n  const u = uploads[i].json || {};\n  const s = split[i]?.json || {};\n  const row = { filename: s.target_filename || u.name || null, original_filename: s.original_filename || null, drive_file_id: u.id || null, mime: s.mime_type || u.mimeType || null, telegram_message_id: s.telegram_message_id || null };\n  if (s.kind === 'document') documents.push(row); else photos.push(row);\n}\nconst telegram = ctx.context?.telegram || {};\nconst brief = { brief_id: ctx.brief_id, created_at: new Date().toISOString(), source: 'telegram', status: 'pending', text: ctx.message?.text || '', photos, documents, drive: { folder_id: folder.id, folder_name: ctx.brief_folder_name, folder_url: folderUrl }, telegram: { chat_id: telegram.chat_id ?? null, chat_type: telegram.chat_type ?? null, media_group_id: telegram.media_group_id || null, group_key: telegram.group_key || ctx.group_key || null, buffer_prefix: telegram.buffer_prefix || ctx.buffer_prefix || null }, siga: { action: null, items: [], processed_at: null, notes: null } };\nconst txt = JSON.stringify(brief, null, 2);\nreturn [{ json: { ...ctx, brief, brief_folder_id: folder.id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: folderUrl, telegram_chat_id: telegram.chat_id ?? null }, binary: { data: { data: Buffer.from(txt, 'utf8').toString('base64'), mimeType: 'application/json', fileName: 'brief.json' } } }];"
+      },
+      "id": "build-brief-json",
+      "name": "Build Brief JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        35200,
+        4976
+      ]
+    },
+    {
+      "parameters": {
+        "name": "brief.json",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.brief_folder_id }}"
+        },
+        "options": {}
+      },
+      "id": "upload-brief-json",
+      "name": "Upload Brief JSON",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        35424,
+        4976
+      ],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "pfuF6ArTiTPmlpHG",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Build Brief JSON').first().json.telegram_chat_id }}",
+        "text": "=Brief SIGA enregistré. Dossier: {{ $('Build Brief JSON').first().json.brief_folder_name }} | Photos: {{ $('Build Brief JSON').first().json.brief.photos.length }} | Lien: {{ $('Build Brief JSON').first().json.brief_folder_url }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "appendAttribution": false
+        }
+      },
+      "id": "confirm-brief-telegram",
+      "name": "Confirm Brief Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        35648,
+        4976
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "pVqYKOVuJrq3njUz",
+          "name": "Telegram Jarvis Bot"
+        }
+      },
+      "continueOnFail": true,
+      "notes": "Non bloquant: le nettoyage du buffer doit continuer meme si Telegram refuse le chat_id. Utilise Build Brief JSON car Upload Brief JSON remplace le contexte courant."
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Build Brief JSON').first().json;\nconst txt = JSON.stringify({ group_key: ctx.group_key, buffer_prefix: ctx.buffer_prefix, processed_at: new Date().toISOString(), status: 'brief_created', brief_folder_id: ctx.brief_folder_id, brief_folder_name: ctx.brief_folder_name, brief_folder_url: ctx.brief_folder_url, photo_count: ctx.brief?.photos?.length || 0, document_count: ctx.brief?.documents?.length || 0 }, null, 2);\nreturn [{ json: { marker_name: ctx.processed_marker_name, buffer_folder_id: ctx.buffer_folder_id, buffer_prefix: ctx.buffer_prefix, brief_folder_id: ctx.brief_folder_id, brief_folder_url: ctx.brief_folder_url }, binary: { data: { data: Buffer.from(txt, 'utf8').toString('base64'), mimeType: 'application/json', fileName: ctx.processed_marker_name } } }];"
+      },
+      "id": "build-marker-binary-brief",
+      "name": "Build Marker Binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        35872,
+        4976
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "let ctx = {};\ntry {\n  ctx = $('Build Marker Binary').first().json || {};\n} catch (e) {\n  ctx = $input.first().json || {};\n}\nconst markerName = ctx.marker_name || ctx.processed_marker_name || (ctx.buffer_prefix ? ctx.buffer_prefix + 'processed.json' : '');\nconst bufferFolderId = ctx.buffer_folder_id || $('Init Processor Config').first().json.buffer_folder_id;\nconst bufferPrefix = ctx.buffer_prefix || '';\nif (!bufferFolderId || !bufferPrefix) {\n  throw new Error('Missing cleanup context: buffer_folder_id or buffer_prefix');\n}\nreturn [{\n  json: {\n    buffer_folder_id: bufferFolderId,\n    buffer_prefix: bufferPrefix,\n    marker_name: markerName,\n    cleanup_requested_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "cf32e4f3-b107-4495-ad24-3e12df718c1b",
+      "name": "Build Cleanup Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2650,
+        -40
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Init Processor Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Every Minute": {
+      "main": [
+        [
+          {
+            "node": "Init Processor Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Processor Config": {
+      "main": [
+        [
+          {
+            "node": "Search Buffered JSON Parts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Buffered JSON Parts": {
+      "main": [
+        [
+          {
+            "node": "Resolve Part JSON Candidates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Part JSON Candidates": {
+      "main": [
+        [
+          {
+            "node": "If Part JSON Exists",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Part JSON Exists": {
+      "main": [
+        [
+          {
+            "node": "Split Part JSON Files",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Op",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Part JSON Files": {
+      "main": [
+        [
+          {
+            "node": "Download Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Part JSON": {
+      "main": [
+        [
+          {
+            "node": "Parse Part JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Part JSON": {
+      "main": [
+        [
+          {
+            "node": "Select Oldest Ready Group",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Oldest Ready Group": {
+      "main": [
+        [
+          {
+            "node": "If Ready Group Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Ready Group Found": {
+      "main": [
+        [
+          {
+            "node": "Search Processed Marker",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Op",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Processed Marker": {
+      "main": [
+        [
+          {
+            "node": "Attach Marker Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Marker Context": {
+      "main": [
+        [
+          {
+            "node": "If Not Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Not Processed": {
+      "main": [
+        [
+          {
+            "node": "Search Group Media",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Cleanup Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Group Media": {
+      "main": [
+        [
+          {
+            "node": "Build Media Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Media Plan": {
+      "main": [
+        [
+          {
+            "node": "Download Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Media": {
+      "main": [
+        [
+          {
+            "node": "Classify Media (No Base64)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Media (No Base64)": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Final Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Final Payload": {
+      "main": [
+        [
+          {
+            "node": "If Payload Ready",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Payload Ready": {
+      "main": [
+        [
+          {
+            "node": "Build Brief Folder Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Op",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Brief Folder Context": {
+      "main": [
+        [
+          {
+            "node": "Create Brief Drive Folder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Brief Drive Folder": {
+      "main": [
+        [
+          {
+            "node": "Split Brief Upload Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Brief Upload Files": {
+      "main": [
+        [
+          {
+            "node": "Upload Brief Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Brief Media": {
+      "main": [
+        [
+          {
+            "node": "Build Brief JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Brief JSON": {
+      "main": [
+        [
+          {
+            "node": "Upload Brief JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Brief JSON": {
+      "main": [
+        [
+          {
+            "node": "Confirm Brief Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confirm Brief Telegram": {
+      "main": [
+        [
+          {
+            "node": "Build Marker Binary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Marker Binary": {
+      "main": [
+        [
+          {
+            "node": "Upload Processed Marker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload Processed Marker": {
+      "main": [
+        [
+          {
+            "node": "Build Cleanup Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Files to Clean": {
+      "main": [
+        [
+          {
+            "node": "Filter Files to Clean",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Files to Clean": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Files": {
+      "main": [
+        [
+          {
+            "node": "No Op",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Delete Original Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Original Files": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Cleanup Context": {
+      "main": [
+        [
+          {
+            "node": "Search Files to Clean",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "093ba1266e85fcaaa6abca411d9f7941951737b3920bfaa6e2db89226df2c82d"
+  },
+  "pinData": {},
+  "versionId": "7b914128-5b81-4860-8fe4-235dc7a713eb",
+  "activeVersionId": "7b914128-5b81-4860-8fe4-235dc7a713eb",
+  "versionCounter": 52,
+  "triggerCount": 1,
+  "tags": [],
+  "shared": [
+    {
+      "updatedAt": "2026-03-16T17:03:18.509Z",
+      "createdAt": "2026-03-16T17:03:18.509Z",
+      "role": "workflow:owner",
+      "workflowId": "fNFsT1JoloWVTLa0Q8z_E",
+      "projectId": "ksaxzZwZY6PsA6jp",
+      "project": {
+        "updatedAt": "2025-08-19T20:06:03.793Z",
+        "createdAt": "2025-08-19T20:05:08.903Z",
+        "id": "ksaxzZwZY6PsA6jp",
+        "name": "Nicolas L'HOTE <nicolas.lhote.88@gmail.com>",
+        "type": "personal",
+        "icon": null,
+        "description": null,
+        "creatorId": "81c13a48-6847-445c-927f-81c1c25a72f4"
+      }
+    }
+  ]
+}
