@@ -117,6 +117,21 @@ Nettoyage effectué après incident:
 - le premier dossier a été conservé: `1Q9Bny2dCaQl9TxX8cE6P9w8hoA66D9rF`;
 - les 20 dossiers suivants ont été mis à la corbeille Drive via `SIGA — Delete Equipment Drive Folder`.
 
+## Correctif Google Drive n8n du 29/06/2026
+
+Les runs `SIGA - Telegram Batch Processor v8 (Loop Clean)` échouaient sur le noeud
+`Search Buffered JSON Parts` avec une erreur OAuth Google Drive `invalid_grant`.
+
+Correctif appliqué sur n8n:
+
+- création d'une credential n8n `SIGA Google Drive Service Account` de type `googleApi`,
+  basée sur le compte de service déjà utilisé par l'API SIGA;
+- repointage des workflows SIGA Drive vers cette credential service account;
+- mise à jour des versions publiées actives (`activeVersionId`) puis redémarrage n8n.
+
+Ne pas revenir à la credential OAuth utilisateur `Google Drive account` pour les flux SIGA: elle
+peut expirer ou être révoquée et bloquer l'activation du batch processor.
+
 ## Prochaine validation
 
 Faire un test réel Telegram:

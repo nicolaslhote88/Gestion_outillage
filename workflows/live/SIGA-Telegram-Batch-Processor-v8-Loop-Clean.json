@@ -35,7 +35,7 @@
       "parameters": {
         "url": "https://www.googleapis.com/drive/v3/files",
         "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googleDriveOAuth2Api",
+        "nodeCredentialType": "googleApi",
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
@@ -72,9 +72,9 @@
       ],
       "typeVersion": 4.2,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -146,7 +146,8 @@
         },
         "options": {
           "binaryPropertyName": "data"
-        }
+        },
+        "authentication": "serviceAccount"
       },
       "id": "1bcd17d8-2887-4c0c-8d20-1634a168c30a",
       "name": "Download Part JSON",
@@ -157,9 +158,9 @@
       ],
       "typeVersion": 3,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -226,7 +227,7 @@
       "parameters": {
         "url": "https://www.googleapis.com/drive/v3/files",
         "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googleDriveOAuth2Api",
+        "nodeCredentialType": "googleApi",
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
@@ -259,9 +260,9 @@
       ],
       "typeVersion": 4.2,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -315,7 +316,7 @@
       "parameters": {
         "url": "https://www.googleapis.com/drive/v3/files",
         "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googleDriveOAuth2Api",
+        "nodeCredentialType": "googleApi",
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
@@ -352,9 +353,9 @@
       ],
       "typeVersion": 4.2,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -381,7 +382,8 @@
         },
         "options": {
           "binaryPropertyName": "data"
-        }
+        },
+        "authentication": "serviceAccount"
       },
       "id": "ab4e79c6-01f3-4b51-a219-11e871b75a07",
       "name": "Download Media",
@@ -392,9 +394,9 @@
       ],
       "typeVersion": 3,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -470,7 +472,8 @@
           "mode": "id",
           "value": "={{$json.buffer_folder_id}}"
         },
-        "options": {}
+        "options": {},
+        "authentication": "serviceAccount"
       },
       "id": "be14bdf6-1502-4688-957d-936aa1a81781",
       "name": "Upload Processed Marker",
@@ -481,9 +484,9 @@
       ],
       "typeVersion": 3,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -491,7 +494,7 @@
       "parameters": {
         "url": "https://www.googleapis.com/drive/v3/files",
         "authentication": "predefinedCredentialType",
-        "nodeCredentialType": "googleDriveOAuth2Api",
+        "nodeCredentialType": "googleApi",
         "sendQuery": true,
         "queryParameters": {
           "parameters": [
@@ -524,9 +527,9 @@
       ],
       "typeVersion": 4.2,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -564,7 +567,8 @@
           "value": "={{ $json.file_id }}",
           "mode": "id"
         },
-        "options": {}
+        "options": {},
+        "authentication": "serviceAccount"
       },
       "id": "f07aba37-387c-4537-bccf-38733c943f5c",
       "name": "Delete Original Files",
@@ -575,9 +579,9 @@
       ],
       "typeVersion": 3,
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -641,7 +645,8 @@
           "mode": "id",
           "value": "={{ $json.final_drive_root_id }}"
         },
-        "options": {}
+        "options": {},
+        "authentication": "serviceAccount"
       },
       "id": "create-brief-drive-folder",
       "name": "Create Brief Drive Folder",
@@ -652,9 +657,9 @@
         4976
       ],
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -684,7 +689,8 @@
           "mode": "id",
           "value": "={{ $json.brief_folder_id }}"
         },
-        "options": {}
+        "options": {},
+        "authentication": "serviceAccount"
       },
       "id": "upload-brief-media",
       "name": "Upload Brief Media",
@@ -695,9 +701,9 @@
         4976
       ],
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
@@ -728,7 +734,8 @@
           "mode": "id",
           "value": "={{ $json.brief_folder_id }}"
         },
-        "options": {}
+        "options": {},
+        "authentication": "serviceAccount"
       },
       "id": "upload-brief-json",
       "name": "Upload Brief JSON",
@@ -739,9 +746,9 @@
         4976
       ],
       "credentials": {
-        "googleDriveOAuth2Api": {
-          "id": "pfuF6ArTiTPmlpHG",
-          "name": "Google Drive account"
+        "googleApi": {
+          "id": "sigaGoogleSaDrive",
+          "name": "SIGA Google Drive Service Account"
         }
       }
     },
